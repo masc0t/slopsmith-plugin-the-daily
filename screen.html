@@ -1,0 +1,76 @@
+<div class="max-w-2xl mx-auto px-6 pt-24 pb-16">
+
+    <!-- Loading -->
+    <div id="ds-loading" class="flex items-center justify-center py-32">
+        <div class="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- Setlist view -->
+    <div id="ds-setlist" class="hidden">
+        <!-- Header -->
+        <div class="mb-8">
+            <div class="flex items-center gap-3 mb-1">
+                <span id="ds-modifier-icon" class="text-2xl"></span>
+                <span id="ds-modifier-label" class="text-xs font-semibold uppercase tracking-widest text-accent-light px-2 py-0.5 bg-accent/10 rounded-full"></span>
+                <span id="ds-day-number" class="text-xs text-gray-500 font-mono"></span>
+            </div>
+            <h2 id="ds-day-name" class="text-4xl font-bold text-white mt-2"></h2>
+            <p id="ds-date" class="text-sm text-gray-500 mt-1"></p>
+            <p id="ds-modifier-desc" class="text-sm text-gray-400 mt-1 italic"></p>
+            <p id="ds-fallback-notice" class="hidden text-xs text-yellow-500 mt-2">
+                Not enough matching songs in the pool — using full library today.
+            </p>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="mb-8">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs text-gray-500 uppercase tracking-wider">Progress</span>
+                <span id="ds-progress-label" class="text-sm font-semibold text-white"></span>
+            </div>
+            <div class="h-2 bg-dark-700 rounded-full overflow-hidden">
+                <div id="ds-progress-bar" class="h-full bg-accent rounded-full transition-all duration-500 shadow-[0_0_8px_rgba(64,128,224,0.6)]" style="width:0%"></div>
+            </div>
+        </div>
+
+        <!-- Song list -->
+        <div id="ds-songs" class="space-y-3"></div>
+    </div>
+
+    <!-- Complete view -->
+    <div id="ds-complete" class="hidden text-center py-16">
+        <canvas id="ds-confetti" class="fixed inset-0 pointer-events-none z-50" style="width:100vw;height:100vh;"></canvas>
+        <div class="text-6xl mb-4">🎸</div>
+        <h2 class="text-4xl font-bold text-white mb-2">Day Complete!</h2>
+        <p id="ds-complete-name" class="text-xl text-accent-light mb-2"></p>
+        <p id="ds-complete-streak" class="text-sm text-gray-400 mb-10"></p>
+
+        <div id="ds-sign-area" class="mb-6">
+            <p class="text-gray-400 text-sm mb-4">Sign the Wall of Fame</p>
+            <div class="flex gap-2 max-w-sm mx-auto">
+                <input type="text" id="ds-name-input" placeholder="Your name"
+                    class="flex-1 bg-dark-700 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-600 focus:border-accent/60 outline-none">
+                <button onclick="dsSign()" class="bg-accent hover:bg-accent-light px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition">Sign</button>
+            </div>
+            <p id="ds-sign-error" class="hidden text-xs text-red-400 mt-2"></p>
+        </div>
+
+        <button onclick="dsShowLeaderboard()" class="text-sm text-gray-400 hover:text-white transition underline">
+            View Wall of Fame
+        </button>
+    </div>
+
+    <!-- Leaderboard view -->
+    <div id="ds-leaderboard" class="hidden">
+        <button onclick="dsShowSetlist()" class="text-gray-500 hover:text-white text-sm mb-8 flex items-center gap-1">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg> Back
+        </button>
+        <h2 class="text-3xl font-bold text-white mb-1">Wall of Fame</h2>
+        <p id="ds-lb-day-name" class="text-accent-light mb-1"></p>
+        <p id="ds-lb-date" class="text-sm text-gray-500 mb-8"></p>
+        <div id="ds-lb-entries" class="space-y-3"></div>
+        <p id="ds-lb-count" class="text-sm text-gray-500 mt-6 text-center"></p>
+        <p id="ds-lb-error" class="hidden text-xs text-yellow-500 mt-4 text-center"></p>
+    </div>
+
+</div>

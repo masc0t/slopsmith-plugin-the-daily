@@ -1,0 +1,9 @@
+{
+  "id": "the_daily",
+  "name": "The Daily",
+  "version": "1.0.0",
+  "nav": { "label": "Daily" },
+  "screen": "screen.html",
+  "script": "screen.js",
+  "routes": "routes.py"
+}
