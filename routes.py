@@ -887,13 +887,8 @@ def _validate_display_name(name):
         return False, f"Name must be {NAME_MIN_LENGTH}-{NAME_MAX_LENGTH} characters"
     if not re.match(r"^[a-zA-Z0-9 ]+$", name):
         return False, "Name can only contain letters, numbers, and spaces"
-
-    from profanity_filter import ProfanityFilter
-
-    _profanity_checker = ProfanityFilter(no_word_boundaries=True)
-    if _profanity_checker.is_profane(name):
-        return False, "Name contains inappropriate language"
-
+    # Profanity enforcement lives in a Supabase trigger on the leaderboard
+    # table so the blocklist never touches this repo.
     return True, None
 
 
@@ -1152,19 +1147,28 @@ def setup(app, context):
             "SELECT day_name FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()[0]
 
+        body = {
+            "date": today_str,
+            "day_name": day_name,
+            "display_name": display_name,
+            "completed_at": datetime.utcnow().isoformat() + "Z",
+            "streak": streak,
+            "ip": client_ip,
+        }
+        if rating is not None:
+            body["rating"] = rating
         try:
-            body = {
-                "date": today_str,
-                "day_name": day_name,
-                "display_name": display_name,
-                "completed_at": datetime.utcnow().isoformat() + "Z",
-                "streak": streak,
-                "ip": client_ip,
-            }
-            if rating is not None:
-                body["rating"] = rating
             _supabase_post("/rest/v1/leaderboard", body)
         except Exception as e:
-            return {"error": f"Could not sign leaderboard: {e}"}
+            err_text = ""
+            if hasattr(e, "read"):
+                try:
+                    err_text = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            err_text = err_text or str(e)
+            if "inappropriate" in err_text.lower():
+                return {"error": "Name contains inappropriate language"}
+            return {"error": f"Could not sign leaderboard: {err_text}"}
 
         return {"ok": True, "streak": streak}

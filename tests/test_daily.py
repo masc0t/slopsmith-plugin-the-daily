@@ -28,7 +28,6 @@ from plugins.the_daily.routes import (
     _select_structural,
     _find_locally,
     _compute_streak,
-    _validate_display_name,
 )
 
 
@@ -312,27 +311,6 @@ class TestStreak(unittest.TestCase):
         self.assertGreaterEqual(streak, 1)
 
 
-class TestProfanityFilter(unittest.TestCase):
-    def test_clean_name_accepted(self):
-        try:
-            import profanity_filter  # noqa: F401
-        except ImportError:
-            self.skipTest("profanity_filter not installed in this environment")
-        valid, err = _validate_display_name("Masc0t")
-        self.assertTrue(valid)
-        self.assertIsNone(err)
-
-    def test_flagged_name_rejected(self):
-        # Mocked so no profane strings appear in source. Verifies that when the
-        # filter flags a name, validation surfaces the rejection.
-        mock_module = MagicMock()
-        mock_module.ProfanityFilter.return_value.is_profane.return_value = True
-        with patch.dict(sys.modules, {"profanity_filter": mock_module}):
-            valid, err = _validate_display_name("Masc0t")
-        self.assertFalse(valid)
-        self.assertIn("inappropriate", err)
-
-
 class TestPreviewScript(unittest.TestCase):
     def test_preview_imports(self):
         from plugins.the_daily import preview
@@ -355,7 +333,6 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestStructuralSelect))
     suite.addTests(loader.loadTestsFromTestCase(TestLocalMatching))
     suite.addTests(loader.loadTestsFromTestCase(TestStreak))
-    suite.addTests(loader.loadTestsFromTestCase(TestProfanityFilter))
     suite.addTests(loader.loadTestsFromTestCase(TestPreviewScript))
     
     runner = unittest.TextTestRunner(verbosity=2)
