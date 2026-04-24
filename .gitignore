@@ -1,6 +1,12 @@
 checkpoint.json
+fill_checkpoint.json
 songs_pool.json
 songs_pool.json.bak
 build_pool.py
 __pycache__/
 *.pyc
+*.bak
+*.txt
+reset_today.py
+preview.py
+.claude/settings.local.json
