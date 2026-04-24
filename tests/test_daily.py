@@ -251,14 +251,16 @@ class TestStructuralSelect(unittest.TestCase):
 class TestLocalMatching(unittest.TestCase):
     def test_find_locally_no_match(self):
         mock_meta_db = MagicMock()
-        mock_meta_db.conn.execute.return_value.fetchone.return_value = None
+        mock_meta_db.conn.execute.return_value.fetchall.return_value = []
         song = {"artist": "UnknownArtist", "title": "UnknownSong"}
         result = _find_locally(mock_meta_db, song)
         self.assertIsNone(result)
 
     def test_find_locally_match(self):
         mock_meta_db = MagicMock()
-        mock_meta_db.conn.execute.return_value.fetchone.return_value = ("song.pkg",)
+        mock_meta_db.conn.execute.return_value.fetchall.return_value = [
+            ("song.pkg", "One", "Metallica"),
+        ]
         song = {"artist": "Metallica", "title": "One"}
         result = _find_locally(mock_meta_db, song)
         self.assertEqual(result, "song.pkg")
