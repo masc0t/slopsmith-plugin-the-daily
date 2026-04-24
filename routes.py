@@ -3,6 +3,7 @@
 import hashlib
 import json
 import random
+import re
 import sqlite3
 import threading
 import urllib.request
@@ -22,6 +23,12 @@ SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 POOL_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/download/pool-latest/songs_pool.json"
 
 DEFAULT_SONG_COUNT = 5
+
+# Leaderboard protection
+NAME_MIN_LENGTH = 2
+NAME_MAX_LENGTH = 20
+IP_DAILY_LIMIT = 5
+STREAK_LOOKBACK_DAYS = 30
 
 # ── Day name ──────────────────────────────────────────────────────────────────
 _EPOCH = date(2026, 4, 22)
@@ -799,13 +806,27 @@ def _select_songs(date_str, modifier_id, pool, exclude=None):
 
 
 # ── Local library matching ────────────────────────────────────────────────────
+def _normalize_title(title):
+    title = (title or "").lower()
+    title = re.sub(r"\s*\(.*?\)", "", title)
+    title = re.sub(r"[?!\.,:;'\"\(\)]", "", title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
+
+
 def _find_locally(meta_db, song):
-    row = meta_db.conn.execute(
-        "SELECT filename FROM songs "
-        "WHERE title LIKE ? AND artist LIKE ? COLLATE NOCASE LIMIT 1",
-        (f"%{song['title']}%", f"%{song['artist']}%"),
-    ).fetchone()
-    return row[0] if row else None
+    norm = _normalize_title(song.get("title"))
+    artist_norm = (song.get("artist") or "").lower()
+    rows = meta_db.conn.execute(
+        "SELECT filename, title, artist FROM songs "
+        "WHERE artist LIKE ? COLLATE NOCASE LIMIT 20",
+        (f"%{artist_norm}%",),
+    ).fetchall()
+    for row in rows:
+        fn, local_title, local_artist = row
+        if _normalize_title(local_title) == norm:
+            return fn
+    return None
 
 
 # ── Streak ────────────────────────────────────────────────────────────────────
@@ -852,6 +873,67 @@ def _supabase_post(path, body):
     req.add_header("Prefer", "return=minimal")
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.status
+
+
+def _get_client_ip(request):
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _validate_display_name(name):
+    if not name or len(name) < NAME_MIN_LENGTH or len(name) > NAME_MAX_LENGTH:
+        return False, f"Name must be {NAME_MIN_LENGTH}-{NAME_MAX_LENGTH} characters"
+    if not re.match(r"^[a-zA-Z0-9 ]+$", name):
+        return False, "Name can only contain letters, numbers, and spaces"
+
+    from profanity_filter import ProfanityFilter
+
+    _profanity_checker = ProfanityFilter(no_word_boundaries=True)
+    if _profanity_checker.is_profane(name):
+        return False, "Name contains inappropriate language"
+
+    return True, None
+
+
+def _compute_streak_from_supabase(ip, today):
+    if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
+        return 0
+    if ip == "unknown":
+        return 0
+    streak = 0
+    check_date = today - timedelta(days=1)
+    for _ in range(STREAK_LOOKBACK_DAYS):
+        entries = _supabase_get(
+            "/rest/v1/leaderboard",
+            {
+                "date": f"eq.{check_date.isoformat()}",
+                "ip": f"eq.{ip}",
+                "select": "date",
+            },
+        )
+        if not entries:
+            break
+        streak += 1
+        check_date -= timedelta(days=1)
+    return streak
+
+
+def _check_ip_rate_limit(ip, target_date):
+    if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
+        return True
+    if ip == "unknown":
+        return True
+    entries = _supabase_get(
+        "/rest/v1/leaderboard",
+        {
+            "date": f"eq.{target_date.isoformat()}",
+            "ip": f"eq.{ip}",
+            "select": "ip",
+        },
+    )
+    return len(entries) < IP_DAILY_LIMIT
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -937,6 +1019,7 @@ def setup(app, context):
             enriched.append(s)
 
         day_number = (date.fromisoformat(today) - _EPOCH).days + 1
+        has_unavailable = any(not s["has_locally"] for s in enriched)
         return {
             "date": today,
             "seed": _date_seed(today),
@@ -954,6 +1037,7 @@ def setup(app, context):
             "song_count": song_count,
             "progress": {"done": len(done_ids), "total": song_count},
             "is_complete": len(done_ids) >= song_count,
+            "has_unavailable": has_unavailable,
         }
 
     @app.post("/api/plugins/the_daily/mark")
@@ -1031,10 +1115,11 @@ def setup(app, context):
         return {"date": target, "day_name": day_name, "entries": entries, "ratings": ratings}
 
     @app.post("/api/plugins/the_daily/sign")
-    def sign_leaderboard(data: dict):
+    def sign_leaderboard(data: dict, request):
         display_name = (data.get("display_name") or "").strip()
-        if not display_name:
-            return {"error": "Name required"}
+        valid, err = _validate_display_name(display_name)
+        if not valid:
+            return {"error": err}
         rating = data.get("rating")
         if rating not in (-1, 1, 2):
             rating = None
@@ -1042,33 +1127,39 @@ def setup(app, context):
         if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
             return {"error": "Supabase not configured"}
 
-        today = date.today().isoformat()
+        today = date.today()
+        today_str = today.isoformat()
         conn = _get_conn()
 
         row = conn.execute(
-            "SELECT song_count FROM daily_setlists WHERE date = ?", (today,)
+            "SELECT song_count FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()
         if not row:
             return {"error": "No setlist for today"}
 
         done = conn.execute(
-            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today,)
+            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today_str,)
         ).fetchone()[0]
         if done < row[0]:
             return {"error": "Setlist not complete yet"}
 
-        streak = _compute_streak(conn, today) + 1
+        client_ip = _get_client_ip(request)
+        if not _check_ip_rate_limit(client_ip, today):
+            return {"error": "Too many submissions from this IP today"}
+
+        streak = _compute_streak_from_supabase(client_ip, today) + 1
         day_name = conn.execute(
-            "SELECT day_name FROM daily_setlists WHERE date = ?", (today,)
+            "SELECT day_name FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()[0]
 
         try:
             body = {
-                "date": today,
+                "date": today_str,
                 "day_name": day_name,
                 "display_name": display_name,
                 "completed_at": datetime.utcnow().isoformat() + "Z",
                 "streak": streak,
+                "ip": client_ip,
             }
             if rating is not None:
                 body["rating"] = rating
