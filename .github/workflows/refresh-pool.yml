@@ -1,0 +1,56 @@
+name: Refresh pool
+
+on:
+  schedule:
+    - cron: '17 4 * * 0'  # Sundays at 04:17 UTC — off the hour to avoid the rush
+  workflow_dispatch:       # manual trigger from the Actions tab
+
+permissions:
+  contents: write          # required to upload release assets
+
+concurrency:
+  group: refresh-pool
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Pull both the seeded pool AND the Discord scrape cursor from the
+      # pool-latest release. Both must exist — we never want a full Discord
+      # rescrape (slow, expensive, risks rate limiting). If either asset is
+      # missing, the operator must seed the release manually before retrying.
+      - name: Fetch prior state from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download pool-latest --pattern songs_pool.json --pattern checkpoint.json
+          test -f songs_pool.json   || { echo "::error::songs_pool.json missing from pool-latest release"; exit 1; }
+          test -f checkpoint.json   || { echo "::error::checkpoint.json missing from pool-latest release — refusing to do a full scrape"; exit 1; }
+          echo "Seeded with $(python -c 'import json; print(len(json.load(open(\"songs_pool.json\"))))') entries"
+          echo "Checkpoint: $(cat checkpoint.json)"
+
+      - name: Run incremental Discord scrape
+        env:
+          DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
+        run: python build_pool.py
+
+      - name: Sanity-check pool file
+        run: |
+          test -f songs_pool.json || { echo "::error::songs_pool.json missing after build"; exit 1; }
+          size=$(stat -c%s songs_pool.json)
+          echo "Pool size: $size bytes"
+          [ "$size" -ge 1048576 ] || { echo "::error::Pool suspiciously small ($size bytes), refusing to upload"; exit 1; }
+          python -c "import json; d=json.load(open('songs_pool.json')); print(f'Entries: {len(d)}')"
+
+      - name: Upload refreshed state to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload --clobber pool-latest songs_pool.json checkpoint.json

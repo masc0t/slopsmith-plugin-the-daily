@@ -3,13 +3,28 @@
 let _dsData = null;        // last /today response
 let _dsSigned = false;     // whether user signed today
 let _dsConfettiDone = false;
+let _dsRating = null;      // selected rating: -1, 1, 2, or null
+let _dsReturnAfterPlayback = false;
+let _dsReturnListenerRegistered = false;
 
 // ── Screen hook ──────────────────────────────────────────────────────────────
 (function () {
     const orig = window.showScreen;
     window.showScreen = function (id) {
         orig(id);
-        if (id === 'plugin-the_daily') dsInit();
+        if (id === 'plugin-the_daily') {
+            if (!_dsReturnListenerRegistered) {
+                _dsReturnListenerRegistered = true;
+                window.slopsmith.on('song:ended', () => {
+                    if (_dsReturnAfterPlayback) {
+                        _dsReturnAfterPlayback = false;
+                        showScreen('plugin-the_daily');
+                        dsInit();
+                    }
+                });
+            }
+            dsInit();
+        }
     };
 })();
 
@@ -19,7 +34,12 @@ async function dsInit() {
     dsShow('loading');
     try {
         const resp = await fetch('/api/plugins/the_daily/today');
-        _dsData = await resp.json();
+        const text = await resp.text();
+        _dsData = text ? JSON.parse(text) : null;
+        if (!_dsData) {
+            dsShowError('Empty response from server.');
+            return;
+        }
         if (_dsData.error) {
             dsShowError(_dsData.error);
             return;
@@ -43,6 +63,7 @@ function dsRender() {
 
     document.getElementById('ds-modifier-icon').textContent = mod.icon;
     document.getElementById('ds-modifier-label').textContent = mod.label;
+    document.getElementById('ds-seed').textContent = d.seed || '';
     document.getElementById('ds-modifier-desc').textContent = mod.description;
     document.getElementById('ds-day-name').textContent = d.day_name;
     document.getElementById('ds-day-number').textContent = `#${d.day_number}`;
@@ -74,12 +95,12 @@ function dsSongCard(song, index, blindside) {
         opacity = 'opacity-60';
         action = `<span class="text-green-500 text-lg flex-shrink-0">✓</span>`;
         if (song.has_locally) {
-            action += `<button onclick="dsPlay(${JSON.stringify(song.cf_id)},${JSON.stringify(song.local_filename)})"
+            action += `<button onclick='dsPlay(${song.cf_id},"${esc(song.local_filename)}")'
                 class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition flex-shrink-0">Replay</button>`;
         }
     } else if (song.has_locally) {
         border = 'border-accent/30';
-        action = `<button onclick="dsPlay(${JSON.stringify(song.cf_id)},${JSON.stringify(song.local_filename)})"
+        action = `<button onclick='dsPlay(${song.cf_id},"${esc(song.local_filename)}")'
             class="bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-xs font-semibold text-white transition flex-shrink-0">Play</button>`;
     } else {
         action = `<a href="${esc(song.cf_url)}" target="_blank" rel="noopener"
@@ -110,6 +131,7 @@ function dsSongCard(song, index, blindside) {
 }
 
 function dsFmtDuration(secs) {
+    if (typeof secs === 'string') return secs;
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);
     return `${m}:${String(s).padStart(2, '0')}`;
@@ -117,27 +139,38 @@ function dsFmtDuration(secs) {
 
 // ── Play a song ───────────────────────────────────────────────────────────────
 async function dsPlay(cfId, filename) {
-    const resp = await fetch('/api/plugins/the_daily/mark', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cf_id: cfId }),
-    });
-    const result = await resp.json();
+    _dsReturnAfterPlayback = true;
+    try {
+        const resp = await fetch('/api/plugins/the_daily/mark', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cf_id: cfId }),
+        });
 
-    // Update local state
-    if (_dsData) {
-        _dsData.progress = result.progress;
-        const song = _dsData.songs.find(s => s.cf_id === cfId);
-        if (song) song.done = true;
-        _dsData.is_complete = result.is_complete;
-        dsRender();
+        if (resp.ok) {
+            const text = await resp.text();
+            if (text) {
+                const result = JSON.parse(text);
 
-        if (result.is_complete && !_dsConfettiDone) {
-            setTimeout(() => {
-                dsShow('complete');
-                dsRenderComplete();
-            }, 800);
+                // Update local state
+                if (_dsData) {
+                    _dsData.progress = result.progress;
+                    const song = _dsData.songs.find(s => s.cf_id === cfId);
+                    if (song) song.done = true;
+                    _dsData.is_complete = result.is_complete;
+                    dsRender();
+
+                    if (result.is_complete && !_dsConfettiDone) {
+                        setTimeout(() => {
+                            dsShow('complete');
+                            dsRenderComplete();
+                        }, 800);
+                    }
+                }
+            }
         }
+    } catch (e) {
+        console.error('Failed to mark song:', e);
     }
 
     playSong(encodeURIComponent(filename));
@@ -149,7 +182,8 @@ async function dsRenderComplete() {
     document.getElementById('ds-complete-name').textContent = _dsData.day_name;
 
     const streakResp = await fetch('/api/plugins/the_daily/streak');
-    const { streak } = await streakResp.json();
+    const streakText = await streakResp.text();
+    const { streak } = streakText ? JSON.parse(streakText) : { streak: 0 };
     const streakEl = document.getElementById('ds-complete-streak');
     if (streak > 1) {
         streakEl.textContent = `🔥 ${streak}-day streak`;
@@ -165,6 +199,18 @@ async function dsRenderComplete() {
     }
 }
 
+// ── Rating selector ───────────────────────────────────────────────────────────
+function dsSelectRating(val) {
+    _dsRating = (_dsRating === val) ? null : val;
+    [-1, 1, 2].forEach(v => {
+        const btn = document.getElementById(`ds-rating-${v}`);
+        const selected = _dsRating === v;
+        btn.classList.toggle('ring-2', selected);
+        btn.classList.toggle('ring-accent', selected);
+        btn.classList.toggle('bg-accent/20', selected);
+    });
+}
+
 // ── Sign leaderboard ──────────────────────────────────────────────────────────
 async function dsSign() {
     const name = document.getElementById('ds-name-input').value.trim();
@@ -175,9 +221,10 @@ async function dsSign() {
     const resp = await fetch('/api/plugins/the_daily/sign', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ display_name: name }),
+        body: JSON.stringify({ display_name: name, rating: _dsRating }),
     });
-    const result = await resp.json();
+    const text = await resp.text();
+    const result = text ? JSON.parse(text) : {};
     if (result.error) {
         errEl.textContent = result.error;
         errEl.classList.remove('hidden');
@@ -193,7 +240,8 @@ async function dsSign() {
 async function dsShowLeaderboard() {
     dsShow('leaderboard');
     const resp = await fetch('/api/plugins/the_daily/leaderboard');
-    const data = await resp.json();
+    const text = await resp.text();
+    const data = text ? JSON.parse(text) : {};
 
     document.getElementById('ds-lb-day-name').textContent = data.day_name || '';
     document.getElementById('ds-lb-date').textContent = data.date
@@ -209,8 +257,22 @@ async function dsShowLeaderboard() {
     }
 
     const entries = data.entries || [];
-    const container = document.getElementById('ds-lb-entries');
+    const ratings = data.ratings || {};
+    const ratingIcon = { '-1': '👎', '1': '👍', '2': '🔥' };
 
+    const ratingsEl = document.getElementById('ds-lb-ratings');
+    const totalRated = Object.values(ratings).reduce((a, b) => a + b, 0);
+    if (totalRated > 0) {
+        ratingsEl.classList.remove('hidden');
+        ratingsEl.innerHTML = [-1, 1, 2]
+            .filter(v => ratings[v] > 0)
+            .map(v => `<span>${ratingIcon[v]} <span class="text-white font-medium">${ratings[v]}</span></span>`)
+            .join('');
+    } else {
+        ratingsEl.classList.add('hidden');
+    }
+
+    const container = document.getElementById('ds-lb-entries');
     if (entries.length === 0) {
         container.innerHTML = '<p class="text-gray-500 text-sm text-center py-8">No one has signed yet. Be the first!</p>';
     } else {
@@ -218,13 +280,15 @@ async function dsShowLeaderboard() {
             const time = e.completed_at
                 ? new Date(e.completed_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
                 : '';
-            const streak = e.streak > 1 ? `<span class="text-orange-400 text-xs ml-2">🔥 ${e.streak}-day streak</span>` : '';
+            const streak = e.streak > 1 ? `<span class="text-orange-400 text-xs">🔥 ${e.streak}-day streak</span>` : '';
+            const rating = e.rating != null ? `<span class="text-lg">${ratingIcon[e.rating] || ''}</span>` : '';
             return `
-                <div class="flex items-center gap-4 bg-dark-700/40 border border-gray-800/30 rounded-xl px-4 py-3">
-                    <span class="text-xs text-gray-600 w-6 text-center">${i + 1}</span>
+                <div class="flex items-center gap-3 bg-dark-700/40 border border-gray-800/30 rounded-xl px-4 py-3">
+                    <span class="text-xs text-gray-600 w-6 text-center flex-shrink-0">${i + 1}</span>
                     <span class="text-sm font-medium text-white flex-1">${esc(e.display_name)}</span>
                     ${streak}
-                    <span class="text-xs text-gray-500">${time}</span>
+                    ${rating}
+                    <span class="text-xs text-gray-500 flex-shrink-0">${time}</span>
                 </div>`;
         }).join('');
     }

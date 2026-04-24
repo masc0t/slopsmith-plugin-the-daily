@@ -10,3 +10,4 @@ __pycache__/
 reset_today.py
 preview.py
 .claude/settings.local.json
+cleanup_pool.py

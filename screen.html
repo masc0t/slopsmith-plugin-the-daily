@@ -12,6 +12,7 @@
             <div class="flex items-center gap-3 mb-1">
                 <span id="ds-modifier-icon" class="text-2xl"></span>
                 <span id="ds-modifier-label" class="text-xs font-semibold uppercase tracking-widest text-accent-light px-2 py-0.5 bg-accent/10 rounded-full"></span>
+                <span id="ds-seed" class="text-xs font-mono text-gray-500"></span>
                 <span id="ds-day-number" class="text-xs text-gray-500 font-mono"></span>
             </div>
             <h2 id="ds-day-name" class="text-4xl font-bold text-white mt-2"></h2>
@@ -47,6 +48,14 @@
 
         <div id="ds-sign-area" class="mb-6">
             <p class="text-gray-400 text-sm mb-4">Sign the Wall of Fame</p>
+            <div class="flex justify-center gap-3 mb-4">
+                <button id="ds-rating--1" onclick="dsSelectRating(-1)"
+                    class="text-2xl w-12 h-12 rounded-xl bg-dark-700 border border-gray-700 hover:border-gray-500 transition">👎</button>
+                <button id="ds-rating-1" onclick="dsSelectRating(1)"
+                    class="text-2xl w-12 h-12 rounded-xl bg-dark-700 border border-gray-700 hover:border-gray-500 transition">👍</button>
+                <button id="ds-rating-2" onclick="dsSelectRating(2)"
+                    class="text-2xl w-12 h-12 rounded-xl bg-dark-700 border border-gray-700 hover:border-gray-500 transition">🔥</button>
+            </div>
             <div class="flex gap-2 max-w-sm mx-auto">
                 <input type="text" id="ds-name-input" placeholder="Your name"
                     class="flex-1 bg-dark-700 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-600 focus:border-accent/60 outline-none">
@@ -67,7 +76,8 @@
         </button>
         <h2 class="text-3xl font-bold text-white mb-1">Wall of Fame</h2>
         <p id="ds-lb-day-name" class="text-accent-light mb-1"></p>
-        <p id="ds-lb-date" class="text-sm text-gray-500 mb-8"></p>
+        <p id="ds-lb-date" class="text-sm text-gray-500 mb-4"></p>
+        <div id="ds-lb-ratings" class="hidden flex gap-6 mb-8 text-sm text-gray-400"></div>
         <div id="ds-lb-entries" class="space-y-3"></div>
         <p id="ds-lb-count" class="text-sm text-gray-500 mt-6 text-center"></p>
         <p id="ds-lb-error" class="hidden text-xs text-yellow-500 mt-4 text-center"></p>
