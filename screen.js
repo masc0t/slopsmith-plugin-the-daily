@@ -2,10 +2,13 @@
 
 let _dsData = null;        // last /today response
 let _dsSigned = false;     // whether user signed today
+let _dsSigning = false;    // in-flight guard for sign submit
 let _dsConfettiDone = false;
 let _dsRating = null;      // selected rating: -1, 1, 2, or null
 let _dsReturnAfterPlayback = false;
 let _dsReturnListenerRegistered = false;
+
+function _dsSignKey(date) { return `ds_signed_${date}`; }
 
 // ── Screen hook ──────────────────────────────────────────────────────────────
 (function () {
@@ -193,6 +196,16 @@ async function dsRenderComplete() {
         streakEl.textContent = '';
     }
 
+    const stored = localStorage.getItem(_dsSignKey(_dsData.date));
+    if (stored) {
+        try {
+            const { name } = JSON.parse(stored);
+            _dsSigned = true;
+            document.getElementById('ds-sign-area').innerHTML =
+                `<p class="text-green-400 text-sm">✓ Signed as <strong>${esc(name)}</strong></p>`;
+        } catch {}
+    }
+
     if (!_dsConfettiDone) {
         _dsConfettiDone = true;
         dsRunConfetti();
@@ -213,27 +226,38 @@ function dsSelectRating(val) {
 
 // ── Sign leaderboard ──────────────────────────────────────────────────────────
 async function dsSign() {
+    if (_dsSigned || _dsSigning) return;
     const name = document.getElementById('ds-name-input').value.trim();
     const errEl = document.getElementById('ds-sign-error');
     errEl.classList.add('hidden');
     if (!name) { errEl.textContent = 'Enter your name.'; errEl.classList.remove('hidden'); return; }
 
-    const resp = await fetch('/api/plugins/the_daily/sign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ display_name: name, rating: _dsRating }),
-    });
-    const text = await resp.text();
-    const result = text ? JSON.parse(text) : {};
-    if (result.error) {
-        errEl.textContent = result.error;
-        errEl.classList.remove('hidden');
-        return;
+    _dsSigning = true;
+    try {
+        const resp = await fetch('/api/plugins/the_daily/sign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ display_name: name, rating: _dsRating }),
+        });
+        const text = await resp.text();
+        const result = text ? JSON.parse(text) : {};
+        if (result.error) {
+            errEl.textContent = result.error;
+            errEl.classList.remove('hidden');
+            return;
+        }
+        _dsSigned = true;
+        if (_dsData?.date) {
+            try {
+                localStorage.setItem(_dsSignKey(_dsData.date), JSON.stringify({ name, rating: _dsRating }));
+            } catch {}
+        }
+        document.getElementById('ds-sign-area').innerHTML =
+            `<p class="text-green-400 text-sm">✓ Signed as <strong>${esc(name)}</strong></p>`;
+        dsShowLeaderboard();
+    } finally {
+        _dsSigning = false;
     }
-    _dsSigned = true;
-    document.getElementById('ds-sign-area').innerHTML =
-        `<p class="text-green-400 text-sm">✓ Signed as <strong>${esc(name)}</strong></p>`;
-    dsShowLeaderboard();
 }
 
 // ── Leaderboard view ──────────────────────────────────────────────────────────
