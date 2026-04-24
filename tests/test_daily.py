@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).parents[2]))
+sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from plugins.the_daily.routes import (
     DEFAULT_SONG_COUNT,
@@ -31,7 +31,7 @@ from plugins.the_daily.routes import (
 )
 
 
-POOL_FILE = Path(__file__).parent / "songs_pool.json"
+POOL_FILE = Path(__file__).parent.parent / "songs_pool.json"
 
 
 def _load_test_pool():
