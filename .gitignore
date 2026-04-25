@@ -11,3 +11,6 @@ reset_today.py
 preview.py
 .claude/settings.local.json
 cleanup_pool.py
+debug_db.py
+the_daily.db
+*.db
