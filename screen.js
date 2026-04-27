@@ -14,8 +14,77 @@ let _dsActiveTab = 'today'; // 'today' or 'wof'
 let _dsWofLoaded = false;  // whether wall of fame data has been loaded
 let _dsPlayStartTime = 0;   // when current song started playing
 let _dsPlayingCfId = null;   // cf_id of song currently being played
+let _dsPlayingNodeId = null; // map node currently being played
+let _dsSkipNextInit = false;
+
+// Node type to icon mapping (centralized for visual consistency)
+const NODE_TYPE_ICONS = {
+    "forced": "🎸",
+    "elite": "⚔️",
+    "treasure": "💎",
+    "rest": "🛌",
+    "shop": "🏪",
+    "choice": "◇",
+    "mystery": "?",
+    "boss": "👑",
+};
 
 function _dsSignKey(date) { return `ds_signed_${date}`; }
+function dsInstallId() {
+    let id = localStorage.getItem('ds_install_id');
+    if (!id) {
+        id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem('ds_install_id', id);
+    }
+    return id;
+}
+
+function dsIsDebugMap() {
+    const params = new URLSearchParams(window.location.search || '');
+    return localStorage.getItem('ds_debug_map') === 'true' || params.get('ds_debug_map') === '1';
+}
+
+function dsDebugMap(on = true) {
+    localStorage.setItem('ds_debug_map', on ? 'true' : 'false');
+    if (on && _dsData?.date) localStorage.setItem('ds_debug_map_date', _dsData.date);
+    dsInit();
+}
+
+function dsDebugMapDay(delta) {
+    const base = localStorage.getItem('ds_debug_map_date') || _dsData?.date || new Date().toISOString().slice(0, 10);
+    const d = new Date(base + 'T12:00:00');
+    d.setDate(d.getDate() + delta);
+    localStorage.setItem('ds_debug_map_date', d.toISOString().slice(0, 10));
+    dsInit();
+}
+
+function dsDebugMapToday() {
+    localStorage.setItem('ds_debug_map_date', new Date().toISOString().slice(0, 10));
+    dsInit();
+}
+
+
+function dsRenderDebugHeader() {
+    const header = document.getElementById('ds-debug-header');
+    if (!header || !window.slopsmith) return;
+    
+    const debugDate = localStorage.getItem('ds_debug_map_date');
+    const isDebug = localStorage.getItem('ds_debug_map') === 'true';
+    
+    let debugText = '';
+    if (isDebug) {
+        debugText = debugDate ? `Debug: ${debugDate}` : 'Debug: ON (no date)';
+    }
+    
+    header.innerHTML = `<span class="ds-debug-label">${debugText}</span>`;
+    header.style.display = isDebug ? 'inline' : 'none';
+}
+function dsApiUrl(path) {
+    const sep = path.includes('?') ? '&' : '?';
+    const debugDate = localStorage.getItem('ds_debug_map_date');
+    const debug = dsIsDebugMap() ? `&debug_map=1${debugDate ? `&debug_date=${encodeURIComponent(debugDate)}` : ''}` : '';
+    return `${path}${sep}install_id=${encodeURIComponent(dsInstallId())}${debug}`;
+}
 
 // ── Screen hook ──────────────────────────────────────────────────────────────
 (function () {
@@ -23,6 +92,10 @@ function _dsSignKey(date) { return `ds_signed_${date}`; }
     window.showScreen = function (id) {
         orig(id);
 if (id === 'plugin-the_daily') {
+            if (_dsSkipNextInit) {
+                _dsSkipNextInit = false;
+                return;
+            }
             if (!_dsReturnListenerRegistered) {
                 _dsReturnListenerRegistered = true;
                 // Listen for song:play to update accurate start time
@@ -32,18 +105,30 @@ if (id === 'plugin-the_daily') {
                         _dsPlayStartTime = Date.now();
                     }
                 });
-                window.slopsmith.on('song:ended', (e) => {
+                window.slopsmith.on('song:ended', async (e) => {
                     // Mark completion if song was played long enough
                     if (_dsPlayingCfId && _dsPlayStartTime > 0) {
                         const durationPlayed = Math.floor((Date.now() - _dsPlayStartTime) / 1000);
-                        dsMarkSong(_dsPlayingCfId, durationPlayed);
+                        await dsMarkSong(_dsPlayingCfId, durationPlayed, _dsPlayingNodeId);
                         _dsPlayingCfId = null;
+                        _dsPlayingNodeId = null;
                         _dsPlayStartTime = 0;
                     }
                     if (_dsReturnAfterPlayback) {
                         _dsReturnAfterPlayback = false;
-                        showScreen('plugin-the_daily');
-                        dsInit();
+                        if (_dsData?.debug_no_save) {
+                            _dsSkipNextInit = true;
+                            showScreen('plugin-the_daily');
+                            if (_dsData.is_complete) {
+                                dsShow('complete');
+                                dsRenderComplete(true);
+                            } else {
+                                dsShow('setlist');
+                                dsRender();
+                            }
+                        } else {
+                            showScreen('plugin-the_daily');
+                        }
                     }
                 });
             }
@@ -56,7 +141,7 @@ if (id === 'plugin-the_daily') {
 async function dsInit() {
     dsShow('loading');
     try {
-        const resp = await fetch('/api/plugins/the_daily/today');
+        const resp = await fetch(dsApiUrl('/api/plugins/the_daily/today'));
         const text = await resp.text();
         _dsData = text ? JSON.parse(text) : null;
         if (!_dsData) {
@@ -111,8 +196,9 @@ function dsRender() {
 
     const fallback = document.getElementById('ds-fallback-notice');
     fallback.classList.toggle('hidden', !d.fallback);
+    dsRenderDebugToggle(d);
 
-    const pct = d.song_count > 0 ? Math.round((d.progress.done / d.progress.total) * 100) : 0;
+    const pct = d.progress.total > 0 ? Math.round((d.progress.done / d.progress.total) * 100) : 0;
     document.getElementById('ds-progress-bar').style.width = pct + '%';
     document.getElementById('ds-progress-label').textContent = `${d.progress.done} / ${d.progress.total}`;
 
@@ -121,7 +207,12 @@ function dsRender() {
     dsLoadStats();
 
     const container = document.getElementById('ds-songs');
-    container.innerHTML = d.songs.map((s, i) => dsSongCard(s, i, mod.is_blindside)).join('');
+    if (d.map) {
+        container.innerHTML = dsMapView(d);
+        dsLoadLanePopularity();
+    } else {
+        container.innerHTML = d.songs.map((s, i) => dsSongCard(s, i, mod.is_blindside)).join('');
+    }
 
     // Show rescan bar when any song is missing locally
     const rescanBar = document.getElementById('ds-rescan-bar');
@@ -129,6 +220,112 @@ function dsRender() {
         const anyMissing = d.songs.some(s => !s.has_locally);
         rescanBar.classList.toggle('hidden', !anyMissing);
     }
+}
+
+function dsRenderDebugToggle(d) {
+    const fallback = document.getElementById('ds-fallback-notice');
+    if (!fallback || !fallback.parentElement) return;
+    let btn = document.getElementById('ds-debug-map-toggle');
+    if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'ds-debug-map-toggle';
+        btn.className = 'mt-3 px-3 py-1.5 rounded-lg border border-yellow-700/40 bg-yellow-900/10 text-xs text-yellow-300 hover:bg-yellow-900/20 transition';
+        fallback.parentElement.appendChild(btn);
+    }
+    btn.textContent = d.debug_no_save ? 'Exit Map Debug' : 'Map Debug (no save)';
+    btn.onclick = () => dsDebugMap(!d.debug_no_save);
+}
+
+async function dsLoadLanePopularity() {
+    if (!_dsData?.map) return;
+    const el = document.getElementById('ds-lane-popularity');
+    if (!el) return;
+    try {
+        const resp = await fetch(`/api/plugins/the_daily/leaderboard?date=${encodeURIComponent(_dsData.date)}`, { cache: 'no-store' });
+        const data = await resp.json();
+        const bits = (data.lane_popularity || []).map(p => `${p.percent}% ${dsLaneLabel(p.lane)}`);
+        el.textContent = bits.length ? bits.join(' · ') : 'No lane picks signed yet';
+    } catch (e) {
+        el.textContent = 'Lane popularity unavailable';
+    }
+}
+
+function dsMapView(d) {
+    const map = d.map;
+    const songMap = Object.fromEntries((d.songs || []).map(s => [s.cf_id, s]));
+    const available = new Set(d.available_node_ids || []);
+    const cleared = new Set(d.cleared_node_ids || []);
+    const locked = new Set(d.locked_node_ids || []);
+    const rows = {};
+    (map.nodes || []).forEach(n => { (rows[n.row] ||= []).push(n); });
+    const maxRow = Math.max(...Object.keys(rows).map(Number));
+    const maxCol = Math.max(0, ...map.nodes.map(n => n.col || 0));
+    const w = 640;
+    const h = Math.max(300, (maxRow + 1) * 86);
+    const pos = {};
+    map.nodes.forEach(n => {
+        pos[n.id] = {
+            x: 70 + ((n.col || 0) * ((w - 140) / Math.max(1, maxCol))),
+            y: 44 + ((n.row || 0) * ((h - 88) / Math.max(1, maxRow))),
+        };
+    });
+    const edges = map.nodes.flatMap(n => (n.edges || []).map(to => ({ from: n.id, to })));
+    const laneNames = Object.entries(map.lanes || {}).map(([id, icon]) => `${icon || ''} ${dsLaneLabel(id)}`.trim()).join(' · ');
+    // Simple color mapping for lanes (acts) to improve visual progression cues
+    const LANE_COLORS = {
+        standard: '#1d4ed8',
+        drop: '#a78bfa',
+        flat: '#14b8a6',
+        sprint: '#10b981',
+        marathon: '#f59e0b',
+    };
+    const rerolls = d.inventory?.counts?.boss_reroll || 0;
+    const inventory = `<div class="bg-dark-700/40 border border-gray-800/40 rounded-xl px-4 py-3 mb-4 space-y-2">
+        <div class="flex items-center justify-between gap-3"><span class="text-xs text-gray-400">${laneNames || 'Daily path'}</span>
+        <button onclick="dsUseBossReroll()" ${(!rerolls || d.boss_revealed || d.used_reroll) ? 'disabled' : ''} class="px-3 py-1.5 rounded-lg border border-purple-700/40 bg-purple-900/20 text-xs text-purple-200 disabled:opacity-40 disabled:cursor-not-allowed">🎲 Boss Re-roll ×${rerolls}</button>
+        </div>${d.debug_no_save ? '<div class="text-xs text-yellow-400 font-semibold">DEBUG MAP · no DB writes, no completion/streak changes <button onclick="dsDebugMap(false)" class="ml-2 underline">exit</button></div>' : ''}<div id="ds-lane-popularity" class="text-[11px] text-gray-500">Loading lane popularity...</div>
+    </div>`;
+    const svgEdges = edges.map(e => `<line x1="${pos[e.from].x}" y1="${pos[e.from].y}" x2="${pos[e.to].x}" y2="${pos[e.to].y}" stroke="rgba(148,163,184,.22)" stroke-width="2" />`).join('');
+    const svgNodes = map.nodes.map(n => {
+        const state = cleared.has(n.id) ? 'cleared' : locked.has(n.id) ? 'locked' : available.has(n.id) ? 'available' : 'future';
+        const fill = state === 'cleared' ? '#14532d' : state === 'available' ? '#1d4ed8' : state === 'locked' ? '#111827' : '#1f2937';
+        const stroke = state === 'cleared' ? '#22c55e' : state === 'available' ? '#60a5fa' : '#374151';
+        const icon = dsNodeIcon(n);
+        const click = state === 'available' || state === 'cleared' ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
+        // Act label near the node (if provided)
+        const actLabel = n.act ? `<text x="${pos[n.id].x}" y="${pos[n.id].y - 28}" text-anchor="middle" class="ds-svg-act" fill="currentColor" font-size="11">${esc(n.act)}</text>` : '';
+        // Lane color cue is handled via CSS classes; color variables applied in CSS
+        return `<g ${click} class="ds-svg-lane-group lane-${n.lane || 'standard'}" data-lane="${n.lane || 'standard'}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
+            <text x="${pos[n.id].x}" y="${pos[n.id].y + 6}" text-anchor="middle" fill="white" font-size="18">${icon}</text>
+            ${actLabel}
+            <text x="${pos[n.id].x}" y="${pos[n.id].y + 42}" text-anchor="middle" fill="#9ca3af" font-size="11">${esc(dsLaneLabel(n.lane) || n.id)}</text></g>`;
+    }).join('');
+    return `${inventory}<div class="bg-dark-800/60 border border-gray-800 rounded-2xl p-3 overflow-x-auto mb-4"><svg viewBox="0 0 ${w} ${h}" class="w-full min-w-[520px]">${svgEdges}${svgNodes}</svg></div><div id="ds-map-panel" class="space-y-3">${dsMapHint(d)}</div>`;
+}
+
+function dsMapHint(d) {
+    const available = d.available_node_ids || [];
+    if (available.length === 0) return '<div class="text-sm text-gray-500 text-center py-4">No available nodes.</div>';
+    return `<div class="text-sm text-gray-400 text-center py-4">Pick an available glowing node to continue.</div>`;
+}
+
+function dsLaneLabel(id) {
+    const labels = { standard: 'Standard', drop: 'Drop', flat: 'Flat', sprint: 'Sprint', marathon: 'Marathon', daily: 'Daily' };
+    if (!id) return '';
+    if (/^decade_\d{4}s$/.test(id)) return id.slice('decade_'.length);
+    return labels[id] || id.replace(/_/g, ' ');
+}
+
+function dsNodeIcon(n) {
+    // Prefer mapping-based iconography for consistency across types
+    if (!n) return '●';
+    const t = n.type;
+    if (t && NODE_TYPE_ICONS[t]) return NODE_TYPE_ICONS[t];
+    // Fallbacks for known special cases to maintain backward compatibility
+    if (t === 'boss') return NODE_TYPE_ICONS.boss;
+    if (t === 'choice') return NODE_TYPE_ICONS.choice;
+    if (t === 'mystery') return NODE_TYPE_ICONS.mystery;
+    return '●';
 }
 
 // ── Rescan Library ────────────────────────────────────────────────────────────
@@ -300,20 +497,137 @@ async function dsLoadStats() {
 }
 
 // ── Play a song ───────────────────────────────────────────────────────────────
+function dsOpenNode(nodeId) {
+    if (!_dsData?.map) return;
+    const panel = document.getElementById('ds-map-panel');
+    const node = _dsData.map.nodes.find(n => n.id === nodeId);
+    if (!panel || !node) return;
+    const songMap = Object.fromEntries((_dsData.songs || []).map(s => [s.cf_id, s]));
+    const cleared = new Set(_dsData.cleared_node_ids || []);
+    const available = new Set(_dsData.available_node_ids || []);
+    const canPlay = available.has(nodeId) || cleared.has(nodeId);
+    let body = '';
+    if (node.type === 'choice') {
+        body = (node.cf_ids || []).map((id, i) => dsMapSongOption(node, songMap[id], `Option ${i + 1}`, canPlay)).join('');
+    } else if (node.type === 'mystery') {
+        const pool = node.cf_pool || [];
+        const idx = dsStableIndex(`${dsInstallId()}:${_dsData.date}:${node.id}`, pool.length);
+        const song = songMap[pool[idx]];
+        body = dsMapSongOption(node, song, 'Mystery revealed', canPlay);
+    } else {
+        body = dsMapSongOption(node, songMap[node.cf_id], node.type === 'boss' && !_dsData.boss_revealed ? 'Boss' : 'Song', canPlay);
+    }
+    panel.innerHTML = `<div class="bg-dark-700/50 border border-accent/30 rounded-2xl p-4 text-left">
+        <div class="flex items-center gap-2 mb-3"><span class="text-xl">${dsNodeIcon(node)}</span><span class="text-sm font-semibold text-white">${esc(node.id)} · ${esc(dsLaneLabel(node.lane) || node.type)}</span></div>
+        <div class="space-y-3">${body}</div>
+    </div>`;
+}
+
+function dsMapSongOption(node, song, label, canPlay) {
+    if (!song) return '<div class="text-sm text-red-400">Song missing from payload.</div>';
+    const title = node.type === 'boss' && !_dsData.boss_revealed ? '???' : esc(song.title);
+    const local = song.has_locally && song.local_filename;
+    const action = local && canPlay
+        ? `<button onclick='dsPlayMapNode("${esc(node.id)}",${song.cf_id},"${esc(song.local_filename)}")' class="bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-xs font-semibold text-white transition">Play</button>`
+        : !local
+            ? `<a href="${esc(song.cf_url || '#')}" target="_blank" rel="noopener" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-xl text-xs text-gray-300 transition">Get on CF ↗</a>`
+            : `<span class="text-xs text-gray-500">Locked</span>`;
+    return `<div class="flex items-center gap-3 bg-dark-800/60 border border-gray-800 rounded-xl p-3">
+        <div class="flex-1 min-w-0"><div class="text-xs text-accent-light uppercase tracking-wider mb-1">${esc(label)}</div>
+        <div class="text-sm font-medium text-white">${title}</div><div class="text-xs text-gray-500">${esc(song.artist || '')} · ${esc(song.tuning || '—')} ${song.duration ? '· ' + esc(dsFmtDuration(song.duration)) : ''}</div></div>${action}</div>`;
+}
+
+function dsStableIndex(text, length) {
+    if (!length) return 0;
+    let h = 0;
+    for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+    return Math.abs(h) % length;
+}
+
+async function dsUseBossReroll() {
+    if (!_dsData?.map) return;
+    try {
+        const resp = await fetch('/api/plugins/the_daily/use-item', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                install_id: dsInstallId(),
+                item_id: 'boss_reroll',
+                payload: {},
+                debug_no_save: !!_dsData.debug_no_save,
+                cleared_node_ids: _dsData.cleared_node_ids || [],
+                committed_node_ids: _dsData.committed_node_ids || [],
+            }),
+        });
+        const text = await resp.text();
+        const data = text ? JSON.parse(text) : {};
+        if (!resp.ok || data.error) {
+            const panel = document.getElementById('ds-map-panel');
+            if (panel) panel.innerHTML = `<div class="text-sm text-yellow-400 text-center py-3">${esc(data.error || 'Could not use item.')}</div>`;
+            return;
+        }
+        _dsData.inventory = data.inventory;
+        _dsData.used_reroll = true;
+        const boss = _dsData.map.nodes.find(n => n.id === _dsData.map.boss);
+        if (boss) boss.cf_id = data.boss_cf_id;
+        if (data.song && !_dsData.songs.some(s => s.cf_id === data.song.cf_id)) {
+            _dsData.songs.push(data.song);
+        }
+        if (_dsData.debug_no_save) {
+            dsRender();
+        } else {
+            await dsInit();
+        }
+    } catch (e) {
+        const panel = document.getElementById('ds-map-panel');
+        if (panel) panel.innerHTML = '<div class="text-sm text-red-400 text-center py-3">Network error using item.</div>';
+    }
+}
+
+async function dsPlayMapNode(nodeId, cfId, filename) {
+    try {
+        await fetch('/api/plugins/the_daily/mark', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                install_id: dsInstallId(),
+                node_id: nodeId,
+                cf_id: cfId,
+                duration_played: 0,
+                action: 'commit',
+                debug_no_save: !!_dsData.debug_no_save,
+                cleared_node_ids: _dsData.cleared_node_ids || [],
+                committed_node_ids: _dsData.committed_node_ids || [],
+            }),
+        });
+    } catch (e) {}
+    dsPlay(cfId, filename, nodeId);
+}
+
 async function dsPlay(cfId, filename) {
+    const nodeId = arguments.length > 2 ? arguments[2] : null;
     _dsReturnAfterPlayback = true;
     _dsPlayStartTime = Date.now();  // Track when song started
     _dsPlayingCfId = cfId;         // Track which song is playing
+    _dsPlayingNodeId = nodeId;
     playSong(encodeURIComponent(filename));
 }
 
 // Mark song completion (called when song:ended fires)
-async function dsMarkSong(cfId, durationPlayed = 0) {
+async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
     try {
         const resp = await fetch('/api/plugins/the_daily/mark', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cf_id: cfId, duration_played: durationPlayed }),
+            body: JSON.stringify({
+                install_id: dsInstallId(),
+                cf_id: cfId,
+                node_id: nodeId,
+                duration_played: durationPlayed,
+                debug_no_save: !!_dsData?.debug_no_save,
+                cleared_node_ids: _dsData?.cleared_node_ids || [],
+                committed_node_ids: _dsData?.committed_node_ids || [],
+            }),
         });
 
         if (resp.ok) {
@@ -328,11 +642,16 @@ async function dsMarkSong(cfId, durationPlayed = 0) {
                 }
 
                 // Update local state
-                if (_dsData && result.ok) {
-                    _dsData.progress = result.progress;
-                    const song = _dsData.songs.find(s => s.cf_id === cfId);
-                    if (song) song.done = true;
-                    _dsData.is_complete = result.is_complete;
+                    if (_dsData && result.ok) {
+                        _dsData.progress = result.progress;
+                        const song = _dsData.songs.find(s => s.cf_id === cfId);
+                        if (song) song.done = true;
+                        ['cleared_node_ids', 'available_node_ids', 'locked_node_ids', 'committed_node_ids'].forEach(k => {
+                            if (result[k]) _dsData[k] = result[k];
+                        });
+                        if (typeof result.boss_revealed !== 'undefined') _dsData.boss_revealed = result.boss_revealed;
+                        if (result.inventory) _dsData.inventory = result.inventory;
+                        _dsData.is_complete = result.is_complete;
                     dsRender();
 
                     if (result.is_complete && _dsConfettiDoneFor !== _dsData.date) {
@@ -413,7 +732,7 @@ async function dsRenderComplete(fireConfetti = false) {
         const isToday = (_dsLbDate === todayIso || _dsLbDate === _dsData.date) && !(_dsData.is_historical);
         const signed = localStorage.getItem(_dsSignKey(_dsData.date));
         
-        if (isToday && !signed) {
+        if (isToday && !signed && !_dsData.debug_no_save) {
             signContainer.classList.remove('hidden');
             const nameInput = document.getElementById('ds-sign-name');
             if (nameInput) {
@@ -514,6 +833,10 @@ function dsRenderCompleteSetlist() {
     const container = document.getElementById('ds-complete-setlist');
     if (!container || !_dsData) return;
     const songs = _dsData.songs || [];
+    if (_dsData.map) {
+        container.innerHTML = dsMapView(_dsData);
+        return;
+    }
     if (songs.length === 0) {
         container.innerHTML = '<div class="text-sm text-gray-400">No songs in today\'s setlist.</div>';
         return;
@@ -560,6 +883,7 @@ async function dsSign() {
         const payload = {
             display_name: name,
             rating: _dsRating,
+            install_id: dsInstallId(),
         };
         if (message) payload.message = message;
 
@@ -786,16 +1110,22 @@ function dsRenderWof(data) {
     const container = document.getElementById('ds-lb-entries');
     const entries = data.entries || [];
     if (container) {
+        const popularity = (data.lane_popularity || []).map(p => `${esc(dsLaneLabel(p.lane))} ${p.percent}%`).join(' · ');
+        const popularityHtml = popularity ? `<div class="text-xs text-gray-400 bg-dark-700/40 border border-gray-800 rounded-xl px-4 py-2 mb-3">Lane popularity: ${popularity}</div>` : '';
         if (entries.length === 0) {
-            container.innerHTML = '<div class="text-gray-500 text-sm py-4 text-center">No entries for this day.</div>';
+            container.innerHTML = popularityHtml + '<div class="text-gray-500 text-sm py-4 text-center">No entries for this day.</div>';
         } else {
             const ratingIcon = { '-1': '👎', '1': '👍', '2': '🔥' };
-            container.innerHTML = entries.map((e, idx) => {
+            const rarestCount = Math.min(...(data.lane_popularity || []).map(p => p.count).concat([Infinity]));
+            const rarestLanes = new Set((data.lane_popularity || []).filter(p => p.count === rarestCount).map(p => p.lane));
+            container.innerHTML = popularityHtml + entries.map((e, idx) => {
                 const time = e.completed_at ? new Date(e.completed_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '';
                 const name = esc(e.display_name || 'Unknown');
                 const streak = (e.streak && e.streak > 1) ? `<span class="text-orange-400 text-xs">🔥 ${e.streak}-day streak</span>` : '';
                 const rating = (e.rating != null) ? `<span class="text-lg ml-2">${ratingIcon[e.rating] || ''}</span>` : '';
                 const message = (e.message) ? `<div class="text-xs text-gray-400 italic mt-0.5">${esc(e.message)}</div>` : '';
+                const badges = `${e.used_reroll ? '🎲' : ''}${e.lane_taken === 'sprint' ? ' ⚡' : ''}${e.lane_taken === 'marathon' ? ' 🌙' : ''}${rarestLanes.has(e.lane_taken) ? ' 🏴' : ''}`.trim();
+                const pathTrace = Array.isArray(e.path) && e.path.length ? dsPathTraceSvg(e.path) : '';
                 return `
                     <div class="flex items-start gap-3 bg-dark-700/40 border border-gray-800/30 rounded-xl px-4 py-3">
                         <span class="text-xs text-gray-600 w-6 text-center mt-1">${idx + 1}</span>
@@ -804,8 +1134,10 @@ function dsRenderWof(data) {
                                 <span class="text-sm font-medium text-white">${name}</span>
                                 ${streak}
                                 ${rating}
+                                ${badges ? `<span class="text-xs">${badges}</span>` : ''}
                             </div>
                             ${message}
+                            ${pathTrace}
                         </div>
                         <span class="text-xs text-gray-500 flex-shrink-0 mt-0.5">${time}</span>
                     </div>`;
@@ -818,6 +1150,15 @@ function dsRenderWof(data) {
         const n = entries.length;
         countEl.textContent = n === 1 ? '1 signer completed today' : `${n} signers completed today`;
     }
+}
+
+function dsPathTraceSvg(path) {
+    const n = path.length;
+    if (!n) return '';
+    const w = Math.max(70, n * 18);
+    const circles = path.map((_, i) => `<circle cx="${10 + i * 18}" cy="10" r="4" fill="#60a5fa" />`).join('');
+    const lines = path.slice(1).map((_, i) => `<line x1="${10 + i * 18}" y1="10" x2="${28 + i * 18}" y2="10" stroke="#475569" stroke-width="2" />`).join('');
+    return `<svg width="${w}" height="20" viewBox="0 0 ${w} 20" class="mt-1" aria-label="Path trace">${lines}${circles}</svg>`;
 }
 
 // Unified navigation and button state

@@ -1,5 +1,24 @@
 <div class="max-w-2xl mx-auto px-6 pt-24 pb-16">
 
+<style>
+  :root {
+    --lane-standard: #1d4ed8;
+    --lane-drop: #a78bfa;
+    --lane-flat: #14b8a6;
+    --lane-sprint: #10b981;
+    --lane-marathon: #f59e0b;
+  }
+  /* Optional helper to make act labels inherit lane color via currentColor */
+  .ds-svg-lane-group { color: var(--lane-standard); }
+  .ds-svg-act { fill: currentColor; font-family: system-ui, -apple-system, sans-serif; }
+  </style>
+  /* Lane colors mapped to classes for CSS-driven styling */
+  .ds-svg-lane-group.lane-standard { color: var(--lane-standard); }
+  .ds-svg-lane-group.lane-drop { color: var(--lane-drop); }
+  .ds-svg-lane-group.lane-flat { color: var(--lane-flat); }
+  .ds-svg-lane-group.lane-sprint { color: var(--lane-sprint); }
+  .ds-svg-lane-group.lane-marathon { color: var(--lane-marathon); }
+
     <!-- Loading -->
     <div id="ds-loading" class="flex items-center justify-center py-32">
         <div class="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>

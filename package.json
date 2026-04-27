@@ -1,0 +1,11 @@
+{
+  "name": "the_daily-tests",
+  "version": "0.1.0",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.20.0"
+  },
+  "scripts": {
+    "test:e2e": "npx playwright test"
+  }
+}

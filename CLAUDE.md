@@ -105,3 +105,12 @@ python build_pool.py --fill-artists --cf-cookie '...'   # back-fill missing meta
 - **The pool ships ~14 MB of JSON.** Keep it gitignored. End users fetch via `POOL_URL` once that's set; until then they use whatever bundled copy they have.
 - **`day_number` is anchored to `_EPOCH = date(2026, 4, 22)`.** Don't bump this — it would renumber every past day in every user's UI.
 - **The Supabase anon key is public on purpose.** Don't rotate it as if it leaked. If abuse becomes a problem, add a Postgres RLS policy or rate-limit at the edge instead.
+## The Daily MVP Roadmap
+
+- Finalize CSS-driven styling for map lanes and acts (Option A): move lane colors and act-label styling into CSS variables and lane-<name> classes.
+- Add lightweight map render tests (no server): a small harness that asserts icon mapping, act labels presence, and lane classes.
+- Extend preview workflow with a deterministic test path to produce stable snapshots for comparison.
+- Improve accessibility (ARIA labels, keyboard navigation) and add a short legend for lane colors.
+- Document how to run deterministic previews and how to verify visuals locally.
+- Document how to run deterministic previews and how to verify visuals locally.
+- Extend doc with quick-start for MVP tests (map render harness and HTML test page).

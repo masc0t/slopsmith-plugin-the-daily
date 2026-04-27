@@ -25,6 +25,8 @@ SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 POOL_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/download/pool-latest/songs_pool.json"
 
 DEFAULT_SONG_COUNT = 5
+MAP_MODE_START = date(2026, 5, 2)
+BOSS_REROLL_ITEM = "boss_reroll"
 
 # Lightweight per-day leaderboard cache
 import time as _time
@@ -485,9 +487,41 @@ def _get_conn():
                 fetched_date TEXT PRIMARY KEY,
                 pool         TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS daily_inventory (
+                install_id TEXT PRIMARY KEY,
+                items TEXT NOT NULL DEFAULT '[]',
+                last_streak_milestone INTEGER NOT NULL DEFAULT 0,
+                starter_awarded INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS daily_boss_rerolls (
+                install_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                rerolled_cf_id INTEGER NOT NULL,
+                PRIMARY KEY (install_id, date)
+            );
+            CREATE TABLE IF NOT EXISTS daily_node_commits (
+                install_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                cf_id INTEGER,
+                committed_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (install_id, date, node_id)
+            );
         """)
+        _ensure_column(_conn, "daily_setlists", "map", "TEXT")
+        _ensure_column(_conn, "daily_setlists", "fallback", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(_conn, "daily_completions", "node_id", "TEXT")
+        _ensure_column(_conn, "daily_completions", "install_id", "TEXT")
+        _ensure_column(_conn, "daily_inventory", "starter_awarded", "INTEGER NOT NULL DEFAULT 0")
         _conn.commit()
     return _conn
+
+
+def _ensure_column(conn, table, column, ddl):
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 # ── Pool loading ──────────────────────────────────────────────────────────────
@@ -822,6 +856,802 @@ def _select_songs(date_str, modifier_id, pool, exclude=None):
     return selected, len(selected), fallback
 
 
+# ── Map Mode generation ───────────────────────────────────────────────────────
+MAP_LANES = {
+    "standard": {
+        "label": "Standard",
+        "icon": "🎸",
+        "fn": lambda s: _tuning_family(s) == "standard",
+    },
+    "drop": {
+        "label": "Drop",
+        "icon": "⬇️",
+        "fn": lambda s: _tuning_family(s) == "drop",
+    },
+    "flat": {
+        "label": "Flat",
+        "icon": "🌍",
+        "fn": lambda s: _tuning_family(s) == "half_down",
+    },
+    "sprint": {
+        "label": "Sprint",
+        "icon": "⚡",
+        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) < 180,
+    },
+    "marathon": {
+        "label": "Marathon",
+        "icon": "🌙",
+        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) > 300,
+    },
+    "decade": {
+        "label": "Decade",
+        "icon": "📻",
+        "dynamic": "decade",
+    },
+}
+
+MAP_SHAPE_WEIGHTS = [
+    ("fork", 30),
+    ("diamond", 30),
+    ("crossroads", 20),
+    ("bramble", 12),
+    ("spiral", 8),
+]
+
+
+def _song_duration_seconds(song):
+    raw = song.get("duration")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    parts = text.split(":")
+    if len(parts) in (2, 3):
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            return None
+        seconds = 0
+        for n in nums:
+            seconds = seconds * 60 + n
+        return seconds
+    return None
+
+
+def _weighted_choice(rng, weighted_items):
+    total = sum(weight for _, weight in weighted_items)
+    pick = rng.uniform(0, total)
+    upto = 0
+    for item, weight in weighted_items:
+        upto += weight
+        if pick <= upto:
+            return item
+    return weighted_items[-1][0]
+
+
+def _map_shape_template(shape, act=None, row_offset=0):
+    def _row(r):
+        return r + row_offset
+    if shape == "fork":
+        return [
+            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2"], "act": act},
+            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
+            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 2, "lane_slot": 1, "edges": ["n4"], "act": act},
+            {"id": f"n3_{act}" if act else "n3", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
+            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 2, "lane_slot": 1, "edges": ["nb"], "act": act},
+            {"id": f"nb_{act}" if act else "nb", "row": _row(3), "col": 1, "lane_slot": None, "edges": [], "act": act},
+        ]
+    if shape == "diamond":
+        return [
+            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2"], "act": act},
+            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
+            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 2, "lane_slot": 1, "edges": ["n3"], "act": act},
+            {"id": f"n3_{act}" if act else "n3", "row": _row(2), "col": 1, "lane_slot": None, "edges": ["n4", "n5"], "act": act},
+            {"id": f"n4_{act}" if act else "n4", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
+            {"id": f"n5_{act}" if act else "n5", "row": _row(3), "col": 2, "lane_slot": 1, "edges": ["nb"], "act": act},
+            {"id": f"nb_{act}" if act else "nb", "row": _row(4), "col": 1, "lane_slot": None, "edges": [], "act": act},
+        ]
+    if shape == "crossroads":
+        return [
+            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2", "n3"], "act": act},
+            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n4", "n5"], "act": act},
+            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 1, "lane_slot": 1, "edges": ["n5"], "act": act},
+            {"id": f"n3_{act}" if act else "n3", "row": _row(1), "col": 2, "lane_slot": 2, "edges": ["n5", "n6"], "act": act},
+            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n7"], "act": act},
+            {"id": f"n5_{act}" if act else "n5", "row": _row(2), "col": 1, "lane_slot": 1, "edges": ["n7"], "act": act},
+            {"id": f"n6_{act}" if act else "n6", "row": _row(2), "col": 2, "lane_slot": 2, "edges": ["n7"], "act": act},
+            {"id": f"n7_{act}" if act else "n7", "row": _row(3), "col": 1, "lane_slot": None, "edges": ["nb"], "act": act},
+            {"id": f"nb_{act}" if act else "nb", "row": _row(4), "col": 1, "lane_slot": None, "edges": [], "act": act},
+        ]
+    if shape == "bramble":
+        return [
+            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2", "n3"], "act": act},
+            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n4", "n5"], "act": act},
+            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 1, "lane_slot": 1, "edges": ["n5", "n6"], "act": act},
+            {"id": f"n3_{act}" if act else "n3", "row": _row(1), "col": 2, "lane_slot": 2, "edges": ["n6"], "act": act},
+            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n8"], "act": act},
+            {"id": f"n5_{act}" if act else "n5", "row": _row(2), "col": 1, "lane_slot": 1, "edges": ["n7", "n8"], "act": act},
+            {"id": f"n6_{act}" if act else "n6", "row": _row(2), "col": 2, "lane_slot": 2, "edges": ["n7"], "act": act},
+            {"id": f"n7_{act}" if act else "n7", "row": _row(3), "col": 2, "lane_slot": 2, "edges": ["n9"], "act": act},
+            {"id": f"n8_{act}" if act else "n8", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["n9"], "act": act},
+            {"id": f"n9_{act}" if act else "n9", "row": _row(4), "col": 1, "lane_slot": None, "edges": ["nb"], "act": act},
+            {"id": f"nb_{act}" if act else "nb", "row": _row(5), "col": 1, "lane_slot": None, "edges": [], "act": act},
+        ]
+    # spiral as fallback
+    return [
+        {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 0, "lane_slot": 0, "edges": ["n1"], "act": act},
+        {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n2"], "act": act},
+        {"id": f"n2_{act}" if act else "n2", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
+        {"id": f"n3_{act}" if act else "n3", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["n4"], "act": act},
+        {"id": f"n4_{act}" if act else "n4", "row": _row(4), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
+        {"id": f"nb_{act}" if act else "nb", "row": _row(5), "col": 0, "lane_slot": None, "edges": [], "act": act},
+    ]
+
+
+def _map_modifier_pool(date_str, modifier_id, pool, exclude=None):
+    mod = MODIFIERS[modifier_id]
+    count = mod.get("count", DEFAULT_SONG_COUNT)
+    fallback = False
+
+    if mod["type"] in ("filter", "filter+count"):
+        candidates = [s for s in pool if mod["fn"](s)]
+        if len(candidates) < count:
+            return pool, True
+        return candidates, False
+
+    if mod["type"] == "identity":
+        candidates, fallback = _identity_candidates(
+            date_str, pool, mod["key"], count, mod.get("min_pool"),
+            exclude=exclude, seed_suffix=modifier_id + "map",
+        )
+        return candidates, fallback
+
+    return pool, False
+
+
+def _boss_eligible(song):
+    duration = _song_duration_seconds(song)
+    return (
+        duration is not None
+        and duration >= 240
+        and bool((song.get("artist") or "").strip())
+        and bool(song.get("year"))
+    )
+
+
+ACTS = ['Act 1', 'Act 2', 'Act 3']
+
+ROOM_TYPES = {
+    "standard": {
+        "label": "Standard",
+        "icon": "🎸",
+        "color": "#1d4ed8",  # blue
+        "description": "Play a song to continue",
+        "fn": lambda s: _tuning_family(s) == "standard",
+    },
+    "elite": {
+        "label": "Elite",
+        "icon": "⚔️",
+        "color": "#dc2626",  # red
+        "description": "High-stakes challenge song",
+        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) > 240,
+    },
+    "treasure": {
+        "label": "Treasure",
+        "icon": "💎",
+        "color": "#f59e0b",  # yellow
+        "description": "Bonus item or bonus song",
+        "fn": lambda s: True,  # any song
+    },
+    "rest": {
+        "label": "Rest",
+        "icon": "🛌",
+        "color": "#10b981",  # green
+        "description": "Recovery and preparation",
+        "fn": lambda s: _tuning_family(s) == "standard" and _song_duration_seconds(s) is not None and _song_duration_seconds(s) < 180,
+    },
+    "shop": {
+        "label": "Shop",
+        "icon": "🏪",
+        "color": "#8b5cf6",  # purple
+        "description": "Purchase upgrades or items",
+        "fn": lambda s: _tuning_family(s) == "drop",
+    },
+    "drop": {
+        "label": "Drop",
+        "icon": "⬇️",
+        "color": "#6366f1",  # indigo
+        "fn": lambda s: _tuning_family(s) == "drop",
+    },
+    "flat": {
+        "label": "Flat",
+        "icon": "🌍",
+        "color": "#14b8a6",  # teal
+        "fn": lambda s: _tuning_family(s) == "half_down",
+    },
+    "sprint": {
+        "label": "Sprint",
+        "icon": "⚡",
+        "color": "#f97316",  # orange
+        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) < 180,
+    },
+    "marathon": {
+        "label": "Marathon",
+        "icon": "🌙",
+        "color": "#64748b",  # slate
+        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) > 300,
+    },
+    "decade": {
+        "label": "Decade",
+        "icon": "📻",
+        "color": "#ec4899",  # pink
+        "dynamic": "decade",
+    },
+}
+
+def _assign_map_node_types(nodes, rng):
+    mystery_count = 0
+    elite_count = 0
+    for node in nodes:
+        if node["id"] == "nb":
+            node["type"] = "boss"
+        elif node["row"] == 0:
+            node["type"] = "forced"  # Start node
+        else:
+            roll = rng.random()
+            if roll < 0.15:
+                node["type"] = "elite"
+                elite_count += 1
+            elif roll < 0.30:
+                node["type"] = "treasure"
+            elif roll < 0.45:
+                node["type"] = "rest"
+            elif roll < 0.60:
+                node["type"] = "shop"
+            elif roll < 0.85:
+                node["type"] = "forced"
+            elif mystery_count < 2:
+                node["type"] = "mystery"
+                mystery_count += 1
+            else:
+                node["type"] = "forced"
+    return nodes
+
+
+def _node_song_need(node):
+    if node["type"] == "choice":
+        return 3
+    if node["type"] == "mystery":
+        return 4
+    if node["type"] == "forced":
+        return 1
+    if node["type"] == "elite":
+        return 5
+    if node["type"] == "treasure":
+        return 2
+    if node["type"] == "rest":
+        return 0  # rest rooms do not require a song
+    if node["type"] == "shop":
+        return 0
+    return 0
+
+
+def _sample_unused(rng, candidates, count, used_cf_ids):
+    available = [s for s in candidates if s.get("cf_id") not in used_cf_ids]
+    if len(available) < count:
+        return None
+    picked = rng.sample(available, count)
+    used_cf_ids.update(s["cf_id"] for s in picked)
+    return picked
+
+
+def _song_decade(song):
+    try:
+        y = int(song.get("year") or 0)
+    except (ValueError, TypeError):
+        return None
+    if not y:
+        return None
+    return (y // 10) * 10
+
+
+def _resolve_lane_candidates(lane_id, lane_def, pool, need, rng, seed_suffix):
+    if lane_def.get("dynamic") == "decade":
+        groups = {}
+        for song in pool:
+            decade = _song_decade(song)
+            if decade is not None:
+                groups.setdefault(decade, []).append(song)
+        eligible = [d for d, songs in groups.items() if len(songs) >= need]
+        if not eligible:
+            return None, None, None
+        local_rng = random.Random(seed_suffix + lane_id)
+        local_rng.shuffle(eligible)
+        decade = eligible[0]
+        resolved_id = f"decade_{decade}s"
+        return resolved_id, lane_def.get("icon", ""), groups[decade]
+    return lane_id, lane_def.get("icon", ""), [s for s in pool if lane_def["fn"](s)]
+
+
+def _build_spiral_map(date_str, modifier_id, pool, fallback):
+    rng = random.Random(_date_seed(date_str) + modifier_id + "mapfallback")
+    nodes = _assign_map_node_types(_map_shape_template("spiral"), rng)
+    boss_pool = [s for s in pool if _boss_eligible(s)] or pool
+    if not boss_pool:
+        return None, [], True
+
+    boss = rng.choice(boss_pool)
+    used_cf_ids = {boss["cf_id"]}
+    songs = {boss["cf_id"]: boss}
+
+    for node in nodes:
+        node.pop("lane_slot", None)
+        node["lane"] = None if node["id"] == "nb" else "daily"
+        if node["id"] == "nb":
+            node["cf_id"] = boss["cf_id"]
+            continue
+        need = _node_song_need(node)
+        picked = _sample_unused(rng, pool, need, used_cf_ids)
+        if not picked:
+            return None, [], True
+        for song in picked:
+            songs[song["cf_id"]] = song
+        if node["type"] == "choice":
+            node["cf_ids"] = [s["cf_id"] for s in picked]
+        elif node["type"] == "mystery":
+            node["cf_pool"] = [s["cf_id"] for s in picked]
+        else:
+            node["cf_id"] = picked[0]["cf_id"]
+
+    mod = MODIFIERS[modifier_id]
+    return {
+        "shape": "spiral",
+        "start": "n0",
+        "boss": "nb",
+        "nodes": nodes,
+        "lanes": {"daily": mod.get("icon", "")},
+    }, list(songs.values()), fallback
+
+
+ACTS = ['Act 1', 'Act 2', 'Act 3']
+    modifier_pool, modifier_fallback = _map_modifier_pool(date_str, modifier_id, pool, exclude=exclude)
+    if len(modifier_pool) < 6:
+        return _build_spiral_map(date_str, modifier_id, pool, True)
+
+    mod = MODIFIERS[modifier_id]
+    collapse_to_spiral = mod["type"] == "identity"
+    rng = random.Random(_date_seed(date_str) + modifier_id + "map")
+    shape = "spiral" if collapse_to_spiral else _weighted_choice(rng, MAP_SHAPE_WEIGHTS)
+    nodes = _assign_map_node_types(_map_shape_template(shape), rng)
+
+    boss_pool = [s for s in modifier_pool if _boss_eligible(s)]
+    if not boss_pool:
+        return _build_spiral_map(date_str, modifier_id, pool, True)
+    boss = rng.choice(boss_pool)
+    used_cf_ids = {boss["cf_id"]}
+
+    lane_slots = sorted({n["lane_slot"] for n in nodes if n.get("lane_slot") is not None})
+    if collapse_to_spiral:
+        lane_ids = [modifier_id]
+        lane_defs = {modifier_id: {"icon": mod.get("icon", ""), "fn": lambda s: True}}
+    else:
+        lane_defs = MAP_LANES
+        lane_need = {slot: 0 for slot in lane_slots}
+        for node in nodes:
+            slot = node.get("lane_slot")
+            if slot is not None:
+                lane_need[slot] += _node_song_need(node)
+
+        eligible = []
+        lane_candidate_map = {}
+        lane_icon_map = {}
+        required_lane_capacity = max(lane_need.values() or [1])
+        for lane_id, lane in lane_defs.items():
+            resolved_id, icon, lane_pool = _resolve_lane_candidates(
+                lane_id, lane, [s for s in modifier_pool if s.get("cf_id") != boss["cf_id"]],
+                required_lane_capacity, rng, _date_seed(date_str) + modifier_id + "lane",
+            )
+            if resolved_id and len(lane_pool) >= required_lane_capacity:
+                eligible.append(resolved_id)
+                lane_candidate_map[resolved_id] = lane_pool
+                lane_icon_map[resolved_id] = icon
+        rng.shuffle(eligible)
+        if len(eligible) < len(lane_slots):
+            return _build_spiral_map(date_str, modifier_id, pool, True)
+        lane_ids = eligible[:len(lane_slots)]
+
+    slot_to_lane = {slot: lane_ids[i] for i, slot in enumerate(lane_slots)}
+    songs = {boss["cf_id"]: boss}
+
+    # Assign ACT to forced nodes based on row (first row = ACT 1, second = ACT 2, etc.)
+    act_number = 1
+    forced_nodes_in_row = {}
+    for node in nodes:
+        if node.get("type") == "forced":
+            row = node.get("row", 0)
+            forced_nodes_in_row.setdefault(row, []).append(node)
+    
+    # Assign acts to forced nodes based on their row order
+    if forced_nodes_in_row:
+        # Sort rows to determine act progression
+        rows = sorted(forced_nodes_in_row.keys())
+        for row_index, row in enumerate(rows):
+            for node in forced_nodes_in_row[row]:
+                node["act"] = f"AC_{row_index + 1}"
+                node["row"] = node["row"] + row_index * 3  # Space out rows for each act
+    else:
+        # Fallback if no forced nodes found
+        for node in nodes:
+            if node["id"] == "n0":
+                node["act"] = "AC_1"
+            elif node["id"] == "fb":
+                node["act"] = "AC_2"
+                node["row"] += 3
+            elif node["id"] == "n1" or node["id"] == "n2":
+                node["act"] = "AC_1"
+            else:
+                node["act"] = "AC_1"
+
+    for node in nodes:
+        slot = node.pop("lane_slot", None)
+        lane_id = slot_to_lane.get(slot)
+        node["lane"] = lane_id
+        if node["id"] == "nb":
+            node["cf_id"] = boss["cf_id"]
+            continue
+
+        need = _node_song_need(node)
+        if lane_id and not collapse_to_spiral:
+            candidates = lane_candidate_map[lane_id]
+        else:
+            candidates = modifier_pool
+        picked = _sample_unused(rng, candidates, need, used_cf_ids)
+        if not picked:
+            return _build_spiral_map(date_str, modifier_id, pool, True)
+        for song in picked:
+            songs[song["cf_id"]] = song
+        if node["type"] == "choice":
+            node["cf_ids"] = [s["cf_id"] for s in picked]
+        elif node["type"] == "mystery":
+            node["cf_pool"] = [s["cf_id"] for s in picked]
+        else:
+            node["cf_id"] = picked[0]["cf_id"]
+
+# Build nodes_by_lane for lane tracking
+    nodes_by_lane = {}
+    for node in nodes:
+        lane = node.get("lane")
+        if lane:
+            if lane not in nodes_by_lane:
+                nodes_by_lane[lane] = {"first_node": node, "count": 0}
+            nodes_by_lane[lane]["count"] += 1
+
+    # Build lanes by ACT type
+    lanes = {}
+    if collapse_to_spiral:
+        lanes[modifier_id] = mod.get("icon", "")
+    else:
+        # Group lanes by ACT type for proper routing
+        lane_act_map = {}
+        for lane_id in lane_ids:
+            # Get the first node to determine ACT type
+            lane_info = nodes_by_lane.get(lane_id, {})
+            sample_node = lane_info.get("first_node")
+            if sample_node and sample_node.get("type") in ["forced", "elite", "treasure", "rest", "shop"]:
+                lane_act_map[lane_id] = sample_node.get("act", "AC_1")
+            else:
+                lane_act_map[lane_id] = "AC_1"
+            lanes[lane_id] = lane_icon_map[lane_id]
+        # Add ACT labels to each lane
+        lanes["act_labels"] = lane_act_map
+
+    return {
+        "shape": shape,
+        "start": "n0",
+        "boss": "nb",
+        "nodes": nodes,
+        "lanes": lanes,
+        "acts": {"min": 1, "max": act_number},
+    }, list(songs.values()), modifier_fallback
+
+
+def _song_by_id(songs):
+    return {s.get("cf_id"): s for s in songs if s.get("cf_id") is not None}
+
+
+def _node_by_id(map_data):
+    return {n.get("id"): n for n in (map_data or {}).get("nodes", [])}
+
+
+def _node_song_ids(node):
+    if not node:
+        return []
+    if node.get("type") == "choice":
+        return list(node.get("cf_ids") or [])
+    if node.get("type") == "mystery":
+        return list(node.get("cf_pool") or [])
+    cf_id = node.get("cf_id")
+    return [cf_id] if cf_id is not None else []
+
+
+def _client_install_id(request=None, data=None):
+    if data and data.get("install_id"):
+        return str(data.get("install_id"))[:80]
+    if request is not None:
+        install_id = request.headers.get("X-Daily-Install-Id") or request.query_params.get("install_id")
+        if install_id:
+            return str(install_id)[:80]
+    return None
+
+
+def _inventory_payload(conn, install_id):
+    if not install_id:
+        return {"items": [], "counts": {}}
+    row = conn.execute(
+        "SELECT items FROM daily_inventory WHERE install_id = ?", (install_id,)
+    ).fetchone()
+    if not row:
+        with _lock:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_inventory (install_id, items, updated_at) VALUES (?, '[]', datetime('now'))",
+                (install_id,),
+            )
+            conn.commit()
+        items = []
+    else:
+        try:
+            items = json.loads(row[0] or "[]")
+        except Exception:
+            items = []
+    counts = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    return {"items": items, "counts": counts}
+
+
+def _map_cleared_node_ids(conn, date_str):
+    return {
+        r[0] for r in conn.execute(
+            "SELECT node_id FROM daily_completions WHERE date = ? AND node_id IS NOT NULL",
+            (date_str,),
+        ).fetchall() if r[0]
+    }
+
+
+def _map_committed_node_ids(conn, date_str, install_id):
+    if not install_id:
+        return set()
+    return {
+        r[0] for r in conn.execute(
+            "SELECT node_id FROM daily_node_commits WHERE date = ? AND install_id = ?",
+            (date_str, install_id),
+        ).fetchall() if r[0]
+    }
+
+
+def _map_available_state(conn, date_str, map_data, install_id=None):
+    nodes = _node_by_id(map_data)
+    cleared = _map_cleared_node_ids(conn, date_str)
+    committed = _map_committed_node_ids(conn, date_str, install_id)
+    reachable = {map_data.get("start")}
+    for node_id in cleared:
+        node = nodes.get(node_id)
+        if node:
+            reachable.update(node.get("edges") or [])
+
+    locked = set()
+    for node_id in committed - cleared:
+        node = nodes.get(node_id)
+        if not node:
+            continue
+        row = node.get("row")
+        locked.update(
+            n["id"] for n in nodes.values()
+            if n.get("row") == row and n.get("id") != node_id and n.get("id") not in cleared
+        )
+
+    available = (reachable | (committed - cleared)) - cleared - locked
+    available = {n for n in available if n in nodes}
+    boss_id = map_data.get("boss")
+    boss_revealed = boss_id in available or boss_id in cleared or boss_id in committed
+    return {
+        "cleared_node_ids": sorted(cleared),
+        "committed_node_ids": sorted(committed),
+        "available_node_ids": sorted(available),
+        "locked_node_ids": sorted(locked),
+        "boss_revealed": boss_revealed,
+        "is_complete": boss_id in cleared,
+    }
+
+
+def _debug_map_state(map_data, cleared=None, committed=None):
+    nodes = _node_by_id(map_data)
+    cleared = set(cleared or [])
+    committed = set(committed or [])
+    reachable = {map_data.get("start")}
+    for node_id in cleared:
+        node = nodes.get(node_id)
+        if node:
+            reachable.update(node.get("edges") or [])
+
+    locked = set()
+    for node_id in committed - cleared:
+        node = nodes.get(node_id)
+        if not node:
+            continue
+        row = node.get("row")
+        locked.update(
+            n["id"] for n in nodes.values()
+            if n.get("row") == row and n.get("id") != node_id and n.get("id") not in cleared
+        )
+
+    available = (reachable | (committed - cleared)) - cleared - locked
+    available = {n for n in available if n in nodes}
+    boss_id = map_data.get("boss")
+    boss_revealed = boss_id in available or boss_id in cleared or boss_id in committed
+    return {
+        "cleared_node_ids": sorted(cleared),
+        "committed_node_ids": sorted(committed),
+        "available_node_ids": sorted(available),
+        "locked_node_ids": sorted(locked),
+        "boss_revealed": boss_revealed,
+        "is_complete": boss_id in cleared,
+    }
+
+
+def _apply_boss_reroll(conn, date_str, map_data, songs, install_id):
+    if not install_id or not map_data:
+        return map_data, songs, False
+    row = conn.execute(
+        "SELECT rerolled_cf_id FROM daily_boss_rerolls WHERE install_id = ? AND date = ?",
+        (install_id, date_str),
+    ).fetchone()
+    if not row:
+        return map_data, songs, False
+    rerolled_cf_id = row[0]
+    song_map = _song_by_id(songs)
+    if rerolled_cf_id not in song_map:
+        pool = _load_pool(date_str, Path(__file__).parent)
+        for song in pool:
+            if song.get("cf_id") == rerolled_cf_id:
+                song_map[rerolled_cf_id] = song
+                songs = list(songs) + [song]
+                break
+    map_copy = json.loads(json.dumps(map_data))
+    for node in map_copy.get("nodes", []):
+        if node.get("id") == map_copy.get("boss"):
+            node["cf_id"] = rerolled_cf_id
+            break
+    return map_copy, songs, True
+
+
+def _enrich_songs(meta_db, songs, done_cf_ids=None):
+    done_cf_ids = done_cf_ids or set()
+    enriched = []
+    for song in songs:
+        s = dict(song)
+        s["local_filename"] = _find_locally(meta_db, s)
+        s["has_locally"] = s["local_filename"] is not None
+        s["done"] = s.get("cf_id") in done_cf_ids
+        enriched.append(s)
+    return enriched
+
+
+def _is_day_complete(conn, date_str):
+    row = conn.execute(
+        "SELECT song_count, map FROM daily_setlists WHERE date = ?", (date_str,)
+    ).fetchone()
+    if not row:
+        return False
+    song_count, map_json = row
+    if map_json:
+        try:
+            map_data = json.loads(map_json)
+        except Exception:
+            return False
+        return map_data.get("boss") in _map_cleared_node_ids(conn, date_str)
+    done = conn.execute(
+        "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (date_str,)
+    ).fetchone()[0]
+    return done >= song_count
+
+
+def _compute_streak_including_today(conn, today_str):
+    d = date.fromisoformat(today_str)
+    streak = 0
+    while _is_day_complete(conn, d.isoformat()):
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
+
+
+def _award_inventory_for_completion(conn, install_id, today_str):
+    if not install_id:
+        return
+    inv = _inventory_payload(conn, install_id)
+    row = conn.execute(
+        "SELECT items, last_streak_milestone, starter_awarded FROM daily_inventory WHERE install_id = ?",
+        (install_id,),
+    ).fetchone()
+    if not row:
+        return
+    items = inv["items"]
+    milestone = int(row[1] or 0)
+    starter_awarded = int(row[2] or 0)
+    changed = False
+    if not starter_awarded:
+        items.append(BOSS_REROLL_ITEM)
+        starter_awarded = 1
+        changed = True
+    streak = _compute_streak_including_today(conn, today_str)
+    next_milestone = streak // 7
+    if next_milestone > milestone:
+        items.extend([BOSS_REROLL_ITEM] * (next_milestone - milestone))
+        milestone = next_milestone
+        changed = True
+    if changed:
+        with _lock:
+            conn.execute(
+                "UPDATE daily_inventory SET items = ?, last_streak_milestone = ?, starter_awarded = ?, updated_at = datetime('now') WHERE install_id = ?",
+                (json.dumps(items), milestone, starter_awarded, install_id),
+            )
+            conn.commit()
+
+
+def _lane_popularity(entries):
+    counts = {}
+    for entry in entries or []:
+        lane = entry.get("lane_taken")
+        if lane:
+            counts[lane] = counts.get(lane, 0) + 1
+    total = sum(counts.values())
+    if not total:
+        return []
+    return [
+        {"lane": lane, "count": count, "percent": round((count / total) * 100)}
+        for lane, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _daily_active_pool(conn, date_str, pool):
+    used_cf_ids = set()
+    current = date.fromisoformat(date_str)
+    for i in range(1, 15):
+        past = (current - timedelta(days=i)).isoformat()
+        past_row = conn.execute(
+            "SELECT songs FROM daily_setlists WHERE date = ?", (past,)
+        ).fetchone()
+        if past_row:
+            for s in json.loads(past_row[0]):
+                used_cf_ids.add(s["cf_id"])
+    fresh_pool = [s for s in pool if s["cf_id"] not in used_cf_ids]
+    return fresh_pool if len(fresh_pool) >= DEFAULT_SONG_COUNT else pool
+
+
+def _daily_artist_exclude(conn, date_str, modifier_id):
+    if modifier_id != "artist_takeover":
+        return None
+    exclude = set()
+    current = date.fromisoformat(date_str)
+    for i in range(1, 15):
+        past = (current - timedelta(days=i)).isoformat()
+        past_row = conn.execute(
+            "SELECT modifier, songs FROM daily_setlists WHERE date = ?", (past,)
+        ).fetchone()
+        if past_row and past_row[0] == "artist_takeover":
+            past_songs = json.loads(past_row[1])
+            if past_songs:
+                exclude.add((past_songs[0].get("artist") or "").lower())
+    return exclude
+
+
 # ── Local library matching ────────────────────────────────────────────────────
 def _normalize_title(title):
     title = (title or "").lower()
@@ -958,19 +1788,43 @@ def setup(app, context):
     plugin_dir = Path(__file__).parent
 
     @app.get("/api/plugins/the_daily/today")
-    def get_today():
+    def get_today(request: Request):
         today = _get_today().isoformat()
+        real_today = today
+        today_date = date.fromisoformat(today)
+        install_id = _client_install_id(request=request)
+        debug_map = request.query_params.get("debug_map") in ("1", "true", "yes")
+        if debug_map and request.query_params.get("debug_date"):
+            try:
+                today = date.fromisoformat(request.query_params.get("debug_date")).isoformat()
+                today_date = date.fromisoformat(today)
+            except Exception:
+                today = real_today
+                today_date = date.fromisoformat(today)
         conn = _get_conn()
 
         row = conn.execute(
-            "SELECT day_name, modifier, songs, song_count FROM daily_setlists WHERE date = ?",
+            "SELECT day_name, modifier, songs, song_count, map, fallback FROM daily_setlists WHERE date = ?",
             (today,),
         ).fetchone()
 
         fallback = False
-        if row:
-            day_name, modifier_id, songs_json, song_count = row
+        map_data = None
+        if debug_map:
+            pool = _load_pool(today, plugin_dir)
+            if not pool:
+                return {"error": "Song pool is empty. Run build_pool.py to populate it."}
+            modifier_id = _pick_modifier(today)
+            active_pool = _daily_active_pool(conn, today, pool)
+            exclude = _daily_artist_exclude(conn, today, modifier_id)
+            map_data, songs, fallback = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            song_count = 1
+            day_name = _day_name(today, modifier_id, songs)
+        elif row:
+            day_name, modifier_id, songs_json, song_count, map_json, fallback_int = row
             songs = json.loads(songs_json)
+            map_data = json.loads(map_json) if map_json else None
+            fallback = bool(fallback_int)
         else:
             pool = _load_pool(today, plugin_dir)
             if not pool:
@@ -978,62 +1832,37 @@ def setup(app, context):
 
             modifier_id = _pick_modifier(today)
 
-            # Exclude songs played in the last 14 days
-            used_cf_ids = set()
-            for i in range(1, 15):
-                past = (date.fromisoformat(today) - timedelta(days=i)).isoformat()
-                past_row = conn.execute(
-                    "SELECT songs FROM daily_setlists WHERE date = ?", (past,)
-                ).fetchone()
-                if past_row:
-                    for s in json.loads(past_row[0]):
-                        used_cf_ids.add(s["cf_id"])
-            fresh_pool = [s for s in pool if s["cf_id"] not in used_cf_ids]
-            active_pool = fresh_pool if len(fresh_pool) >= DEFAULT_SONG_COUNT else pool
-
-            # Exclude recently used artists for artist_takeover
-            exclude = None
-            if modifier_id == "artist_takeover":
-                exclude = set()
-                for i in range(1, 15):
-                    past = (date.fromisoformat(today) - timedelta(days=i)).isoformat()
-                    past_row = conn.execute(
-                        "SELECT modifier, songs FROM daily_setlists WHERE date = ?", (past,)
-                    ).fetchone()
-                    if past_row and past_row[0] == "artist_takeover":
-                        past_songs = json.loads(past_row[1])
-                        if past_songs:
-                            exclude.add((past_songs[0].get("artist") or "").lower())
-            songs, song_count, fallback = _select_songs(today, modifier_id, active_pool, exclude=exclude)
+            active_pool = _daily_active_pool(conn, today, pool)
+            exclude = _daily_artist_exclude(conn, today, modifier_id)
+            if today_date >= MAP_MODE_START:
+                map_data, songs, fallback = _build_map(today, modifier_id, active_pool, exclude=exclude)
+                song_count = 1
+            else:
+                songs, song_count, fallback = _select_songs(today, modifier_id, active_pool, exclude=exclude)
             day_name = _day_name(today, modifier_id, songs)
 
             with _lock:
                 conn.execute(
                     "INSERT OR IGNORE INTO daily_setlists "
-                    "(date, day_name, modifier, songs, song_count) VALUES (?, ?, ?, ?, ?)",
-                    (today, day_name, modifier_id, json.dumps(songs), song_count),
+                    "(date, day_name, modifier, songs, song_count, map, fallback) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (today, day_name, modifier_id, json.dumps(songs), song_count, json.dumps(map_data) if map_data else None, 1 if fallback else 0),
                 )
                 conn.commit()
 
-        done_ids = {
-            r[0]
-            for r in conn.execute(
-                "SELECT cf_id FROM daily_completions WHERE date = ?", (today,)
-            ).fetchall()
-        }
+        map_data, songs, used_reroll = (map_data, songs, False) if debug_map else _apply_boss_reroll(conn, today, map_data, songs, install_id)
+
+        done_ids = set() if debug_map else {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (today,)).fetchall()}
 
         mod = MODIFIERS[modifier_id]
-        enriched = []
-        for song in songs:
-            s = dict(song)
-            s["local_filename"] = _find_locally(meta_db, s)
-            s["has_locally"] = s["local_filename"] is not None
-            s["done"] = s["cf_id"] in done_ids
-            enriched.append(s)
+        enriched = _enrich_songs(meta_db, songs, done_ids)
+        map_state = _map_available_state(conn, today, map_data, None if debug_map else install_id) if map_data else None
+        is_complete = map_state["is_complete"] if map_state else len(done_ids) >= song_count
+        progress_done = len(map_state["cleared_node_ids"]) if map_state else len(done_ids)
+        progress_total = len(map_data.get("nodes", [])) if map_data else song_count
 
         day_number = (date.fromisoformat(today) - _EPOCH).days + 1
         has_unavailable = any(not s["has_locally"] for s in enriched)
-        return {
+        payload = {
             "date": today,
             "seed": _date_seed(today),
             "day_name": day_name,
@@ -1048,13 +1877,21 @@ def setup(app, context):
             "fallback": fallback,
             "songs": enriched,
             "song_count": song_count,
-            "progress": {"done": len(done_ids), "total": song_count},
-            "is_complete": len(done_ids) >= song_count,
+            "progress": {"done": progress_done, "total": progress_total},
+            "is_complete": is_complete,
             "has_unavailable": has_unavailable,
+            "map": map_data,
+            "used_reroll": used_reroll,
+            "inventory": {"items": [BOSS_REROLL_ITEM] * 99, "counts": {BOSS_REROLL_ITEM: 99}} if debug_map else _inventory_payload(conn, install_id),
+            "debug_no_save": debug_map,
+            "debug_real_today": real_today if debug_map else None,
         }
+        if map_state:
+            payload.update(map_state)
+        return payload
     # Diagnostic: log that the_daily module has loaded routes
     try:
-        print("the_daily: routes registered: /today, /setlist/{date}, /mark, /streak, /leaderboard")
+        print("the_daily: routes registered: /today, /setlist/{date}, /mark, /use-item, /streak, /leaderboard")
     except Exception:
         pass
 
@@ -1106,7 +1943,12 @@ def setup(app, context):
                         if past_songs:
                             exclude.add((past_songs[0].get("artist") or "").lower())
 
-            songs, song_count, fallback = _select_songs(target_date_str, mod_id, active_pool, exclude=exclude)
+            map_data = None
+            if targ >= MAP_MODE_START:
+                map_data, songs, fallback = _build_map(target_date_str, mod_id, active_pool, exclude=exclude)
+                song_count = 1
+            else:
+                songs, song_count, fallback = _select_songs(target_date_str, mod_id, active_pool, exclude=exclude)
             day_name = _day_name(target_date_str, mod_id, songs)
 
             # Enrich songs with local availability
@@ -1116,6 +1958,7 @@ def setup(app, context):
                 s2["local_filename"] = _find_locally(meta_db, s2)
                 s2["has_locally"] = s2["local_filename"] is not None
                 enriched.append(s2)
+            progress_total = len(map_data.get("nodes", [])) if map_data else song_count
             day_number = (targ - _EPOCH).days + 1
             return {
                 "date": target_date_str,
@@ -1132,14 +1975,15 @@ def setup(app, context):
                 "fallback": fallback,
                 "songs": enriched,
                 "song_count": song_count,
-                "progress": {"done": 0, "total": song_count},
+                "progress": {"done": 0, "total": progress_total},
                 "is_complete": False,
                 "has_unavailable": False,
                 "is_historical": True,
+                "map": map_data,
             }
 
         # Helper to build payload from a retrieved row
-        def build_payload(row, is_historical: bool, mod_id, songs, song_count, done_ids=None):
+        def build_payload(row, is_historical: bool, mod_id, songs, song_count, done_ids=None, map_data=None, fallback=False):
             if not row:
                 return None
             day_name = row[0]
@@ -1156,6 +2000,10 @@ def setup(app, context):
                 s2["done"] = (done_ids or set()).__contains__(s2.get("cf_id"))
                 enriched.append(s2)
             day_num = (target - _EPOCH).days + 1
+            map_state = _map_available_state(conn, date_str, map_data, None) if map_data else None
+            is_complete = map_state["is_complete"] if map_state else (len(done_ids or []) >= song_count)
+            progress_done = len(map_state["cleared_node_ids"]) if map_state else len(done_ids or [])
+            progress_total = len(map_data.get("nodes", [])) if map_data else song_count
             return {
                 "date": date_str,
                 "seed": _date_seed(date_str),
@@ -1168,36 +2016,40 @@ def setup(app, context):
                     "icon": mod.get("icon", ""),
                     "is_blindside": mod["type"] == "ui",
                 },
-                "fallback": False,
+                "fallback": fallback,
                 "songs": enriched,
                 "song_count": song_count,
-                "progress": {"done": len(done_ids or []), "total": song_count},
-                "is_complete": (len(done_ids or []) >= song_count),
+                "progress": {"done": progress_done, "total": progress_total},
+                "is_complete": is_complete,
                 "has_unavailable": any(not s.get("has_locally") for s in enriched),
                 "is_historical": is_historical,
+                "map": map_data,
+                **(map_state or {}),
             }
 
         # Today
         row = conn.execute(
-            "SELECT day_name, modifier, songs, song_count FROM daily_setlists WHERE date = ?",
+            "SELECT day_name, modifier, songs, song_count, map, fallback FROM daily_setlists WHERE date = ?",
             (date_str,),
         ).fetchone()
         if target == today_date:
             if not row:
                 return {"error": "No setlist for today"}, 404
-            day_name, modifier_id, songs_json, song_count = row
+            day_name, modifier_id, songs_json, song_count, map_json, fallback_int = row
             songs = json.loads(songs_json)
+            map_data = json.loads(map_json) if map_json else None
             # Enrich completion state for today
             done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
-            payload = build_payload(row, False, modifier_id, songs, song_count, done_ids)
+            payload = build_payload(row, False, modifier_id, songs, song_count, done_ids, map_data=map_data, fallback=bool(fallback_int))
             return payload
 
         # Historical
         if row:
-            day_name, modifier_id, songs_json, song_count = row
+            day_name, modifier_id, songs_json, song_count, map_json, fallback_int = row
             songs = json.loads(songs_json)
+            map_data = json.loads(map_json) if map_json else None
             done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
-            payload = build_payload(row, True, modifier_id, songs, song_count, done_ids)
+            payload = build_payload(row, True, modifier_id, songs, song_count, done_ids, map_data=map_data, fallback=bool(fallback_int))
             return payload
         # Not found for historical date: generate locally if date is historical
         if target < today_date:
@@ -1213,18 +2065,67 @@ def setup(app, context):
     @app.post("/api/plugins/the_daily/mark")
     def mark_song(data: dict):
         cf_id = data.get("cf_id")
+        node_id = data.get("node_id")
+        install_id = _client_install_id(data=data)
+        action = data.get("action")
+        debug_no_save = bool(data.get("debug_no_save"))
         duration_played = data.get("duration_played", 0)
         if not cf_id:
             return {"error": "cf_id required"}
         today = _get_today().isoformat()
+        if debug_no_save and data.get("debug_date"):
+            try:
+                today = date.fromisoformat(str(data.get("debug_date"))).isoformat()
+            except Exception:
+                today = _get_today().isoformat()
         conn = _get_conn()
 
-        row = conn.execute(
-            "SELECT song_count FROM daily_setlists WHERE date = ?", (today,)
-        ).fetchone()
-        if not row:
-            return {"error": "No setlist for today"}
-        song_count = row[0]
+        if debug_no_save:
+            pool = _load_pool(today, plugin_dir)
+            modifier_id = _pick_modifier(today)
+            active_pool = _daily_active_pool(conn, today, pool)
+            exclude = _daily_artist_exclude(conn, today, modifier_id)
+            map_data, songs, _ = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            song_count = 1
+        else:
+            row = conn.execute(
+                "SELECT song_count, map, songs FROM daily_setlists WHERE date = ?", (today,)
+            ).fetchone()
+            if not row:
+                return {"error": "No setlist for today"}
+            song_count, map_json, songs_json = row
+            map_data = json.loads(map_json) if map_json else None
+        if map_data:
+            if not debug_no_save:
+                map_data, songs, used_reroll = _apply_boss_reroll(conn, today, map_data, json.loads(songs_json), install_id)
+            nodes = _node_by_id(map_data)
+            node = nodes.get(node_id)
+            if not node:
+                return {"error": "node_id required"}
+            if int(cf_id) not in {int(x) for x in _node_song_ids(node) if x is not None}:
+                return {"error": "cf_id is not valid for node"}
+            state = _map_available_state(conn, today, map_data, None if debug_no_save else install_id)
+            if debug_no_save:
+                client_cleared = set(data.get("cleared_node_ids") or [])
+                client_committed = set(data.get("committed_node_ids") or [])
+                state = _debug_map_state(map_data, client_cleared, client_committed)
+            if node_id not in state["available_node_ids"] and node_id not in state["committed_node_ids"] and node_id not in state["cleared_node_ids"]:
+                return {"error": "Node is not available"}
+
+            if action == "commit":
+                if debug_no_save:
+                    client_committed = set(data.get("committed_node_ids") or [])
+                    client_committed.add(node_id)
+                    state = _debug_map_state(map_data, set(data.get("cleared_node_ids") or []), client_committed)
+                    return {"ok": True, "committed": True, "debug_no_save": True, "progress": {"done": len(state["cleared_node_ids"]), "total": len(map_data.get("nodes", []))}, **state}
+                with _lock:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO daily_node_commits (install_id, date, node_id, cf_id) VALUES (?, ?, ?, ?)",
+                        (install_id or "anonymous", today, node_id, cf_id),
+                    )
+                    conn.commit()
+                state = _map_available_state(conn, today, map_data, install_id)
+                return {"ok": True, "committed": True, "progress": {"done": len(state["cleared_node_ids"]), "total": len(map_data.get("nodes", []))}, **state}
 
         # Check if minimum play duration was met
         if duration_played < MIN_PLAY_DURATION:
@@ -1237,22 +2138,138 @@ def setup(app, context):
                 "is_complete": False,
             }
 
+        if map_data and debug_no_save:
+            client_cleared = set(data.get("cleared_node_ids") or [])
+            client_committed = set(data.get("committed_node_ids") or [])
+            client_cleared.add(node_id)
+            client_committed.add(node_id)
+            state = _debug_map_state(map_data, client_cleared, client_committed)
+            return {
+                "ok": True,
+                "debug_no_save": True,
+                "progress": {"done": len(state["cleared_node_ids"]), "total": len(map_data.get("nodes", []))},
+                **state,
+                "inventory": {"items": [BOSS_REROLL_ITEM] * 99, "counts": {BOSS_REROLL_ITEM: 99}},
+            }
+
         with _lock:
-            conn.execute(
-                "INSERT OR IGNORE INTO daily_completions (date, cf_id) VALUES (?, ?)",
-                (today, cf_id),
-            )
+            if map_data:
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_node_commits (install_id, date, node_id, cf_id) VALUES (?, ?, ?, ?)",
+                    (install_id or "anonymous", today, node_id, cf_id),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_completions (date, cf_id, node_id, install_id) VALUES (?, ?, ?, ?)",
+                    (today, cf_id, node_id, install_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_completions (date, cf_id) VALUES (?, ?)",
+                    (today, cf_id),
+                )
             conn.commit()
 
-        done = conn.execute(
-            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today,)
-        ).fetchone()[0]
+        if map_data:
+            state = _map_available_state(conn, today, map_data, install_id)
+            if state["is_complete"]:
+                _award_inventory_for_completion(conn, install_id, today)
+            return {
+                "ok": True,
+                "progress": {"done": len(state["cleared_node_ids"]), "total": len(map_data.get("nodes", []))},
+                **state,
+                "inventory": _inventory_payload(conn, install_id),
+            }
+
+        done = conn.execute("SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today,)).fetchone()[0]
 
         return {
             "ok": True,
             "progress": {"done": done, "total": song_count},
             "is_complete": done >= song_count,
         }
+
+    @app.post("/api/plugins/the_daily/use-item")
+    def use_item(data: dict):
+        install_id = _client_install_id(data=data)
+        item_id = data.get("item_id")
+        debug_no_save = bool(data.get("debug_no_save"))
+        if not install_id:
+            return {"error": "install_id required"}
+        if item_id != BOSS_REROLL_ITEM:
+            return {"error": "Unknown item"}
+
+        today = _get_today().isoformat()
+        if debug_no_save and data.get("debug_date"):
+            try:
+                today = date.fromisoformat(str(data.get("debug_date"))).isoformat()
+            except Exception:
+                today = _get_today().isoformat()
+        conn = _get_conn()
+        if debug_no_save:
+            pool = _load_pool(today, plugin_dir)
+            modifier_id = _pick_modifier(today)
+            active_pool = _daily_active_pool(conn, today, pool)
+            exclude = _daily_artist_exclude(conn, today, modifier_id)
+            map_data, songs, _ = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            state = _debug_map_state(map_data, set(data.get("cleared_node_ids") or []), set(data.get("committed_node_ids") or []))
+        else:
+            row = conn.execute(
+                "SELECT modifier, songs, map FROM daily_setlists WHERE date = ?", (today,)
+            ).fetchone()
+            if not row:
+                return {"error": "No setlist for today"}
+            modifier_id, songs_json, map_json = row
+            if not map_json:
+                return {"error": "Items are only available in Map Mode"}
+            map_data = json.loads(map_json)
+            state = _map_available_state(conn, today, map_data, install_id)
+        if state["boss_revealed"]:
+            return {"error": "Boss already revealed"}
+        if not debug_no_save and conn.execute(
+            "SELECT 1 FROM daily_boss_rerolls WHERE install_id = ? AND date = ?",
+            (install_id, today),
+        ).fetchone():
+            return {"error": "Boss already re-rolled today"}
+
+        inv = {"items": [BOSS_REROLL_ITEM], "counts": {BOSS_REROLL_ITEM: 1}} if debug_no_save else _inventory_payload(conn, install_id)
+        items = list(inv["items"])
+        if BOSS_REROLL_ITEM not in items:
+            return {"error": "No Boss Re-roll available"}
+
+        boss_node = _node_by_id(map_data).get(map_data.get("boss"))
+        original_cf_id = boss_node.get("cf_id") if boss_node else None
+        pool = _load_pool(today, plugin_dir)
+        active_pool = _daily_active_pool(conn, today, pool)
+        modifier_pool, _ = _map_modifier_pool(
+            today, modifier_id, active_pool,
+            exclude=_daily_artist_exclude(conn, today, modifier_id),
+        )
+        map_song_ids = {cf_id for node in map_data.get("nodes", []) for cf_id in _node_song_ids(node)}
+        eligible = [s for s in modifier_pool if _boss_eligible(s) and s.get("cf_id") not in map_song_ids]
+        if not eligible:
+            return {"error": "No alternative boss available"}
+        rng = random.Random(_date_seed(today) + install_id + "bossreroll")
+        rerolled = rng.choice(sorted(eligible, key=lambda s: int(s.get("cf_id") or 0)))
+        if debug_no_save:
+            return {
+                "ok": True,
+                "debug_no_save": True,
+                "boss_cf_id": rerolled["cf_id"],
+                "song": rerolled,
+                "inventory": {"items": [BOSS_REROLL_ITEM] * 99, "counts": {BOSS_REROLL_ITEM: 99}},
+            }
+        items.remove(BOSS_REROLL_ITEM)
+        with _lock:
+            conn.execute(
+                "INSERT INTO daily_boss_rerolls (install_id, date, rerolled_cf_id) VALUES (?, ?, ?)",
+                (install_id, today, rerolled["cf_id"]),
+            )
+            conn.execute(
+                "UPDATE daily_inventory SET items = ?, updated_at = datetime('now') WHERE install_id = ?",
+                (json.dumps(items), install_id),
+            )
+            conn.commit()
+        return {"ok": True, "boss_cf_id": rerolled["cf_id"], "song": rerolled, "inventory": _inventory_payload(conn, install_id)}
 
     @app.get("/api/plugins/the_daily/streak")
     def get_streak():
@@ -1413,6 +2430,7 @@ def setup(app, context):
                 "modifier": modifier,
                 "fallback": fallback,
                 "entries": [],
+                "lane_popularity": [],
                 "available": True,
                 "total_entries": 0,
                 "last_updated": None,
@@ -1426,7 +2444,7 @@ def setup(app, context):
                 {
                     "date": f"eq.{target.isoformat()}",
                     "order": "completed_at.asc",
-                    "select": "display_name,completed_at,streak,rating,message",
+                    "select": "*",
                 },
             )
         except Exception as e:
@@ -1448,6 +2466,7 @@ def setup(app, context):
             "modifier": modifier,
             "fallback": fallback,
             "entries": entries or [],
+            "lane_popularity": _lane_popularity(entries or []),
             "available": True,
             "total_entries": len(entries or []),
             "last_updated": last_updated,
@@ -1463,9 +2482,6 @@ def setup(app, context):
             body = {}
         data = body if isinstance(body, dict) else {}
 
-        # Handle fallback payload for empty results
-        if isinstance(entries, list) and len(entries) == 0:
-            payload = {"date": target.isoformat(), "day_name": day_name, "day_number": day_num, "seed": seed, "modifier": modifier, "fallback": fallback, "entries": [], "available": True, "total_entries": 0, "last_updated": None}
         # Guard against signing historical days if a date is provided
         if isinstance(data, dict) and data.get("date"):
             try:
@@ -1493,20 +2509,18 @@ def setup(app, context):
         if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
             return {"error": "Supabase not configured"}
 
-        today = date.today()
+        today = _get_today()
         today_str = today.isoformat()
         conn = _get_conn()
 
         row = conn.execute(
-            "SELECT song_count FROM daily_setlists WHERE date = ?", (today_str,)
+            "SELECT song_count, map FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()
         if not row:
             return {"error": "No setlist for today"}
 
-        done = conn.execute(
-            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today_str,)
-        ).fetchone()[0]
-        if done < row[0]:
+        map_data = json.loads(row[1]) if row[1] else None
+        if not _is_day_complete(conn, today_str):
             return {"error": "Setlist not complete yet"}
 
         client_ip = _get_client_ip(request)
@@ -1526,6 +2540,19 @@ def setup(app, context):
             "streak": streak,
             "ip": client_ip,
         }
+        install_id = _client_install_id(data=data)
+        if map_data:
+            cleared = _map_cleared_node_ids(conn, today_str)
+            nodes = _node_by_id(map_data)
+            path = [n["id"] for n in sorted(map_data.get("nodes", []), key=lambda x: (x.get("row", 0), x.get("col", 0))) if n.get("id") in cleared]
+            lanes = [nodes[n].get("lane") for n in path if nodes.get(n) and nodes[n].get("lane")]
+            body["path"] = path
+            if lanes:
+                body["lane_taken"] = lanes[0]
+            body["used_reroll"] = bool(install_id and conn.execute(
+                "SELECT 1 FROM daily_boss_rerolls WHERE install_id = ? AND date = ?",
+                (install_id, today_str),
+            ).fetchone())
         if rating is not None:
             body["rating"] = rating
         if message is not None:
@@ -1533,6 +2560,13 @@ def setup(app, context):
         try:
             _supabase_post("/rest/v1/leaderboard", body)
         except Exception as e:
+            if any(k in body for k in ("path", "lane_taken", "used_reroll")):
+                legacy_body = {k: v for k, v in body.items() if k not in ("path", "lane_taken", "used_reroll")}
+                try:
+                    _supabase_post("/rest/v1/leaderboard", legacy_body)
+                    return {"ok": True, "streak": streak}
+                except Exception as e2:
+                    e = e2
             err_text = ""
             if hasattr(e, "read"):
                 try:

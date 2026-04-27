@@ -1,0 +1,43 @@
+name: Playwright E2E (The Daily)
+
+on:
+  push:
+    branches: [ main, master, '**/*' ]
+  pull_request:
+    branches: [ '**' ]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install --silent
+
+      - name: Install Playwright browsers
+        run: |
+          npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: |
+          npm run test:e2e
+
+      - name: Cache Playwright artifacts (optional)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
