@@ -1389,12 +1389,9 @@ def _map_modifier_pool(date_str, modifier_id, pool, active, exclude=None):
 
 
 def _boss_eligible(song):
-    duration = _song_duration_seconds(song)
-    return (
-        duration is not None
-        and duration >= 240
-        and bool((song.get("artist") or "").strip())
-        and bool(song.get("year"))
+    return bool(
+        (song.get("artist") or "").strip()
+        and song.get("year")
     )
 
 
@@ -1560,7 +1557,7 @@ ROOM_TYPES = {
         "icon": "⚔️",
         "color": "#dc2626",  # red
         "description": "High-stakes challenge song",
-        "fn": lambda s: _song_duration_seconds(s) is not None and _song_duration_seconds(s) > 240,
+        "fn": lambda s: _boss_eligible(s),
     },
     "treasure": {
         "label": "Treasure",
