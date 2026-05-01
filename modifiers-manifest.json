@@ -69,38 +69,12 @@
           "type": "ui"
         },
         {
-          "id": "fresh_off_the_press",
-          "label": "Fresh Off the Press",
-          "description": "CDLC added in the last 7 days",
-          "icon": "📰",
-          "type": "filter",
-          "fn": "_is_fresh_week"
-        },
-        {
           "id": "vintage_chart",
           "label": "Vintage Chart",
           "description": "CDLC uploaded to CF over 2 years ago",
           "icon": "📜",
           "type": "filter",
           "fn": "_is_vintage_upload"
-        },
-        {
-          "id": "album_side",
-          "label": "Album Side",
-          "description": "All songs from the same album",
-          "icon": "💿",
-          "type": "identity",
-          "key": "album",
-          "min_pool": 4
-        },
-        {
-          "id": "class_reunion",
-          "label": "Class Reunion",
-          "description": "All songs from the same release year",
-          "icon": "🎓",
-          "type": "identity",
-          "key": "year",
-          "min_pool": 5
         },
         {
           "id": "discography",
