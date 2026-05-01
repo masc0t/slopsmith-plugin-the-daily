@@ -25,13 +25,10 @@ def _date_seed(date_str):
 SUPABASE_URL = "https://fzwjepglsewwvwfhghdh.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ6d2plcGdsc2V3d3Z3ZmhnaGRoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY4OTUwODIsImV4cCI6MjA5MjQ3MTA4Mn0.mfXDg6LS8N6VrjXIyd8FJ0_QTjpJpUdyRmtgTV9FEOc"
 
-# Raw GitHub URLs for pool versioning. Falls back to bundled songs_pool.json.
+# Raw GitHub URLs for pool versioning.
 POOL_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/download/pool-archive/pool-YYYY-MM-DD.json"
 MANIFEST_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/download/pool-archive/pool-manifest.json"
 MODIFIERS_MANIFEST_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/download/pool-archive/modifiers-manifest.json"
-
-# Bundled pool is a first-run seed only. Stamp must be strictly in the past.
-BUNDLED_POOL_STAMP = "2026-04-22"
 
 # Grace period for stale pool cache before hard-fail
 POOL_STALE_GRACE_DAYS = 7
@@ -688,36 +685,7 @@ def _load_pool(date_str, plugin_dir):
                     conn.commit()
                 return pool
 
-    bundled_path = Path(plugin_dir) / "songs_pool.json"
-    if bundled_path.exists():
-        with open(bundled_path) as f:
-            pool = json.load(f)
-        pool = [s for s in pool
-                if len((s.get("artist") or "").strip()) >= 2
-                and len((s.get("title") or "").strip()) >= 2
-                and "full album" not in (s.get("title") or "").lower()]
-
-        bundled_stamp = BUNDLED_POOL_STAMP
-        if stamps:
-            stamp = _latest_leq_stamp([bundled_stamp] + stamps, target_date)
-        else:
-            stamp = bundled_stamp
-
-        row = conn.execute(
-            "SELECT pool FROM pool_cache WHERE pool_stamp = ?", (stamp,)
-        ).fetchone()
-        if row:
-            return json.loads(row[0])
-
-        with _lock:
-            conn.execute(
-                "INSERT OR REPLACE INTO pool_cache (pool_stamp, pool, fetched_at) VALUES (?, ?, ?)",
-                (stamp, json.dumps(pool), datetime.utcnow().isoformat())
-            )
-            conn.commit()
-        return pool
-
-    return []
+    raise RuntimeError(f"Failed to fetch pool from releases for {date_str}")
 
 
 def _get_pool_stamp(date_str: str) -> str | None:
@@ -733,8 +701,7 @@ def _get_pool_stamp(date_str: str) -> str | None:
     stamps_from_db = [r[0] for r in _get_conn().execute(
         "SELECT pool_stamp FROM pool_cache ORDER BY pool_stamp DESC"
     ).fetchall()]
-    all_stamps = [BUNDLED_POOL_STAMP] + stamps_from_db
-    return _latest_leq_stamp(all_stamps, target_date)
+    return _latest_leq_stamp(stamps_from_db, target_date)
 
 
 # ── Modifier manifest loading ────────────────────────────────────────────────

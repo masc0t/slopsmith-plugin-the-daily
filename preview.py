@@ -13,7 +13,6 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from plugins.the_daily.routes import (
-    BUNDLED_POOL_STAMP,
     DEFAULT_SONG_COUNT,
     MAP_LANES,
     MANIFEST_URL,
@@ -91,18 +90,7 @@ def _load_pool(target_date: date = None):
             if pool:
                 return _filter_pool(pool), stamp
 
-    if POOL_FILE.exists():
-        with open(POOL_FILE) as f:
-            pool = json.load(f)
-        pool = _filter_pool(pool)
-
-        all_stamps = [BUNDLED_POOL_STAMP]
-        if stamps:
-            all_stamps = stamps + all_stamps
-        stamp = _latest_leq_stamp(all_stamps, target_date) or BUNDLED_POOL_STAMP
-        return pool, stamp
-
-    return [], None
+    raise RuntimeError(f"Failed to fetch pool from releases for {target_date.isoformat()}")
 
 
 def _load_active_modifier_set(target_date: date) -> list:

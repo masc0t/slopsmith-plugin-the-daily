@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).parents[3]))
 
 from plugins.the_daily import routes
 from plugins.the_daily.routes import (
-    BUNDLED_POOL_STAMP,
     _latest_leq_stamp,
     _get_pool_stamp,
     _load_pool,
@@ -66,42 +65,35 @@ class TestPoolStampResolution(unittest.TestCase):
             stamp = _get_pool_stamp("2026-05-05")
             self.assertEqual(stamp, "2026-05-01")
 
-    def test_falls_through_to_bundled_when_manifest_unavailable(self):
+    def test_returns_none_when_no_stamps_available(self):
         with patch.object(routes, "_fetch_manifest", return_value=None):
-            stamp = _get_pool_stamp(BUNDLED_POOL_STAMP)
-            self.assertEqual(stamp, BUNDLED_POOL_STAMP)
+            stamp = _get_pool_stamp("2026-05-01")
+            self.assertIsNone(stamp)
 
     def test_returns_none_when_target_predates_all_stamps(self):
         with patch.object(routes, "_fetch_manifest", return_value=None):
-            with patch.object(routes, "BUNDLED_POOL_STAMP", "2026-05-01"):
-                stamp = _get_pool_stamp("2026-04-01")
-                self.assertIsNone(stamp)
+            stamp = _get_pool_stamp("2026-04-01")
+            self.assertIsNone(stamp)
 
 
-class TestLoadPoolFallback(unittest.TestCase):
-    """When manifest+pool fetch fails, _load_pool falls back to bundled."""
+class TestLoadPoolHardFail(unittest.TestCase):
+    """When manifest+pool fetch fails, _load_pool raises an error."""
 
     def setUp(self):
         _init_tmp_db()
 
-    def test_falls_back_to_bundled_when_manifest_unavailable(self):
+    def test_raises_when_no_pool_available(self):
         plugin_dir = Path(__file__).parent.parent
-        if not (plugin_dir / "songs_pool.json").exists():
-            self.skipTest("Bundled pool not available")
         with patch.object(routes, "_fetch_manifest", return_value=None):
-            pool = _load_pool("2026-05-01", plugin_dir)
-            self.assertIsInstance(pool, list)
-            self.assertGreater(len(pool), 0)
+            with self.assertRaises(RuntimeError):
+                _load_pool("2026-05-01", plugin_dir)
 
-    def test_falls_back_when_fetch_pool_fails(self):
+    def test_raises_when_fetch_fails(self):
         plugin_dir = Path(__file__).parent.parent
-        if not (plugin_dir / "songs_pool.json").exists():
-            self.skipTest("Bundled pool not available")
         with patch.object(routes, "_fetch_manifest", return_value=["2026-99-99"]):
             with patch.object(routes, "_fetch_pool_by_stamp", return_value=None):
-                pool = _load_pool("2026-05-01", plugin_dir)
-                self.assertIsInstance(pool, list)
-                self.assertGreater(len(pool), 0)
+                with self.assertRaises(RuntimeError):
+                    _load_pool("2026-05-01", plugin_dir)
 
 
 class TestSchemaPoolStamp(unittest.TestCase):
@@ -146,11 +138,9 @@ class TestPoolStampPersisted(unittest.TestCase):
     def test_pool_cache_writes_include_fetched_at(self):
         # Simulate a pool fetch via mocked manifest+fetch, then verify cache row.
         plugin_dir = Path(__file__).parent.parent
-        if not (plugin_dir / "songs_pool.json").exists():
-            self.skipTest("Bundled pool not available")
-
-        with patch.object(routes, "_fetch_manifest", return_value=None):
-            _load_pool("2026-05-01", plugin_dir)
+        with patch.object(routes, "_fetch_manifest", return_value=["2026-05-01"]):
+            with patch.object(routes, "_fetch_pool_by_stamp", return_value=[{"artist": "Test", "title": "Test"}]):
+                _load_pool("2026-05-01", plugin_dir)
 
         conn = routes._get_conn()
         rows = conn.execute(
