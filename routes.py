@@ -940,6 +940,9 @@ def _identity_candidates(date_str, pool, key, count, min_pool=None, exclude=None
     eligible = {k: v for k, v in groups.items() if len(v) >= threshold}
     if exclude:
         eligible = {k: v for k, v in eligible.items() if str(k).lower() not in exclude}
+    while not eligible and threshold > 1:
+        threshold -= 1
+        eligible = {k: v for k, v in groups.items() if len(v) >= threshold}
     if not eligible:
         return pool, True
 
@@ -1756,12 +1759,13 @@ ACTS = ['Act 1', 'Act 2', 'Act 3']
 
 def _build_map(date_str, modifier_id, pool, active, exclude=None):
     modifier_pool, modifier_fallback = _map_modifier_pool(date_str, modifier_id, pool, active, exclude=exclude)
-    print(f"DEBUG: {date_str} modifier: {modifier_id} pool size: {len(modifier_pool)}", file=sys.stderr)
     if len(modifier_pool) < 3:
-        return _build_spiral_map(date_str, modifier_id, pool, active, True)
+        return _build_spiral_map(date_str, modifier_id, modifier_pool or pool, active, modifier_fallback)
 
     mod = next(m for m in active if m["id"] == modifier_id)
     collapse_to_spiral = mod["type"] == "identity"
+    if collapse_to_spiral and len(modifier_pool) < DEFAULT_SONG_COUNT:
+        collapse_to_spiral = False
     rng = random.Random(_date_seed(date_str) + modifier_id + "map")
     shape = "spiral" if collapse_to_spiral else _weighted_choice(rng, MAP_SHAPE_WEIGHTS)
     nodes = _assign_map_node_types(_map_shape_template(shape), rng)
