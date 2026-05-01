@@ -1756,8 +1756,6 @@ ACTS = ['Act 1', 'Act 2', 'Act 3']
 
 def _build_map(date_str, modifier_id, pool, active, exclude=None):
     modifier_pool, modifier_fallback = _map_modifier_pool(date_str, modifier_id, pool, active, exclude=exclude)
-    if len(modifier_pool) < 3:
-        return _build_spiral_map(date_str, modifier_id, modifier_pool or pool, active, modifier_fallback)
 
     mod = next(m for m in active if m["id"] == modifier_id)
     collapse_to_spiral = mod["type"] == "identity"
