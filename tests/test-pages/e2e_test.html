@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Daily - E2E Test Page</title>
+  <style>
+    /* Tailwind-like reset for testing */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .hidden { display: none !important; }
+    .max-w-2xl { max-width: 672px; }
+    .mx-auto { margin-left: auto; margin-right: auto; }
+    .px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
+    .pt-24 { padding-top: 6rem; }
+    .pb-16 { padding-bottom: 4rem; }
+    .flex { display: flex; }
+    .items-center { align-items: center; }
+    .justify-center { justify-content: center; }
+    .justify-between { justify-content: space-between; }
+    .gap-3 { gap: 0.75rem; }
+    .mb-8 { margin-bottom: 2rem; }
+    .mb-2 { margin-bottom: 0.5rem; }
+    .mt-1 { margin-top: 0.25rem; }
+    .mt-2 { margin-top: 0.5rem; }
+    .text-2xl { font-size: 1.5rem; }
+    .text-4xl { font-size: 2.25rem; }
+    .text-xs { font-size: 0.75rem; }
+    .text-sm { font-size: 0.875rem; }
+    .font-bold { font-weight: 700; }
+    .font-semibold { font-weight: 600; }
+    .uppercase { text-transform: uppercase; }
+    .tracking-widest { letter-spacing: 0.1em; }
+    .text-white { color: #fff; }
+    .text-gray-300 { color: #cbd5e1; }
+    .text-gray-400 { color: #94a3b8; }
+    .text-gray-500 { color: #64748b; }
+    .text-accent { color: #4080e0; }
+    .text-accent-light { color: #60a5fa; }
+    .text-yellow-500 { color: #eab308; }
+    .bg-accent { background-color: #4080e0; }
+    .bg-accent\/10 { background-color: rgba(64,128,224,0.1); }
+    .bg-dark-700 { background-color: #1e293b; }
+    .bg-dark-600 { background-color: #334155; }
+    .border { border-width: 1px; }
+    .border-gray-700 { border-color: #334155; }
+    .border-accent\/50 { border-color: rgba(64,128,224,0.5); }
+    .border-yellow-700\/30 { border-color: rgba(161,98,7,0.3); }
+    .rounded-full { border-radius: 9999px; }
+    .rounded-xl { border-radius: 0.75rem; }
+    .px-4 { padding-left: 1rem; padding-right: 1rem; }
+    .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+    .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+    .py-1\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+    .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+    .space-y-3 > * + * { margin-top: 0.75rem; }
+    .h-2 { height: 0.5rem; }
+    .w-8 { width: 2rem; }
+    .h-8 { height: 2rem; }
+    .border-2 { border-width: 2px; }
+    .border-t-transparent { border-top-color: transparent; }
+    .animate-spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .overflow-hidden { overflow: hidden; }
+    .transition { transition-property: all; }
+    .transition-all { transition-property: all; }
+    .duration-500 { transition-duration: 500ms; }
+    .shadow-\[0_0_8px_rgba\(64,128,224,0\.6\)\] { box-shadow: 0 0 8px rgba(64,128,224,0.6); }
+    .italic { font-style: italic; }
+    .font-mono { font-family: ui-monospace, monospace; }
+    .text-right { text-align: right; }
+    .flex-shrink-0 { flex-shrink: 0; }
+    .min-w-0 { min-width: 0; }
+    .py-16 { padding-top: 4rem; padding-bottom: 4rem; }
+    .py-32 { padding-top: 8rem; padding-bottom: 8rem; }
+    .mb-4 { margin-bottom: 1rem; }
+    .mb-6 { margin-bottom: 1.5rem; }
+    .text-6xl { font-size: 3.75rem; }
+    .disabled\:opacity-30:disabled { opacity: 0.3; }
+    .disabled\:cursor-not-allowed:disabled { cursor: not-allowed; }
+    .hover\:bg-dark-500:hover { background-color: #475569; }
+    .hover\:border-gray-500:hover { border-color: #64748b; }
+    .border-gray-800\/40 { border-color: rgba(30,41,59,0.4); }
+    .bg-dark-700\/40 { background-color: rgba(30,41,59,0.4); }
+    .text-\[11px\] { font-size: 11px; }
+
+    /* Lane colors */
+    :root {
+      --lane-standard: #1d4ed8;
+      --lane-drop: #a78bfa;
+      --lane-flat: #14b8a6;
+      --lane-sprint: #10b981;
+      --lane-marathon: #f59e0b;
+    }
+    .ds-svg-lane-group { color: var(--lane-standard); }
+    .ds-svg-act { fill: currentColor; font-family: system-ui, -apple-system, sans-serif; }
+    .ds-svg-lane-group.lane-standard { color: var(--lane-standard); }
+    .ds-svg-lane-group.lane-drop { color: var(--lane-drop); }
+    .ds-svg-lane-group.lane-flat { color: var(--lane-flat); }
+    .ds-svg-lane-group.lane-sprint { color: var(--lane-sprint); }
+    .ds-svg-lane-group.lane-marathon { color: var(--lane-marathon); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- Loading -->
+    <div id="ds-loading" class="flex items-center justify-center py-32">
+      <div class="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>
+    </div>
+
+    <!-- Setlist view (before completion) -->
+    <div id="ds-setlist" class="hidden max-w-2xl mx-auto px-6 pt-24 pb-16">
+      <div class="mb-8">
+        <div class="flex items-center justify-between mb-1">
+          <div class="flex items-center gap-3">
+            <span id="ds-modifier-icon" class="text-2xl"></span>
+            <span id="ds-modifier-label" class="text-xs font-semibold uppercase tracking-widest text-accent-light px-2 py-0.5 bg-accent/10 rounded-full"></span>
+            <span id="ds-seed" class="text-xs font-mono text-gray-500"></span>
+            <span id="ds-day-number" class="text-xs text-gray-500 font-mono"></span>
+          </div>
+          <span id="ds-stats" class="text-xs text-gray-500 font-mono"></span>
+        </div>
+        <div class="text-right">
+          <span id="ds-countdown" class="text-xs text-gray-500 font-mono"></span>
+        </div>
+        <h2 id="ds-day-name" class="text-4xl font-bold text-white mt-2"></h2>
+        <p id="ds-date" class="text-sm text-gray-500 mt-1"></p>
+        <p id="ds-modifier-desc" class="text-sm text-gray-400 mt-1 italic"></p>
+        <p id="ds-fallback-notice" class="hidden text-xs text-yellow-500 mt-2">
+          Not enough matching songs in the pool — using full library today.
+        </p>
+      </div>
+
+      <div class="mb-8">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs text-gray-500 uppercase tracking-wider">Progress</span>
+          <span id="ds-progress-label" class="text-sm font-semibold text-white"></span>
+        </div>
+        <div class="h-2 bg-dark-700 rounded-full overflow-hidden">
+          <div id="ds-progress-bar" class="h-full bg-accent rounded-full transition-all duration-500 shadow-[0_0_8px_rgba(64,128,224,0.6)]" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div id="ds-rescan-bar" class="hidden mb-4 flex items-center gap-3 bg-dark-700/40 border border-yellow-700/30 rounded-xl px-4 py-3">
+        <div class="flex-1 min-w-0">
+          <p class="text-sm text-gray-300">Some songs aren't in your library yet.</p>
+          <p id="ds-rescan-status" class="text-xs text-gray-500 mt-0.5">Download the missing CDLC, then rescan to play.</p>
+        </div>
+        <button id="ds-btn-rescan" onclick="dsRescanLibrary()" class="bg-dark-600 hover:bg-dark-500 px-4 py-2 rounded-xl text-xs text-gray-300 transition flex-shrink-0">Rescan Library</button>
+      </div>
+
+      <div id="ds-songs" class="space-y-3"></div>
+
+      <!-- Map Legend & Popularity -->
+      <div id="ds-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
+          <div id="ds-lane-legend" class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
+              <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                  <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
+              </div>
+              <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                  <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
+              </div>
+              <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                  <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
+              </div>
+              <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                  <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
+              </div>
+              <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                  <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
+              </div>
+          </div>
+          <div id="ds-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
+      </div>
+    </div>
+
+    <!-- Complete view -->
+    <div id="ds-complete" class="hidden text-center py-16 max-w-2xl mx-auto px-6">
+      <div class="text-xs text-gray-500 font-mono mb-2" id="ds-complete-countdown"></div>
+      <canvas id="ds-confetti" class="hidden fixed inset-0 pointer-events-none z-50" style="width:100vw;height:100vh;"></canvas>
+      <div class="text-6xl mb-4">🎸</div>
+      <h2 class="text-4xl font-bold text-white mb-2">Day Complete!</h2>
+      <p id="ds-complete-stats" class="text-xl text-accent-light mb-1"></p>
+      <p id="ds-complete-name" class="text-xl text-accent-light mb-1"></p>
+      <p id="ds-complete-mod" class="text-sm text-gray-400 mb-1"></p>
+      <p id="ds-complete-seed" class="text-xs text-gray-600 mb-2"></p>
+      <p id="ds-complete-fallback" class="text-xs text-yellow-500 mb-2 hidden"></p>
+      <p id="ds-complete-streak" class="text-sm text-gray-400 mb-6"></p>
+
+      <div class="flex justify-center gap-1 mb-4" role="tablist">
+        <button id="ds-tab-today" onclick="dsSwitchTab('today')" role="tab" aria-selected="true" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-accent/20 text-accent border border-accent/50">Setlist</button>
+        <button id="ds-tab-wof" onclick="dsSwitchTab('wof')" role="tab" aria-selected="false" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-dark-700 text-gray-400 border border-gray-700 hover:border-gray-500">Wall of Fame</button>
+      </div>
+
+      <div class="flex justify-center gap-2 mb-4" aria-label="Navigate historical days">
+        <button id="ds-prev-day" onclick="dsGoPrevDay()" class="px-3 py-1.5 rounded-xl bg-dark-700 border border-gray-700 hover:border-gray-500 text-xs disabled:opacity-30 disabled:cursor-not-allowed" title="Previous day" aria-label="Previous day">◀ Prev Day</button>
+        <input id="ds-lb-date" type="date" min="2026-04-22" max="" value="" onchange="dsDateChanged(this.value)" oninput="dsDateChanged(this.value)" class="px-2 py-1.5 rounded-xl bg-dark-700 border border-gray-700 text-xs disabled:opacity-50" aria-label="Select date" />
+        <button id="ds-next-day" onclick="dsGoNextDay()" class="px-3 py-1.5 rounded-xl bg-dark-700 border border-gray-700 hover:border-gray-500 text-xs disabled:opacity-30 disabled:cursor-not-allowed" title="Next day" aria-label="Next day">Next Day ▶</button>
+      </div>
+
+      <div id="ds-today-content">
+          <div id="ds-complete-setlist" class="space-y-3"></div>
+          <div id="ds-complete-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
+              <div class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
+                  <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                      <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
+                  </div>
+                  <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                      <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
+                  </div>
+                  <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                      <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
+                  </div>
+                  <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                      <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
+                  </div>
+                  <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                      <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
+                  </div>
+              </div>
+              <div id="ds-complete-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
+          </div>
+      </div>
+
+      <div id="ds-wof-content" class="hidden">
+          <div id="ds-sign-container" class="hidden max-w-sm mx-auto bg-dark-700/50 border border-gray-800 rounded-xl p-4 mb-6">
+              <div class="space-y-3">
+                  <input type="text" id="ds-sign-name" placeholder="Your Name" class="w-full bg-dark-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" maxlength="30" />
+                  <div class="flex justify-center gap-2 pt-1" id="ds-sign-ratings" role="radiogroup" aria-label="Rate today's setlist">
+                      <button id="ds-rating--1" onclick="dsSelectRating(-1)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Down">👎</button>
+                      <button id="ds-rating-1" onclick="dsSelectRating(1)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Up">👍</button>
+                      <button id="ds-rating-2" onclick="dsSelectRating(2)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Fire">🔥</button>
+                  </div>
+                  <button id="ds-btn-sign" onclick="dsSign()" class="w-full bg-accent hover:bg-accent-light text-white font-semibold py-2 rounded-lg text-sm transition">Sign the Wall</button>
+              </div>
+          </div>
+          <div id="ds-lb-entries" class="space-y-3"></div>
+      </div>
+    </div>
+
+    <!-- Debug header -->
+    <div id="ds-debug-header" style="display:none; position:fixed; top:0; left:0; background:#1e293b; color:#eab308; padding:4px 8px; font-size:11px; z-index:9999;"></div>
+  </div>
+
+  <script src="/screen.js"></script>
+  <script>
+    // Mock window.slopsmith for testing
+    window.slopsmith = {
+      on: function() {},
+      emit: function() {}
+    };
+    console.log('E2E test page loaded');
+  </script>
+</body>
+</html>

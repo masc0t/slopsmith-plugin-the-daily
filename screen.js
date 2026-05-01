@@ -1,21 +1,22 @@
 // Daily Setlist plugin
 
-let _dsData = null;        // last /today response
-let _dsLbDate = null;        // currently selected leaderboard date (YYYY-MM-DD)
-let _dsSigned = false;     // whether user signed today
-let _dsSigning = false;    // in-flight guard for sign submit
-let _dsConfettiDoneFor = null; // date string; confetti has played for this date in this session
-let _dsRating = null;      // selected rating: -1, 1, or null
-let _dsReturnAfterPlayback = false;
-let _dsReturnListenerRegistered = false;
-let _dsInCompleteView = false; // true when Day Complete view is active
-let _dsLastHistoricalRetryDate = null; // last date attempted for historical retry
-let _dsActiveTab = 'today'; // 'today' or 'wof'
-let _dsWofLoaded = false;  // whether wall of fame data has been loaded
-let _dsPlayStartTime = 0;   // when current song started playing
-let _dsPlayingCfId = null;   // cf_id of song currently being played
-let _dsPlayingNodeId = null; // map node currently being played
-let _dsSkipNextInit = false;
+var _dsData = null;        // last /today response
+var _dsLbDate = null;   // currently selected leaderboard date (YYYY-MM-DD)
+var _dsSigned = false;     // whether user signed today
+var _dsSigning = false;    // in-flight guard for sign submit
+var _dsConfettiDoneFor = null; // date string; confetti has played for this date in this session
+var _dsRating = null;      // selected rating: -1, 1, or null
+var _dsReturnAfterPlayback = false;
+var _dsReturnListenerRegistered = false;
+var _dsInCompleteView = false; // true when Day Complete view is active
+var _dsLastHistoricalRetryDate = null; // last date attempted for historical retry
+var _dsActiveTab = 'today'; // 'today' or 'wof'
+var _dsWofLoaded = false;  // whether wall of fame data has been loaded
+var _dsPlayStartTime = 0;   // when current song started playing
+var _dsPlayingCfId = null;   // cf_id of song currently being played
+var _dsPlayingNodeId = null; // map node currently being played
+var _dsSkipNextInit = false;
+
 
 // Node type to icon mapping (centralized for visual consistency)
 const NODE_TYPE_ICONS = {
@@ -30,6 +31,15 @@ const NODE_TYPE_ICONS = {
 };
 
 function _dsSignKey(date) { return `ds_signed_${date}`; }
+function esc(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
 function dsInstallId() {
     let id = localStorage.getItem('ds_install_id');
     if (!id) {
@@ -149,6 +159,14 @@ async function dsInit() {
             return;
         }
         if (_dsData.error) {
+            if (_dsData.error === 'offline') {
+                dsRenderError('offline');
+                return;
+            }
+            if (_dsData.error === 'update_required') {
+                dsRenderError('update_required', _dsData.min_version);
+                return;
+            }
             dsShowError(_dsData.error);
             return;
         }
@@ -173,8 +191,37 @@ async function dsInit() {
         } else {
             dsShow('setlist');
         }
+        // Refresh tokens after loading setlist
+        dsRefreshTokens();
     } catch (e) {
         dsShowError('Failed to load daily setlist.');
+    }
+}
+
+function dsRenderError(errorType, minVersion) {
+    const container = document.getElementById('ds-setlist-view');
+    if (!container) return;
+    
+    if (errorType === 'offline') {
+        container.innerHTML = `
+            <div class="flex flex-col items-center justify-center py-16 text-center">
+                <div class="text-4xl mb-4">📡</div>
+                <h2 class="text-xl font-bold text-gray-200 mb-2">No internet connection</h2>
+                <p class="text-gray-400 mb-6 max-w-md">The Daily requires an active connection to load today's setlist. Try again later.</p>
+                <button onclick="dsInit()" class="bg-accent-500 hover:bg-accent-600 text-white px-6 py-2 rounded-lg font-medium transition-colors">
+                    Retry
+                </button>
+            </div>
+        `;
+    } else if (errorType === 'update_required') {
+        container.innerHTML = `
+            <div class="flex flex-col items-center justify-center py-16 text-center">
+                <div class="text-4xl mb-4">⬆️</div>
+                <h2 class="text-xl font-bold text-gray-200 mb-2">Update Required</h2>
+                <p class="text-gray-400 mb-6 max-w-md">A plugin update is required to play today's Daily. Update The Daily plugin in Slopsmith settings.</p>
+                ${minVersion ? `<p class="text-gray-500 text-sm mb-6">Required version: ${esc(minVersion)}</p>` : ''}
+            </div>
+        `;
     }
 }
 
@@ -198,20 +245,19 @@ function dsRender() {
     fallback.classList.toggle('hidden', !d.fallback);
     dsRenderDebugToggle(d);
 
-    const pct = d.progress.total > 0 ? Math.round((d.progress.done / d.progress.total) * 100) : 0;
-    document.getElementById('ds-progress-bar').style.width = pct + '%';
-    document.getElementById('ds-progress-label').textContent = `${d.progress.done} / ${d.progress.total}`;
-
     // Start/update countdown and fetch stats
     dsStartCountdown();
     dsLoadStats();
-
     const container = document.getElementById('ds-songs');
+    const extras = document.getElementById('ds-lane-extras');
+    
+    // Map mode is now mandatory; if map is missing, show an error.
     if (d.map) {
         container.innerHTML = dsMapView(d);
+        if (extras) extras.classList.remove('hidden');
         dsLoadLanePopularity();
     } else {
-        container.innerHTML = d.songs.map((s, i) => dsSongCard(s, i, mod.is_blindside)).join('');
+        dsShowError('Legacy flat-list mode is deprecated. Map data is required.');
     }
 
     // Show rescan bar when any song is missing locally
@@ -238,15 +284,19 @@ function dsRenderDebugToggle(d) {
 
 async function dsLoadLanePopularity() {
     if (!_dsData?.map) return;
-    const el = document.getElementById('ds-lane-popularity');
-    if (!el) return;
+    const els = [
+        document.getElementById('ds-lane-popularity'),
+        document.getElementById('ds-complete-lane-popularity')
+    ].filter(el => el);
+    if (els.length === 0) return;
     try {
         const resp = await fetch(`/api/plugins/the_daily/leaderboard?date=${encodeURIComponent(_dsData.date)}`, { cache: 'no-store' });
         const data = await resp.json();
         const bits = (data.lane_popularity || []).map(p => `${p.percent}% ${dsLaneLabel(p.lane)}`);
-        el.textContent = bits.length ? bits.join(' · ') : 'No lane picks signed yet';
+        const text = bits.length ? bits.join(' · ') : 'No lane picks signed yet';
+        els.forEach(el => el.textContent = text);
     } catch (e) {
-        el.textContent = 'Lane popularity unavailable';
+        els.forEach(el => el.textContent = 'Lane popularity unavailable');
     }
 }
 
@@ -291,11 +341,11 @@ function dsMapView(d) {
         const fill = state === 'cleared' ? '#14532d' : state === 'available' ? '#1d4ed8' : state === 'locked' ? '#111827' : '#1f2937';
         const stroke = state === 'cleared' ? '#22c55e' : state === 'available' ? '#60a5fa' : '#374151';
         const icon = dsNodeIcon(n);
-        const click = state === 'available' || state === 'cleared' ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
+        const click = (state === 'available' || state === 'cleared' || d.debug_no_save) ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
         // Act label near the node (if provided)
         const actLabel = n.act ? `<text x="${pos[n.id].x}" y="${pos[n.id].y - 28}" text-anchor="middle" class="ds-svg-act" fill="currentColor" font-size="11">${esc(n.act)}</text>` : '';
         // Lane color cue is handled via CSS classes; color variables applied in CSS
-        return `<g ${click} class="ds-svg-lane-group lane-${n.lane || 'standard'}" data-lane="${n.lane || 'standard'}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
+        return `<g ${click} class="ds-svg-lane-group lane-${n.lane || 'standard'}" data-lane="${n.lane || 'standard'}" data-node-id="${n.id}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
             <text x="${pos[n.id].x}" y="${pos[n.id].y + 6}" text-anchor="middle" fill="white" font-size="18">${icon}</text>
             ${actLabel}
             <text x="${pos[n.id].x}" y="${pos[n.id].y + 42}" text-anchor="middle" fill="#9ca3af" font-size="11">${esc(dsLaneLabel(n.lane) || n.id)}</text></g>`;
@@ -507,6 +557,7 @@ function dsOpenNode(nodeId) {
     const available = new Set(_dsData.available_node_ids || []);
     const canPlay = available.has(nodeId) || cleared.has(nodeId);
     let body = '';
+    const debugControls = _dsData.debug_no_save ? `<button onclick="dsUseLaneReroll('${nodeId}')" class="w-full mt-2 px-3 py-1.5 rounded-lg border border-yellow-700/40 bg-yellow-900/20 text-xs text-yellow-300 hover:bg-yellow-900/40 transition">🎲 Lane Re-roll (Debug)</button>` : '';
     if (node.type === 'choice') {
         body = (node.cf_ids || []).map((id, i) => dsMapSongOption(node, songMap[id], `Option ${i + 1}`, canPlay)).join('');
     } else if (node.type === 'mystery') {
@@ -514,12 +565,15 @@ function dsOpenNode(nodeId) {
         const idx = dsStableIndex(`${dsInstallId()}:${_dsData.date}:${node.id}`, pool.length);
         const song = songMap[pool[idx]];
         body = dsMapSongOption(node, song, 'Mystery revealed', canPlay);
+    } else if (node.type === 'shop') {
+        return dsOpenShopNode(nodeId);
     } else {
         body = dsMapSongOption(node, songMap[node.cf_id], node.type === 'boss' && !_dsData.boss_revealed ? 'Boss' : 'Song', canPlay);
     }
     panel.innerHTML = `<div class="bg-dark-700/50 border border-accent/30 rounded-2xl p-4 text-left">
         <div class="flex items-center gap-2 mb-3"><span class="text-xl">${dsNodeIcon(node)}</span><span class="text-sm font-semibold text-white">${esc(node.id)} · ${esc(dsLaneLabel(node.lane) || node.type)}</span></div>
         <div class="space-y-3">${body}</div>
+        ${debugControls}
     </div>`;
 }
 
@@ -652,7 +706,8 @@ async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
                         if (typeof result.boss_revealed !== 'undefined') _dsData.boss_revealed = result.boss_revealed;
                         if (result.inventory) _dsData.inventory = result.inventory;
                         _dsData.is_complete = result.is_complete;
-                    dsRender();
+                        dsRender();
+                        dsRefreshTokens(); // Refresh token count after song completion
 
                     if (result.is_complete && _dsConfettiDoneFor !== _dsData.date) {
                         setTimeout(() => {
@@ -804,6 +859,7 @@ const data = await resp.json();
             }
         }
     } catch (e) {
+        console.error('DEBUG dsLoadSetlistForDate Error:', e.message, e.stack);
         dsShowError('Network error while loading historical setlist. Please try again.');
         // show retry option on network failure as well
         if (!_dsLastHistoricalRetryDate) {
@@ -831,12 +887,16 @@ function dsRetryLastHistorical() {
 // Render the complete setlist on the Day Complete screen, enabling replay
 function dsRenderCompleteSetlist() {
     const container = document.getElementById('ds-complete-setlist');
+    const extras = document.getElementById('ds-complete-lane-extras');
     if (!container || !_dsData) return;
     const songs = _dsData.songs || [];
     if (_dsData.map) {
         container.innerHTML = dsMapView(_dsData);
+        if (extras) extras.classList.remove('hidden');
+        dsLoadLanePopularity();
         return;
     }
+    if (extras) extras.classList.add('hidden');
     if (songs.length === 0) {
         container.innerHTML = '<div class="text-sm text-gray-400">No songs in today\'s setlist.</div>';
         return;
@@ -850,10 +910,12 @@ function dsSelectRating(val) {
     _dsRating = (_dsRating === val) ? null : val;
     [-1, 1, 2].forEach(v => {
         const btn = document.getElementById(`ds-rating-${v}`);
+        if (!btn) return;
         const selected = _dsRating === v;
         btn.classList.toggle('ring-2', selected);
         btn.classList.toggle('ring-accent', selected);
         btn.classList.toggle('bg-accent/20', selected);
+        btn.setAttribute('aria-checked', selected ? 'true' : 'false');
     });
 }
 
@@ -930,6 +992,7 @@ async function dsShowLeaderboard() {
 
 function dsShowSetlist() {
     dsShow(_dsData?.is_complete ? 'complete' : 'setlist');
+    dsRefreshTokens();
 }
 
 // ── Tab switching for merged complete view ────────────────────────────────
@@ -944,10 +1007,12 @@ function dsSwitchTab(tab) {
         if (todayTab) {
             todayTab.classList.add('bg-accent/20', 'text-accent', 'border-accent/50');
             todayTab.classList.remove('bg-dark-700', 'text-gray-400', 'border-gray-700');
+            todayTab.setAttribute('aria-selected', 'true');
         }
         if (wofTab) {
             wofTab.classList.remove('bg-accent/20', 'text-accent', 'border-accent/50');
             wofTab.classList.add('bg-dark-700', 'text-gray-400', 'border-gray-700');
+            wofTab.setAttribute('aria-selected', 'false');
         }
         if (todayContent) todayContent.classList.remove('hidden');
         if (wofContent) wofContent.classList.add('hidden');
@@ -955,10 +1020,12 @@ function dsSwitchTab(tab) {
         if (todayTab) {
             todayTab.classList.remove('bg-accent/20', 'text-accent', 'border-accent/50');
             todayTab.classList.add('bg-dark-700', 'text-gray-400', 'border-gray-700');
+            todayTab.setAttribute('aria-selected', 'false');
         }
         if (wofTab) {
             wofTab.classList.add('bg-accent/20', 'text-accent', 'border-accent/50');
             wofTab.classList.remove('bg-dark-700', 'text-gray-400', 'border-gray-700');
+            wofTab.setAttribute('aria-selected', 'true');
         }
         if (todayContent) todayContent.classList.add('hidden');
         if (wofContent) wofContent.classList.remove('hidden');
@@ -984,11 +1051,19 @@ function dsDateChanged(val) {
 // ── View switching ────────────────────────────────────────────────────────────
 function dsShow(view) {
     _dsInCompleteView = (view === 'complete');
-    ['loading', 'setlist', 'complete', 'leaderboard'].forEach(v => {
+    ['loading', 'setlist', 'complete', 'leaderboard', 'passport', 'shop'].forEach(v => {
         const el = document.getElementById(`ds-${v}`);
         if (!el) return;
         el.classList.toggle('hidden', v !== view);
     });
+    // Hide token counter in shop view (it shows its own)
+    const tokenCounter = document.getElementById('ds-token-counter');
+    if (tokenCounter && view !== 'shop') {
+        // Only show token counter if we have loaded inventory
+        if (view === 'setlist' || view === 'complete') {
+            tokenCounter.classList.remove('hidden');
+        }
+    }
 }
 
 function dsShowError(msg) {
@@ -1226,3 +1301,395 @@ window.addEventListener('keydown', (e) => {
         }
     }
 });
+
+// ── Passport view ───────────────────────────────────────────────────────────────
+const LANE_GLYPHS = {
+    sprint: '🏃', marathon: '🐢', drop: '⬇', flat: '➡',
+    standard: '🎸', mixed: '🔀',
+};
+
+function dsLaneGlyph(lane) {
+    if (!lane) return '·';
+    if (lane.startsWith('decade_')) return lane.replace('decade_', "'").replace(/s$/, '');
+    return LANE_GLYPHS[lane] || '?';
+}
+
+async function dsLoadPassport() {
+    const r = await fetch(dsApiUrl('/api/plugins/the_daily/passport'), { headers: { 'X-Install-Id': dsInstallId() } });
+    const text = await r.text();
+    const data = text ? JSON.parse(text) : {};
+    if (data.error) {
+        document.getElementById('ds-passport-totals').innerHTML = `<p class="text-red-400 text-sm">${esc(data.error)}</p>`;
+        return;
+    }
+    dsRenderPassportTotals(data.totals);
+    dsRenderPassportGrid(data.days);
+    dsRenderPassportStamps(data.stamps_earned, data.stamps_progress);
+}
+
+function dsShowPassport() {
+    document.getElementById('ds-passport').classList.remove('hidden');
+    document.getElementById('ds-setlist').classList.add('hidden');
+    document.getElementById('ds-complete').classList.add('hidden');
+    document.getElementById('ds-loading').classList.add('hidden');
+    dsLoadPassport();
+}
+
+function dsRenderPassportTotals(totals) {
+    const t = document.getElementById('ds-passport-totals');
+    t.innerHTML = `
+      <div class="bg-dark-700 rounded-2xl p-3 text-center">
+        <div class="text-2xl font-bold text-white">${totals.total_dailies}</div>
+        <div class="text-xs text-gray-500">Dailies played</div>
+      </div>
+      <div class="bg-dark-700 rounded-2xl p-3 text-center">
+        <div class="text-2xl font-bold text-white">${totals.longest_streak}</div>
+        <div class="text-xs text-gray-500">Longest streak</div>
+      </div>
+      <div class="bg-dark-700 rounded-2xl p-3 text-center">
+        <div class="text-2xl font-bold text-white">${totals.current_streak}</div>
+        <div class="text-xs text-gray-500">Current streak</div>
+      </div>
+      <div class="bg-dark-700 rounded-2xl p-3 text-center">
+        <div class="text-2xl font-bold text-yellow-400">🪙 ${totals.lifetime_tokens_earned}</div>
+        <div class="text-xs text-gray-500">Lifetime tokens</div>
+      </div>`;
+}
+
+function dsRenderPassportGrid(days) {
+    const grid = document.getElementById('ds-passport-grid');
+    if (!days || !days.length) {
+        grid.innerHTML = '<div class="text-gray-500 text-sm">No dailies yet — come back tomorrow!</div>';
+        return;
+    }
+    const byMonth = {};
+    days.forEach(d => {
+        const ym = d.date.slice(0, 7);
+        (byMonth[ym] = byMonth[ym] || []).push(d);
+    });
+    const months = Object.keys(byMonth).sort();
+    grid.innerHTML = months.map(ym => {
+        const [y, m] = ym.split('-').map(Number);
+        return `<div>
+          <div class="text-xs uppercase text-gray-500 mb-1">${ym}</div>
+          <div class="grid grid-cols-7 gap-1">
+            ${byMonth[ym].map(d => `
+              <div class="passport-cell month-${m} aspect-square rounded-lg flex flex-col items-center justify-center cursor-pointer hover:ring-2 hover:ring-accent"
+                   title="${esc(d.day_name || '')} · ${esc(d.modifier || '')} · streak ${d.streak_at}"
+                   onclick="dsShowPassportDayDetail('${esc(d.date)}')">
+                <div class="text-lg">${dsLaneGlyph(d.lane)}</div>
+                <div class="text-xs text-gray-400">${d.date.slice(8)}${d.boss_done ? ' ✓' : ''}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>`;
+    }).join('');
+}
+
+function dsShowPassportDayDetail(date) {
+    const day = document.querySelector(`.passport-cell[onclick*="${date}"]`);
+    if (day) {
+        alert(day.getAttribute('title'));
+    }
+}
+
+function dsRenderPassportStamps(earned, progress) {
+    const shelf = document.getElementById('ds-passport-stamps');
+    const earnedHtml = (earned || []).map(s => dsRenderStamp(s.id, s.earned_date, false)).join('');
+    const lockedHtml = (progress || []).map(p => `
+      <div class="relative">
+        ${dsRenderStamp(p.id, null, true)}
+        <div class="absolute -bottom-1 left-0 right-0 text-center text-xs text-gray-500">
+          ${p.current} / ${p.target}
+        </div>
+      </div>`).join('');
+    shelf.innerHTML = earnedHtml + lockedHtml;
+}
+
+// Expose passport functions globally
+window.dsShowPassport = dsShowPassport;
+window.dsLoadPassport = dsLoadPassport;
+window.dsShowPassportDayDetail = dsShowPassportDayDetail;
+
+// ── Shop functions ───────────────────────────────────────────────────────────────
+let _dsShopFilter = 'all';
+let _dsCurrentNodeId = null; // track node_id when opened from map
+
+function dsShowShop(nodeId = null) {
+    _dsCurrentNodeId = nodeId;
+    document.getElementById('ds-shop').classList.remove('hidden');
+    document.getElementById('ds-setlist').classList.add('hidden');
+    document.getElementById('ds-complete').classList.add('hidden');
+    document.getElementById('ds-passport').classList.add('hidden');
+    document.getElementById('ds-loading').classList.add('hidden');
+    dsLoadShop(nodeId);
+    // Show token counter when shop is open
+    document.getElementById('ds-token-counter').classList.remove('hidden');
+}
+
+async function dsRefreshTokens() {
+    try {
+        const r = await fetch(dsApiUrl('/api/plugins/the_daily/inventory'),
+            { headers: { 'X-Install-Id': dsInstallId() } });
+        const text = await r.text();
+        const data = text ? JSON.parse(text) : {};
+        const el = document.querySelector('#ds-token-counter .value');
+        const old = parseInt(el?.textContent, 10) || 0;
+        const next = data.tokens || 0;
+        if (el) el.textContent = next;
+        if (next > old) dsAnimateTokenDelta(next - old);
+        dsApplyEquipped(data.equipped || {});
+    } catch (e) {
+        console.error('Failed to refresh tokens:', e);
+    }
+}
+
+function dsAnimateTokenDelta(delta) {
+    const chip = document.getElementById('ds-token-counter');
+    if (!chip) return;
+    const float = document.createElement('div');
+    float.className = 'absolute -top-4 right-0 text-yellow-400 text-xs animate-bounce';
+    float.textContent = `+${delta}`;
+    chip.style.position = 'relative';
+    chip.appendChild(float);
+    setTimeout(() => float.remove(), 1500);
+}
+
+function dsRenderShopItem(item, forNode = false) {
+    const cost = item.discounted_cost ?? item.cost;
+    const discount = item.discounted_cost ? `<span class="line-through text-gray-500 mr-1">${item.cost}</span>` : '';
+    const buttonState = item.owned ? (item.equipped ? 'Equipped' : 'Owned') : (item.affordable ? 'Buy' : 'Not enough');
+    const disabled = item.owned || !item.affordable;
+    const canRefund = item.is_cosmetic && item.owned && dsCanRefund(item);
+    const refundLink = canRefund ? `<button onclick="dsRefundItem('${esc(item.id)}')" class="ml-2 text-xs text-red-400 hover:underline">Refund</button>` : '';
+    const isEquipped = item.equipped === true;
+    const equipBtn = item.owned && item.is_cosmetic && !item.is_consumable
+        ? `<button onclick="dsEquipToggle('${item.slot}', '${esc(item.id)}', ${isEquipped})" class="ml-2 px-2 py-0.5 rounded text-xs ${isEquipped ? 'bg-green-700 text-green-200' : 'bg-dark-600 text-gray-400'}">${isEquipped ? 'Equipped' : 'Equip'}</button>`
+        : '';
+    return `<div class="bg-dark-700 border border-gray-700 rounded-2xl p-3 flex flex-col">
+        <div class="text-sm font-semibold text-white">${esc(item.name)}</div>
+        <div class="text-xs text-gray-500 mb-2">${esc(item.description || item.type)}</div>
+        <div class="mt-auto flex items-center justify-between">
+            <span class="text-yellow-400 text-sm">🪙 ${discount}${cost}</span>
+            <div class="flex items-center">
+                ${equipBtn}
+                <button onclick="dsBuyItem('${esc(item.id)}', ${forNode ? `'${esc(_dsCurrentNodeId || '')}'` : 'null'})" ${disabled ? 'disabled' : ''}
+                        class="px-3 py-1 rounded-xl bg-accent hover:bg-accent-light disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs whitespace-nowrap">
+                    ${buttonState}
+                </button>
+                ${refundLink}
+            </div>
+        </div>
+    </div>`;
+}
+
+async function dsLoadShop(nodeId = null) {
+    try {
+        const url = nodeId
+            ? `/api/plugins/the_daily/shop?node_id=${encodeURIComponent(nodeId)}`
+            : '/api/plugins/the_daily/shop';
+        const r = await fetch(dsApiUrl(url), { headers: { 'X-Install-Id': dsInstallId() } });
+        const text = await r.text();
+        const data = text ? JSON.parse(text) : {};
+        if (data.error) {
+            document.getElementById('ds-shop-items').innerHTML = `<p class="text-red-400 text-sm">${esc(data.error)}</p>`;
+            return;
+        }
+        document.getElementById('ds-shop-tokens').textContent = data.tokens;
+        const filter = _dsShopFilter;
+        const filtered = data.items.filter(i =>
+            filter === 'all' ||
+            (filter === 'cosmetic' && i.is_cosmetic) ||
+            (filter === 'consumable' && !i.is_cosmetic)
+        );
+        document.getElementById('ds-shop-items').innerHTML = filtered.map(i => dsRenderShopItem(i, !!nodeId)).join('');
+    } catch (e) {
+        document.getElementById('ds-shop-items').innerHTML = `<p class="text-red-400 text-sm">Failed to load shop.</p>`;
+    }
+}
+
+async function dsBuyItem(itemId, nodeId = null) {
+    try {
+        const r = await fetch(dsApiUrl('/api/plugins/the_daily/shop/buy'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() },
+            body: JSON.stringify({ item_id: itemId, node_id: nodeId }),
+        });
+        const text = await r.text();
+        const data = text ? JSON.parse(text) : {};
+        if (data.error) { alert(data.error); return; }
+        dsRefreshTokens();
+        dsLoadShop(nodeId);
+        if (data.effect?.rerolled) {
+            dsLoadToday();
+        }
+    } catch (e) {
+        alert('Failed to purchase item.');
+    }
+}
+
+function dsShopFilter(filter) {
+    _dsShopFilter = filter;
+    document.querySelectorAll('.ds-shop-tab').forEach(btn => {
+        const isSelected = btn.dataset.tab === filter;
+        btn.classList.toggle('bg-accent/20', isSelected);
+        btn.classList.toggle('text-accent', isSelected);
+        btn.classList.toggle('bg-dark-700', !isSelected);
+        btn.classList.toggle('text-gray-400', !isSelected);
+    });
+    dsLoadShop(_dsCurrentNodeId);
+}
+
+function dsCanRefund(item) {
+    if (!item.purchased_at) return false;
+    return (Date.now() / 1000) - item.purchased_at < 60;
+}
+
+async function dsRefundItem(itemId) {
+    if (!confirm('Refund this item? Tokens will be returned.')) return;
+    try {
+        const r = await fetch(dsApiUrl('/api/plugins/the_daily/refund'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() },
+            body: JSON.stringify({ item_id: itemId }),
+        });
+        const text = await r.text();
+        const data = text ? JSON.parse(text) : {};
+        if (data.error) { alert(data.error); return; }
+        dsRefreshTokens();
+        dsLoadShop(_dsCurrentNodeId);
+    } catch (e) {
+        alert('Failed to refund item.');
+    }
+}
+
+async function dsEquip(slot, cosmeticId) {
+    try {
+        await fetch(dsApiUrl('/api/plugins/the_daily/equip'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() },
+            body: JSON.stringify({ slot, cosmetic_id: cosmeticId }),
+        });
+        dsRefreshTokens();
+    } catch (e) {
+        console.error('Failed to equip:', e);
+    }
+}
+
+async function dsEquipToggle(slot, cosmeticId, currentlyEquipped) {
+    const newId = currentlyEquipped ? null : cosmeticId;
+    await dsEquip(slot, newId);
+    dsLoadShop(_dsCurrentNodeId);
+}
+
+function dsApplyEquipped(equipped) {
+    const root = document.querySelector('.daily-root');
+    if (!root) return;
+    // Remove all theme-*, skin-*, flair-*, calendar-art-* classes
+    [...root.classList].forEach(c => {
+        if (/^(theme|skin|flair|calendar-art)-/.test(c)) root.classList.remove(c);
+    });
+    // Map cosmetic ids to CSS classes
+    // flair_glow -> flair-glow, theme_papercraft -> theme-papercraft
+    // skin_neonsprint -> skin-neonsprint, calendar_pastel -> calendar-art-pastel
+    const mapping = {
+        flair: 'flair',
+        map_theme: 'theme',
+        lane_skin: 'skin',
+        calendar_art: 'calendar-art',
+    };
+    Object.entries(equipped).forEach(([slot, id]) => {
+        if (!id) return;
+        const prefix = mapping[slot];
+        if (!prefix) return;
+        const className = `${prefix}-${id.replace(/_/g, '-').replace(/^([a-z]+)-/, '')}`;
+        root.classList.add(className);
+    });
+}
+
+async function dsOpenShopNode(nodeId) {
+    const panel = document.getElementById('ds-map-panel');
+    if (!panel) return;
+    try {
+        const r = await fetch(dsApiUrl(`/api/plugins/the_daily/shop?node_id=${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } });
+        const text = await r.text();
+        const data = text ? JSON.parse(text) : {};
+        const offerSet = new Set(data.discount?.items || []);
+        const offerItems = data.items.filter(i => offerSet.has(i.id));
+        panel.innerHTML = `<div class="bg-dark-700/50 border border-yellow-700/40 rounded-2xl p-4">
+            <div class="flex items-center gap-2 mb-3">
+                <span class="text-xl">🛒</span>
+                <span class="text-sm font-semibold text-white">Shop · 10% off (today)</span>
+            </div>
+            <div class="grid grid-cols-1 gap-2">
+                ${offerItems.map(i => dsRenderShopItem({ ...i, _node_id: nodeId }, true)).join('')}
+            </div>
+        </div>`;
+    } catch (e) {
+        panel.innerHTML = '<div class="text-sm text-red-400">Failed to load shop offer.</div>';
+    }
+}
+
+// Helper to reload today's setlist after re-roll
+async function dsLoadToday() {
+    if (_dsData?.map) {
+        await dsInit();
+    }
+}
+
+async function dsUseLaneReroll(nodeId) {
+    if (!_dsData?.map) return;
+    console.log("DEBUG: Triggering lane re-roll for node:", nodeId);
+    console.log("DEBUG: Current inventory:", _dsData.inventory);
+    try {
+        const resp = await fetch('/api/plugins/the_daily/use-item', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                install_id: dsInstallId(),
+                item_id: 'lane_reroll',
+                node_id: nodeId,
+                debug_no_save: !!_dsData.debug_no_save,
+            }),
+        });
+        const text = await resp.text();
+        console.log("DEBUG: Reroll response status:", resp.status);
+        console.log("DEBUG: Reroll response text:", text);
+        const data = text ? JSON.parse(text) : {};
+        if (!resp.ok || data.error) {
+            const panel = document.getElementById('ds-map-panel');
+            if (panel) panel.innerHTML = `<div class="text-sm text-yellow-400 text-center py-3">${esc(data.error || 'Could not use item.')}</div>`;
+            return;
+        }
+        _dsData.inventory = data.inventory;
+        if (data.effect?.rerolled) {
+            dsLoadToday();
+        } else if (_dsData.debug_no_save) {
+            dsInit();
+        } else {
+            await dsInit();
+        }
+    } catch (e) {
+        console.error("DEBUG: Reroll network error:", e);
+        const panel = document.getElementById('ds-map-panel');
+        if (panel) panel.innerHTML = '<div class="text-sm text-red-400 text-center py-3">Network error using item.</div>';
+    }
+}
+
+// ── Expose shop globals ──────────────────────────────────────────────────
+window.dsShowShop = dsShowShop;
+window.dsRefreshTokens = dsRefreshTokens;
+window.dsAnimateTokenDelta = dsAnimateTokenDelta;
+window.dsLoadShop = dsLoadShop;
+window.dsBuyItem = dsBuyItem;
+window.dsShopFilter = dsShopFilter;
+window.dsRefundItem = dsRefundItem;
+window.dsEquip = dsEquip;
+window.dsEquipToggle = dsEquipToggle;
+window.dsApplyEquipped = dsApplyEquipped;
+window.dsOpenShopNode = dsOpenShopNode;
+window.dsRenderShopItem = dsRenderShopItem;
+window.dsUseBossReroll = dsUseBossReroll;
+window.dsUseLaneReroll = dsUseLaneReroll;
+window._dsShopFilter = _dsShopFilter;

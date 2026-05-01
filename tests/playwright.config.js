@@ -1,8 +1,10 @@
-module.exports = {
+const { defineConfig } = require('@playwright/test');
+
+module.exports = defineConfig({
   testDir: './tests/playwright',
   retries: 1,
   use: {
-    baseURL: 'http://localhost',
     headless: true,
   },
-};
+  // No webServer needed - tests use page.setContent()
+});

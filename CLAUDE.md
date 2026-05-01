@@ -4,6 +4,20 @@ A Slopsmith plugin that delivers a globally-shared daily setlist of CDLC songs, 
 
 The parent `CLAUDE.md` (two levels up) covers Slopsmith's plugin contract — read it first. This file documents what's specific to The Daily.
 
+## Agent skills
+
+### Issue tracker
+
+Local markdown — issues live as files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary (needs-triage, ready-for-agent, etc.). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — one `CONTEXT.md` + `plans/adr/` at the repo root. See `docs/agents/domain.md`.
+
 ## Files
 
 ```
@@ -13,25 +27,28 @@ screen.js            Frontend; functions prefixed `ds*`. Hooks window.showScreen
 routes.py            Backend: pool loading, modifier engine, FastAPI routes, Supabase calls
 songs_pool.json      The song pool (~14 MB, gitignored). Built by build_pool.py.
 build_pool.py        Discord scraper + CustomsForge metadata filler (dev tool, gitignored)
+publish_pool.py      Stamps + uploads pool to GitHub release `pool-archive` (dev tool, gitignored)
 preview.py           Simulate the next N days without writing to the DB (gitignored)
 reset_today.py       Wipe today's cached setlist from the_daily.db so it regenerates (gitignored)
 checkpoint.json      Discord scrape resume cursor (gitignored)
 fill_checkpoint.json CF artist-fill resume state (gitignored)
 ```
 
-The pool file and the build script are gitignored on purpose — the pool is too large to ship, and the build script needs a Discord user token + CustomsForge cookie that nobody else has. End users get the pool from a remote URL (see `POOL_URL` in `routes.py`, currently empty → falls back to bundled file).
+The pool file and the build/publish scripts are gitignored on purpose — the pool is too large to ship, and the scripts need a Discord user token + CustomsForge cookie + `gh` auth that nobody else has. End users fetch versioned pools from a GitHub release (see `MANIFEST_URL` + `POOL_URL` in `routes.py`); the bundled `songs_pool.json` is a first-run seed only.
 
 ## How a daily setlist is built
 
-`GET /api/plugins/the_daily/today` is the entry point. The flow:
+`GET /api/plugins/the_daily/today` is the entry point. All dates are **UTC** (`datetime.utcnow().date()` — daily rolls at 00:00 UTC for every install). The flow:
 
 1. **Cache check** — `daily_setlists` table keyed by `date`. If today's row exists, return its modifier + songs.
-2. **Pool load** — `_load_pool()` returns from the `pool_cache` table (1 row per fetch date), else fetches `POOL_URL`, else reads bundled `songs_pool.json`. Pool gets filtered: artist+title ≥ 2 chars, no "full album" entries.
+2. **Pool resolution** — `_get_pool_stamp(date)` fetches `pool-manifest.json` (cached in DB), runs latest-leq against the date to pick a `pool_stamp`, then `_fetch_pool_by_stamp(stamp)` returns the pool (cached by stamp in `pool_cache`, else GETs `pool-<stamp>.json` from the release). On network failure, stale-cache covers a 7-day grace window; beyond that, hard-fail. Bundled `songs_pool.json` participates as `BUNDLED_POOL_STAMP` for first-run installs. Pool gets filtered: artist+title ≥ 2 chars, no "full album" entries.
 3. **Modifier pick** — `_pick_modifier(date_str)` seeds an RNG with `md5(date)[:6]` and picks one key from `MODIFIERS`.
 4. **Pool narrowing** — exclude any `cf_id` used in the last 14 days. If that leaves <5 songs, ignore the exclusion. For `artist_takeover`, additionally exclude artists picked in the last 14 days.
 5. **Song selection** — dispatched by modifier `type` (see "Modifier system" below). Returns `(songs, song_count, fallback_bool)`.
-6. **Day name** — for `identity` modifiers, derived from the chosen value ("The 1980s", "AC/DC", album name). Otherwise `"Daily #{N}"` where N is days since `_EPOCH = 2026-04-22` (Day #1).
-7. **Persist + enrich** — write to `daily_setlists`, then enrich each song with `local_filename`, `has_locally` (via `_find_locally` LIKE-match against `meta_db.songs`), and `done` (from `daily_completions`).
+6. **Day name** — for `identity` modifiers, derived from the chosen value ("The 1980s", "AC/DC", album name). Otherwise `"Daily #{N}"` where N is days since `_EPOCH = 2026-04-22` (Day #1, UTC).
+7. **Persist + enrich** — write to `daily_setlists` (including `pool_stamp` for past-day reproducibility), then enrich each song with `local_filename`, `has_locally` (via `_find_locally` LIKE-match against `meta_db.songs`), and `done` (from `daily_completions`).
+
+Pool stamps are immutable once published. Stamps are activation dates — the pool stamped `2026-05-01` first applies on UTC date 2026-05-01 and remains in effect until a later stamp supersedes it. See `plans/adr/0005-pool-versioning-and-utc-date.md`.
 
 Determinism is load-bearing: changing the modifier list, the seed function, the EPOCH, or the selection algorithms will silently retroactively change what every user sees today. If you need to evolve a selector, version it (e.g. seed with `_date_seed(date) + "v2"`) so past days remain reproducible.
 
@@ -64,9 +81,9 @@ Every selector returns `(songs, count, fallback_bool)`. `fallback=True` surfaces
 
 SQLite file at `<config_dir>/the_daily.db`. `config_dir` is provided by Slopsmith's plugin context. Three tables, all created on first connection:
 
-- `daily_setlists(date PK, day_name, modifier, songs JSON, song_count)` — one row per day; the source of truth for "what is today's setlist".
+- `daily_setlists(date PK, day_name, modifier, songs JSON, song_count, pool_stamp)` — one row per day; the source of truth for "what is today's setlist". `pool_stamp` records which pool produced the row, enabling identical regen via `reset_today.py`.
 - `daily_completions(date, cf_id, completed_at)` — composite PK, INSERT OR IGNORE so dupes are silent.
-- `pool_cache(fetched_date PK, pool JSON)` — one row per day. Don't trust this for "the pool today" beyond a single date; a stale row from yesterday is still valid for yesterday's setlist regeneration but never read past today.
+- `pool_cache(pool_stamp PK, pool JSON, fetched_at)` — keyed by stamp, not by fetch date. Pools are immutable per stamp, so each stamp is fetched once and reused forever. `fetched_at` drives stale-cache grace: beyond 7 days without a successful refresh + GitHub unreachable, the daily hard-fails rather than silently diverging.
 
 Connection is a module-level singleton with `check_same_thread=False` and a `threading.Lock` around writes. Reads are unlocked.
 
@@ -86,6 +103,14 @@ python preview.py --days 30
 python preview.py --days 90 --compact
 python preview.py --start 2026-05-01 --days 7
 
+# Deterministic snapshot for comparison testing (new)
+python preview.py --snapshot snapshots/baseline.json --days 90
+python preview.py --snapshot snapshots/after-change.json --days 90
+# Compare: diff snapshots/baseline.json snapshots/after-change.json
+
+# Map mode preview (ASCII art)
+python preview.py --map --days 30
+
 # Force-regenerate today's setlist (e.g. after editing MODIFIERS)
 python reset_today.py            # just the setlist row
 python reset_today.py --pool     # also clear today's pool_cache row
@@ -94,7 +119,38 @@ python reset_today.py --pool     # also clear today's pool_cache row
 python build_pool.py             # incremental — uses checkpoint.json
 python build_pool.py --full      # full rescrape, ignores checkpoint
 python build_pool.py --fill-artists --cf-cookie '...'   # back-fill missing metadata via CF
+
+# Publish a new pool to the GitHub release (requires gh CLI authenticated)
+python publish_pool.py                          # stamps as today_utc + 1 day
+python publish_pool.py --stamp 2026-05-15       # explicit future stamp
+# Asserts: stamp is strictly future, no collision with existing asset.
+# Uploads pool-<stamp>.json + updated pool-manifest.json to release `pool-archive`,
+# verifies anonymous GET + content hash, then runs preview spot-check.
 ```
+
+### Running map render tests (no server)
+
+Open `test-map-render.html` in a browser to verify:
+- Icon mapping for all node types (forced, elite, treasure, rest, shop, choice, mystery, boss)
+- Lane label generation (standard, drop, flat, sprint, marathon, decade_*)
+- SVG lane classes (`lane-standard`, `lane-drop`, etc.) are applied
+- Act labels are present when nodes have an `act` property
+- Default lane falls back to `lane-standard`
+
+```bash
+# Open directly
+start test-map-render.html        # Windows
+open test-map-render.html         # macOS
+xdg-open test-map-render.html    # Linux
+```
+
+### Verifying visuals locally
+
+1. **CSS variables**: Edit `:root` lane colors in `screen.html` — all lane styling updates from one place
+2. **Lane legend**: Toggle `#ds-lane-legend` visibility in DevTools to verify color circles use `var(--lane-*)`
+3. **Map nodes**: Inspect SVG `<g>` elements for `lane-standard`, `lane-drop`, etc. classes
+4. **Keyboard nav**: Click a map node, then use Arrow keys to move between available nodes
+5. **Screen reader**: Check `ds-live-region` announces focused nodes; lane legend has `role="region"`
 
 `reset_today.py` reads `CONFIG_DIR` from env, defaulting to `~/.local/share/rocksmith-cdlc`. On Windows that path won't exist — pass `CONFIG_DIR=...` matching what Slopsmith uses on this machine.
 
@@ -102,8 +158,10 @@ python build_pool.py --fill-artists --cf-cookie '...'   # back-fill missing meta
 
 - **Editing MODIFIERS changes today retroactively.** The seed function shuffles all keys and picks index 0. Adding/removing/renaming a modifier reshuffles. If you need to test a new modifier without disturbing the live setlist, add it locally, run `preview.py`, then `reset_today.py` before the day it lands.
 - **`_find_locally` is a `LIKE` match** on title and artist. Songs with punctuation/featuring-artist differences won't match. False positives are possible (substring collisions); accepted as a tradeoff for not requiring per-song fingerprinting.
-- **The pool ships ~14 MB of JSON.** Keep it gitignored. End users fetch via `POOL_URL` once that's set; until then they use whatever bundled copy they have.
-- **`day_number` is anchored to `_EPOCH = date(2026, 4, 22)`.** Don't bump this — it would renumber every past day in every user's UI.
+- **The pool ships ~14 MB of JSON.** Keep it gitignored. End users fetch versioned pools from the `pool-archive` GitHub release; the bundled copy is a first-run seed only and is shadowed once any successful manifest fetch lands.
+- **Pool stamps are immutable and strictly future.** `publish_pool.py` enforces this — never overwrite an existing `pool-<date>.json`, never stamp a pool with today's or a past UTC date. Same-day pool fixes are impossible by design; bad pool means a bad day. Build pool today, stamp tomorrow, upload today.
+- **All dates are UTC.** `_get_today()` uses `datetime.utcnow().date()`. The daily rolls at 00:00 UTC for every install regardless of timezone. Don't reintroduce `date.today()` — it breaks the global determinism guarantee across timezones.
+- **`day_number` is anchored to `_EPOCH = date(2026, 4, 22)` UTC.** Don't bump this — it would renumber every past day in every user's UI.
 - **The Supabase anon key is public on purpose.** Don't rotate it as if it leaked. If abuse becomes a problem, add a Postgres RLS policy or rate-limit at the edge instead.
 ## The Daily MVP Roadmap
 

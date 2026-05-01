@@ -1,4 +1,4 @@
-<div class="max-w-2xl mx-auto px-6 pt-24 pb-16">
+<div class="max-w-2xl mx-auto px-6 pt-24 pb-16 daily-root">
 
 <style>
   :root {
@@ -11,13 +11,13 @@
   /* Optional helper to make act labels inherit lane color via currentColor */
   .ds-svg-lane-group { color: var(--lane-standard); }
   .ds-svg-act { fill: currentColor; font-family: system-ui, -apple-system, sans-serif; }
-  </style>
   /* Lane colors mapped to classes for CSS-driven styling */
   .ds-svg-lane-group.lane-standard { color: var(--lane-standard); }
   .ds-svg-lane-group.lane-drop { color: var(--lane-drop); }
   .ds-svg-lane-group.lane-flat { color: var(--lane-flat); }
   .ds-svg-lane-group.lane-sprint { color: var(--lane-sprint); }
   .ds-svg-lane-group.lane-marathon { color: var(--lane-marathon); }
+  </style>
 
     <!-- Loading -->
     <div id="ds-loading" class="flex items-center justify-center py-32">
@@ -30,12 +30,17 @@
         <div class="mb-8">
             <div class="flex items-center justify-between mb-1">
                 <div class="flex items-center gap-3">
+                    <button onclick="dsShowPassport()" class="text-xs text-gray-400 hover:text-white transition">Passport</button>
+                    <button onclick="dsShowShop()" class="text-xs text-gray-400 hover:text-white transition">Shop</button>
                     <span id="ds-modifier-icon" class="text-2xl"></span>
                     <span id="ds-modifier-label" class="text-xs font-semibold uppercase tracking-widest text-accent-light px-2 py-0.5 bg-accent/10 rounded-full"></span>
                     <span id="ds-seed" class="text-xs font-mono text-gray-500"></span>
                     <span id="ds-day-number" class="text-xs text-gray-500 font-mono"></span>
                 </div>
                 <span id="ds-stats" class="text-xs text-gray-500 font-mono"></span>
+                <span id="ds-token-counter" class="ml-2 px-2 py-1 rounded-full bg-dark-700 text-yellow-400 text-sm font-mono hidden">
+                    🪙 <span class="value">0</span>
+                </span>
             </div>
             <div class="text-right">
                 <span id="ds-countdown" class="text-xs text-gray-500 font-mono"></span>
@@ -46,17 +51,6 @@
             <p id="ds-fallback-notice" class="hidden text-xs text-yellow-500 mt-2">
                 Not enough matching songs in the pool — using full library today.
             </p>
-        </div>
-
-        <!-- Progress bar -->
-        <div class="mb-8">
-            <div class="flex items-center justify-between mb-2">
-                <span class="text-xs text-gray-500 uppercase tracking-wider">Progress</span>
-                <span id="ds-progress-label" class="text-sm font-semibold text-white"></span>
-            </div>
-            <div class="h-2 bg-dark-700 rounded-full overflow-hidden">
-                <div id="ds-progress-bar" class="h-full bg-accent rounded-full transition-all duration-500 shadow-[0_0_8px_rgba(64,128,224,0.6)]" style="width:0%"></div>
-            </div>
         </div>
 
         <!-- Rescan prompt (shown when songs are missing locally) -->
@@ -70,6 +64,28 @@
 
         <!-- Song list -->
         <div id="ds-songs" class="space-y-3"></div>
+
+        <!-- Map Legend & Popularity -->
+        <div id="ds-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
+            <div id="ds-lane-legend" class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
+                </div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
+                </div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
+                </div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
+                </div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
+                </div>
+            </div>
+            <div id="ds-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
+        </div>
     </div>
 
 <!-- Complete view (with tabs merger) -->
@@ -86,9 +102,9 @@
         <p id="ds-complete-streak" class="text-sm text-gray-400 mb-6"></p>
 
         <!-- Tab bar -->
-        <div class="flex justify-center gap-1 mb-4">
-            <button id="ds-tab-today" onclick="dsSwitchTab('today')" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-accent/20 text-accent border border-accent/50">Setlist</button>
-            <button id="ds-tab-wof" onclick="dsSwitchTab('wof')" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-dark-700 text-gray-400 border border-gray-700 hover:border-gray-500">Wall of Fame</button>
+        <div class="flex justify-center gap-1 mb-4" role="tablist">
+            <button id="ds-tab-today" onclick="dsSwitchTab('today')" role="tab" aria-selected="true" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-accent/20 text-accent border border-accent/50">Setlist</button>
+            <button id="ds-tab-wof" onclick="dsSwitchTab('wof')" role="tab" aria-selected="false" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-dark-700 text-gray-400 border border-gray-700 hover:border-gray-500">Wall of Fame</button>
         </div>
 
         <!-- Day navigation -->
@@ -105,6 +121,26 @@
         <!-- Today tab content -->
         <div id="ds-today-content">
             <div id="ds-complete-setlist" class="space-y-3"></div>
+            <div id="ds-complete-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
+                <div class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
+                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
+                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
+                    </div>
+                </div>
+                <div id="ds-complete-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
+            </div>
         </div>
 
         <!-- Wall of Fame tab content -->
@@ -114,10 +150,10 @@
                 <div class="space-y-3">
                     <input type="text" id="ds-sign-name" placeholder="Your Name" class="w-full bg-dark-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-accent" maxlength="30" />
                     <input type="text" id="ds-sign-message" placeholder="Leave a comment... (optional)" class="w-full bg-dark-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 focus:outline-none focus:border-accent" maxlength="60" />
-                    <div class="flex justify-center gap-2 pt-1" id="ds-sign-ratings">
-                        <button id="ds-rating--1" onclick="dsSelectRating(-1)" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Down">👎</button>
-                        <button id="ds-rating-1" onclick="dsSelectRating(1)" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Up">👍</button>
-                        <button id="ds-rating-2" onclick="dsSelectRating(2)" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Fire">🔥</button>
+                    <div class="flex justify-center gap-2 pt-1" id="ds-sign-ratings" role="radiogroup" aria-label="Rate today's setlist">
+                        <button id="ds-rating--1" onclick="dsSelectRating(-1)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Down">👎</button>
+                        <button id="ds-rating-1" onclick="dsSelectRating(1)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Thumbs Up">👍</button>
+                        <button id="ds-rating-2" onclick="dsSelectRating(2)" role="radio" aria-checked="false" class="p-2 rounded-lg bg-dark-800 border border-gray-700 hover:border-gray-500 transition text-lg" title="Fire">🔥</button>
                     </div>
                     <p id="ds-sign-error" class="hidden text-xs text-red-400 text-center"></p>
                     <button id="ds-btn-sign" onclick="dsSign()" class="w-full bg-accent hover:bg-accent-light text-white font-semibold py-2 rounded-lg text-sm transition">Sign the Wall</button>
@@ -129,6 +165,36 @@
             <p id="ds-lb-count" class="text-sm text-gray-500 mt-6 text-center"></p>
             <p id="ds-lb-error" class="hidden text-xs text-yellow-500 mt-4 text-center"></p>
         </div>
+    </div>
+
+    <!-- Passport view -->
+    <div id="ds-passport" class="hidden">
+        <div class="flex items-center mb-4">
+            <button onclick="dsShowSetlist()" class="text-sm text-gray-400 hover:text-white">← Back</button>
+            <h2 class="ml-4 text-xl font-semibold text-white">Passport</h2>
+        </div>
+
+        <div id="ds-passport-totals" class="grid grid-cols-4 gap-3 mb-6"></div>
+
+        <div id="ds-passport-grid" class="space-y-4 mb-8"></div>
+
+        <h3 class="text-sm uppercase text-gray-500 mb-2">Stamps</h3>
+        <div id="ds-passport-stamps" class="flex flex-wrap gap-3"></div>
+    </div>
+
+    <!-- Shop view -->
+    <div id="ds-shop" class="hidden">
+        <div class="flex items-center mb-4">
+            <button onclick="dsShowSetlist()" class="text-sm text-gray-400 hover:text-white">← Back</button>
+            <h2 class="ml-4 text-xl font-semibold text-white">Shop</h2>
+            <span class="ml-auto text-yellow-400 font-mono">🪙 <span id="ds-shop-tokens">0</span></span>
+        </div>
+        <div class="flex gap-2 mb-4">
+            <button class="ds-shop-tab px-3 py-1.5 rounded-lg text-xs bg-accent/20 text-accent border border-accent/50" data-tab="all" onclick="dsShopFilter('all')">All</button>
+            <button class="ds-shop-tab px-3 py-1.5 rounded-lg text-xs bg-dark-700 text-gray-400 border border-gray-700 hover:border-gray-500" data-tab="cosmetic" onclick="dsShopFilter('cosmetic')">Cosmetics</button>
+            <button class="ds-shop-tab px-3 py-1.5 rounded-lg text-xs bg-dark-700 text-gray-400 border border-gray-700 hover:border-gray-500" data-tab="consumable" onclick="dsShopFilter('consumable')">Re-rolls</button>
+        </div>
+        <div id="ds-shop-items" class="grid grid-cols-2 gap-3"></div>
     </div>
 
 </div>

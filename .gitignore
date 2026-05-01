@@ -1,8 +1,12 @@
+test-results/
+node_modules/
 checkpoint.json
 fill_checkpoint.json
 songs_pool.json
 songs_pool.json.bak
 build_pool.py
+publish_pool.py
+publish_modifiers.py
 __pycache__/
 *.pyc
 *.bak

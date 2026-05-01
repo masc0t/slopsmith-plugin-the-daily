@@ -12,4 +12,17 @@ if [ ! -d node_modules ]; then
 fi
 
 echo "Starting Playwright tests..."
-npx playwright test || exit 2
+npm run build-static || true
+if command -v node >/dev/null 2>&1; then
+  # Start a lightweight dev server on port 3000 for tests that need a running UI
+  if ! pgrep -f "dev_server.js" > /dev/null; then
+    node dev_server.js 3000 &
+    SERVER_PID=$!
+    echo "Dev server started with PID $SERVER_PID"
+    sleep 1
+  fi
+fi
+ npx playwright test || exit 2
+ if [ -n "${SERVER_PID:-}" ]; then
+  kill "$SERVER_PID" || true
+ fi
