@@ -2,6 +2,7 @@
   "id": "the_daily",
   "name": "The Daily",
   "version": "1.0.0",
+  "debug": false,
   "nav": { "label": "Daily" },
   "screen": "screen.html",
   "script": "screen.js",

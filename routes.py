@@ -73,7 +73,17 @@ def _read_plugin_version():
     except Exception:
         return "0.0.0"
 
+
+def _is_debug_enabled() -> bool:
+    try:
+        with open(Path(__file__).parent / "plugin.json") as f:
+            return json.load(f).get("debug", False) is True
+    except Exception:
+        return False
+
+
 _PLUGIN_VERSION = _read_plugin_version()
+_DEBUG_ENABLED = _is_debug_enabled()
 
 
 def _day_name(date_str, mod, songs):
@@ -2673,7 +2683,7 @@ def setup(app, context):
         real_today = today
         today_date = date.fromisoformat(today)
         install_id = _client_install_id(request=request)
-        debug_map = request.query_params.get("debug_map") in ("1", "true", "yes")
+        debug_map = _DEBUG_ENABLED and request.query_params.get("debug_map") in ("1", "true", "yes")
         if debug_map and request.query_params.get("debug_date"):
             try:
                 today = date.fromisoformat(request.query_params.get("debug_date")).isoformat()
@@ -3016,7 +3026,7 @@ def setup(app, context):
         node_id = data.get("node_id")
         install_id = _client_install_id(data=data)
         action = data.get("action")
-        debug_no_save = bool(data.get("debug_no_save"))
+        debug_no_save = _DEBUG_ENABLED and bool(data.get("debug_no_save"))
         force_complete = bool(data.get("force_complete"))
         duration_played = data.get("duration_played", 0)
         # Debug-only path: force-complete a node without playing.
@@ -3172,7 +3182,7 @@ def setup(app, context):
     def use_item(data: dict):
         install_id = _client_install_id(data=data)
         item_id = data.get("item_id")
-        debug_no_save = bool(data.get("debug_no_save"))
+        debug_no_save = _DEBUG_ENABLED and bool(data.get("debug_no_save"))
         if not install_id:
             return {"error": "install_id required"}
         if item_id not in (BOSS_REROLL_ITEM, LANE_REROLL_ITEM):
