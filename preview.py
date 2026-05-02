@@ -213,8 +213,12 @@ def _print_map_ascii(map_data: dict, songs: list, active: list):
             for option in options:
                 print(f"      - {option}")
         else:
-            song = lookup.get(node.get("cf_id"))
-            print(prefix + (" Boss: " if node["type"] == "boss" else " ") + (_song_label(song) if song else "missing song"))
+            need = 1 if node["type"] in ("forced", "boss", "elite", "treasure") else 0
+            if need == 0:
+                print(prefix + f" {node['type'].capitalize()}")
+            else:
+                song = lookup.get(node.get("cf_id"))
+                print(prefix + (" Boss: " if node["type"] == "boss" else " ") + (_song_label(song) if song else "missing song"))
 
 
 def _build_snapshot(days: int, start: date, map_mode: bool = False) -> dict:
