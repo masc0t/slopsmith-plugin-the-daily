@@ -17,6 +17,7 @@ const html = `<!doctype html>
   </style>
 </head>
 <body>
+  <div id="ds-live-region" aria-live="polite" aria-atomic="true" class="sr-only"></div>
   <div id="output"></div>
   <div id="ds-map-panel"></div>
   <script>${screenJs}<\/script>
@@ -215,6 +216,94 @@ setTimeout(() => {
   assert(htmlWithSvg.includes('<circle'), 'Should contain circle elements for nodes');
   assert(htmlWithSvg.includes('<text'), 'Should contain text elements for labels');
   assert(htmlWithSvg.includes('viewBox='), 'Should have viewBox attribute');
+
+  // Test 7: Accessibility - Map node aria-label with song info
+  console.log('\nTest 7: Accessibility - Node ARIA');
+
+  const accessibilityData = {
+    date: '2026-04-26',
+    map: {
+      nodes: [
+        { id: 'n1', type: 'forced', lane: 'sprint', col: 0, row: 0 },
+      ],
+      edges: [],
+      lanes: { sprint: '⚡' }
+    },
+    songs: [
+      { cf_id: 'song1', title: 'Back in Black', artist: 'AC/DC' }
+    ],
+    available_node_ids: ['n1'],
+    cleared_node_ids: [],
+    locked_node_ids: []
+  };
+  accessibilityData.map.nodes[0].cf_id = 'song1';
+
+  const accessibilityHtml = window.dsMapView(accessibilityData);
+  assert(accessibilityHtml.includes('aria-label='), 'Should have aria-label attribute');
+  assert(accessibilityHtml.includes('Back in Black'), 'Should include song title in aria-label');
+  assert(accessibilityHtml.includes('AC/DC'), 'Should include artist in aria-label');
+  assert(accessibilityHtml.includes('role="button"'), 'Interactive nodes should have role="button"');
+  assert(accessibilityHtml.includes('tabindex="0"'), 'Interactive nodes should have tabindex="0"');
+
+  // Future nodes should NOT have interactive attributes
+  const futureData = {
+    date: '2026-04-26',
+    map: {
+      nodes: [
+        { id: 'n1', type: 'forced', lane: 'standard', col: 0, row: 0 },
+      ],
+      edges: [],
+      lanes: {}
+    },
+    songs: [],
+    available_node_ids: [],
+    cleared_node_ids: [],
+    locked_node_ids: []
+  };
+
+  const futureHtml = window.dsMapView(futureData);
+  assert(!futureHtml.includes('role="button"'), 'Future nodes should NOT have role="button"');
+  assert(!futureHtml.includes('tabindex="0"'), 'Future nodes should NOT have tabindex="0"');
+
+  // Test 8: Accessibility - dsAnnounce function
+  console.log('\nTest 8: Accessibility - Live Region Announcements');
+
+  assert(typeof window.dsAnnounce === 'function', 'dsAnnounce should be a function');
+
+  // Test that dsAnnounce updates the live region
+  const liveRegion = document.getElementById('ds-live-region');
+  assert(liveRegion !== null, 'Live region element should exist');
+
+  window.dsAnnounce('Test announcement message');
+  assert(liveRegion.textContent === 'Test announcement message', 'dsAnnounce should update live region text');
+
+  // Test 9: Accessibility - Panel aria-live
+  console.log('\nTest 9: Accessibility - Panel aria-live');
+
+  const panelData = {
+    date: '2026-04-26',
+    map: {
+      nodes: [
+        { id: 'n1', type: 'forced', lane: 'standard', col: 0, row: 0 },
+      ],
+      edges: [],
+      lanes: {}
+    },
+    songs: [],
+    available_node_ids: ['n1'],
+    cleared_node_ids: [],
+    locked_node_ids: []
+  };
+
+  const panelHtml = window.dsMapView(panelData);
+  assert(panelHtml.includes('aria-live="polite"'), 'Map panel should have aria-live="polite"');
+
+  // Test 10: Focus ring CSS exists in screen.html
+  console.log('\nTest 10: Accessibility - Focus Ring CSS');
+
+  const screenHtmlPath = path.join(__dirname, '..', 'screen.html');
+  const screenHtml = fs.readFileSync(screenHtmlPath, 'utf8');
+  assert(screenHtml.includes('.ds-svg-lane-group:focus'), 'screen.html should have focus ring CSS for SVG nodes');
 
   // Summary
   console.log('\n=== Summary ===');

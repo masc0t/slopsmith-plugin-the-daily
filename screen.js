@@ -16,6 +16,7 @@ var _dsPlayStartTime = 0;   // when current song started playing
 var _dsPlayingCfId = null;   // cf_id of song currently being played
 var _dsPlayingNodeId = null; // map node currently being played
 var _dsSkipNextInit = false;
+var _dsInitialized = false; // whether dsInit has run at least once
 
 
 // Node type to icon mapping (centralized for visual consistency)
@@ -40,6 +41,10 @@ function esc(str) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
 }
+function dsAnnounce(msg) {
+    const el = document.getElementById('ds-live-region');
+    if (el) { el.textContent = msg; setTimeout(() => { if(el) el.textContent = ''; }, 1000); }
+}
 function dsInstallId() {
     let id = localStorage.getItem('ds_install_id');
     if (!id) {
@@ -50,14 +55,27 @@ function dsInstallId() {
 }
 
 function dsIsDebugMap() {
-    const params = new URLSearchParams(window.location.search || '');
-    return localStorage.getItem('ds_debug_map') === 'true' || params.get('ds_debug_map') === '1';
+    const debug = localStorage.getItem('ds_debug_map') === 'true';
+    if (!debug) return false;
+    // Auto-clear debug if more than 1 day old
+    const debugDate = localStorage.getItem('ds_debug_map_date');
+    if (debugDate) {
+        const d1 = new Date(debugDate);
+        const d2 = new Date();
+        const days = Math.abs(d2 - d1) / (1000 * 60 * 60 * 24);
+        if (days > 1) {
+            localStorage.removeItem('ds_debug_map');
+            localStorage.removeItem('ds_debug_map_date');
+            return false;
+        }
+    }
+    return true;
 }
 
 function dsDebugMap(on = true) {
     localStorage.setItem('ds_debug_map', on ? 'true' : 'false');
     if (on && _dsData?.date) localStorage.setItem('ds_debug_map_date', _dsData.date);
-    dsInit();
+    showScreen('plugin-the_daily');  // Use showScreen to ensure HTML is loaded first
 }
 
 function dsDebugMapDay(delta) {
@@ -65,12 +83,12 @@ function dsDebugMapDay(delta) {
     const d = new Date(base + 'T12:00:00');
     d.setDate(d.getDate() + delta);
     localStorage.setItem('ds_debug_map_date', d.toISOString().slice(0, 10));
-    dsInit();
+    showScreen('plugin-the_daily');  // Use showScreen to ensure HTML is loaded first
 }
 
 function dsDebugMapToday() {
     localStorage.setItem('ds_debug_map_date', new Date().toISOString().slice(0, 10));
-    dsInit();
+    showScreen('plugin-the_daily');  // Use showScreen to ensure HTML is loaded first
 }
 
 
@@ -100,65 +118,86 @@ function dsApiUrl(path) {
 (function () {
     const orig = window.showScreen;
     window.showScreen = function (id) {
+        console.log('[daily] showScreen called with id:', id);
         orig(id);
-if (id === 'plugin-the_daily') {
-            if (_dsSkipNextInit) {
-                _dsSkipNextInit = false;
-                return;
-            }
-            if (!_dsReturnListenerRegistered) {
-                _dsReturnListenerRegistered = true;
-                // Listen for song:play to update accurate start time
-                window.slopsmith.on('song:play', (e) => {
-                    // Update start time when playback actually begins
-                    if (_dsPlayingCfId) {
-                        _dsPlayStartTime = Date.now();
-                    }
-                });
-                window.slopsmith.on('song:ended', async (e) => {
-                    // Mark completion if song was played long enough
-                    if (_dsPlayingCfId && _dsPlayStartTime > 0) {
-                        const durationPlayed = Math.floor((Date.now() - _dsPlayStartTime) / 1000);
-                        await dsMarkSong(_dsPlayingCfId, durationPlayed, _dsPlayingNodeId);
-                        _dsPlayingCfId = null;
-                        _dsPlayingNodeId = null;
-                        _dsPlayStartTime = 0;
-                    }
-                    if (_dsReturnAfterPlayback) {
-                        _dsReturnAfterPlayback = false;
-                        if (_dsData?.debug_no_save) {
-                            _dsSkipNextInit = true;
-                            showScreen('plugin-the_daily');
-                            if (_dsData.is_complete) {
-                                dsShow('complete');
-                                dsRenderComplete(true);
-                            } else {
-                                dsShow('setlist');
-                                dsRender();
-                            }
-                        } else {
-                            showScreen('plugin-the_daily');
-                        }
-                    }
-                });
-            }
-            dsInit();
+        if (id === 'plugin-the_daily') {
+            console.log('[daily] showing the_daily screen, will init after DOM updates');
+            // Wait longer and keep polling for DOM
+            let attempts = 0;
+            const tryInit = async () => {
+                attempts++;
+                const parent = document.getElementById('plugin-the_daily');
+                let setlist = document.getElementById('ds-setlist');
+                // Try querySelector as fallback
+                if (!setlist) setlist = parent?.querySelector('#ds-setlist');
+                // If HTML missing, fetch and inject it
+                if (parent && !setlist && attempts <= 3) {
+                    try {
+                        console.log('[daily] fetching HTML...');
+                        const resp = await fetch('/api/plugins/the_daily/screen.html');
+                        const html = await resp.text();
+                        console.log('[daily] HTML length:', html.length, 'starts:', html.slice(0,50));
+                        parent.innerHTML = html;
+                        setlist = document.getElementById('ds-setlist');
+                        if (!setlist) setlist = parent.querySelector('#ds-setlist');
+                        console.log('[daily] after inj, setlist:', setlist ? 'yes' : 'no', 'querySelector:', parent?.querySelector('#ds-setlist') ? 'yes' : 'no');
+                        console.log('[daily] parent children:', parent?.children?.length);
+                        console.log('[daily] parent.innerHTML first 200:', parent?.innerHTML?.slice(0,200));
+                    } catch(e) { console.log('[daily] HTML fetch failed:', e); }
+                }
+                console.log('[daily] attempt:', attempts, 'setlist:', setlist ? 'yes' : 'no');
+                if (!_dsInitialized && setlist) {
+                    _dsInitialized = true;
+                    dsInit();
+                } else if (attempts < 20) {
+                    setTimeout(tryInit, 100);
+                }
+            };
+            setTimeout(tryInit, 100);
         }
     };
 })();
 
+// Register event listeners once
+if (typeof window !== 'undefined' && window.slopsmith) {
+    window.slopsmith.on('song:play', (e) => {
+        if (_dsPlayingCfId) {
+            _dsPlayStartTime = Date.now();
+        }
+    });
+    window.slopsmith.on('song:ended', async (e) => {
+        if (_dsPlayingCfId && _dsPlayStartTime > 0) {
+            const durationPlayed = Math.floor((Date.now() - _dsPlayStartTime) / 1000);
+            await dsMarkSong(_dsPlayingCfId, durationPlayed, _dsPlayingNodeId);
+            _dsPlayingCfId = null;
+            _dsPlayingNodeId = null;
+            _dsPlayStartTime = 0;
+        }
+        if (_dsReturnAfterPlayback) {
+            _dsReturnAfterPlayback = false;
+            showScreen('plugin-the_daily');
+        }
+    });
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function dsInit() {
+    console.log('[daily] dsInit starting, debug:', dsIsDebugMap());
     dsShow('loading');
     try {
-        const resp = await fetch(dsApiUrl('/api/plugins/the_daily/today'));
+        const apiUrl = dsApiUrl('/api/plugins/the_daily/today');
+        console.log('[daily] fetching:', apiUrl);
+        const resp = await fetch(apiUrl);
         const text = await resp.text();
+        console.log('[daily] response status:', resp.status, 'length:', text.length);
         _dsData = text ? JSON.parse(text) : null;
         if (!_dsData) {
+            console.log('[daily] empty response');
             dsShowError('Empty response from server.');
             return;
         }
         if (_dsData.error) {
+            console.log('[daily] got error:', _dsData.error);
             if (_dsData.error === 'offline') {
                 dsRenderError('offline');
                 return;
@@ -170,6 +209,7 @@ async function dsInit() {
             dsShowError(_dsData.error);
             return;
         }
+        console.log('[daily] data loaded, date:', _dsData.date, 'modifier:', _dsData.modifier?.id);
         dsRender();
         // Start in Leaderboard view unless today is marked complete on first load
         _dsInCompleteView = !!_dsData?.is_complete;
@@ -227,8 +267,13 @@ function dsRenderError(errorType, minVersion) {
 
 // ── Render setlist view ───────────────────────────────────────────────────────
 function dsRender() {
+    console.log('[daily] dsRender called');
     const d = _dsData;
     const mod = d.modifier;
+    
+    console.log('[daily] setlist view', document.getElementById('ds-setlist'));
+    console.log('[daily] songs container', document.getElementById('ds-songs'));
+    console.log('[daily] map data', !!d.map);
 
     document.getElementById('ds-modifier-icon').textContent = mod.icon;
     document.getElementById('ds-modifier-label').textContent = mod.label;
@@ -271,6 +316,7 @@ function dsRender() {
 function dsRenderDebugToggle(d) {
     const fallback = document.getElementById('ds-fallback-notice');
     if (!fallback || !fallback.parentElement) return;
+    if (!d.debug_no_save) return;
     let btn = document.getElementById('ds-debug-map-toggle');
     if (!btn) {
         btn = document.createElement('button');
@@ -336,21 +382,27 @@ function dsMapView(d) {
         </div>${d.debug_no_save ? '<div class="text-xs text-yellow-400 font-semibold">DEBUG MAP · no DB writes, no completion/streak changes <button onclick="dsDebugMap(false)" class="ml-2 underline">exit</button></div>' : ''}<div id="ds-lane-popularity" class="text-[11px] text-gray-500">Loading lane popularity...</div>
     </div>`;
     const svgEdges = edges.map(e => `<line x1="${pos[e.from].x}" y1="${pos[e.from].y}" x2="${pos[e.to].x}" y2="${pos[e.to].y}" stroke="rgba(148,163,184,.22)" stroke-width="2" />`).join('');
-    const svgNodes = map.nodes.map(n => {
+const svgNodes = map.nodes.map(n => {
         const state = cleared.has(n.id) ? 'cleared' : locked.has(n.id) ? 'locked' : available.has(n.id) ? 'available' : 'future';
         const fill = state === 'cleared' ? '#14532d' : state === 'available' ? '#1d4ed8' : state === 'locked' ? '#111827' : '#1f2937';
         const stroke = state === 'cleared' ? '#22c55e' : state === 'available' ? '#60a5fa' : '#374151';
         const icon = dsNodeIcon(n);
-        const click = (state === 'available' || state === 'cleared' || d.debug_no_save) ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
-        // Act label near the node (if provided)
+        const interactive = state === 'available' || state === 'cleared' || d.debug_no_save;
+        const role = interactive ? 'role="button"' : '';
+        const tab = interactive ? 'tabindex="0"' : '';
+        const type = n.type || n.id;
+        const laneLabel = dsLaneLabel(n.lane) || n.lane || 'standard';
+        const song = songMap[n.cf_id];
+        const songInfo = (interactive && state !== 'future' && song) ? `${esc(song.title)} by ${esc(song.artist)} · ` : '';
+        const aria = interactive ? `aria-label="${songInfo}${type} node · ${laneLabel} lane · ${state}"` : `aria-label="${type} node · ${laneLabel} lane"`;
+        const click = interactive ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
         const actLabel = n.act ? `<text x="${pos[n.id].x}" y="${pos[n.id].y - 28}" text-anchor="middle" class="ds-svg-act" fill="currentColor" font-size="11">${esc(n.act)}</text>` : '';
-        // Lane color cue is handled via CSS classes; color variables applied in CSS
-        return `<g ${click} class="ds-svg-lane-group lane-${n.lane || 'standard'}" data-lane="${n.lane || 'standard'}" data-node-id="${n.id}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
+        return `<g ${role} ${tab} ${aria} ${click} class="ds-svg-lane-group lane-${n.lane || 'standard'}" data-lane="${n.lane || 'standard'}" data-node-id="${n.id}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
             <text x="${pos[n.id].x}" y="${pos[n.id].y + 6}" text-anchor="middle" fill="white" font-size="18">${icon}</text>
             ${actLabel}
-            <text x="${pos[n.id].x}" y="${pos[n.id].y + 42}" text-anchor="middle" fill="#9ca3af" font-size="11">${esc(dsLaneLabel(n.lane) || n.id)}</text></g>`;
+            <text x="${pos[n.id].x}" y="${pos[n.id].y + 42}" text-anchor="middle" fill="#9ca3af" font-size="11">${esc(laneLabel)}</text></g>`;
     }).join('');
-    return `${inventory}<div class="bg-dark-800/60 border border-gray-800 rounded-2xl p-3 overflow-x-auto mb-4"><svg viewBox="0 0 ${w} ${h}" class="w-full min-w-[520px]">${svgEdges}${svgNodes}</svg></div><div id="ds-map-panel" class="space-y-3">${dsMapHint(d)}</div>`;
+    return `${inventory}<div class="bg-dark-800/60 border border-gray-800 rounded-2xl p-3 overflow-x-auto mb-4"><svg viewBox="0 0 ${w} ${h}" class="w-full min-w-[520px]">${svgEdges}${svgNodes}</svg></div><div id="ds-map-panel" class="space-y-3" aria-live="polite">${dsMapHint(d)}</div>`;
 }
 
 function dsMapHint(d) {
@@ -428,7 +480,7 @@ async function dsRescanLibrary() {
 
 function dsSongCard(song, index, blindside) {
     const num = `<span class="text-xs text-gray-600 w-6 text-center flex-shrink-0">${index + 1}</span>`;
-    const title = blindside && !song.done ? '???' : esc(song.title);
+    const title = blindside && !song.done ? '<span aria-label="Title hidden (Blindside modifier)">???</span>' : esc(song.title);
     const artist = esc(song.artist);
     const tuning = song.tuning ? `<span class="text-xs text-gray-600 ml-2">${esc(song.tuning)}</span>` : '';
 
@@ -567,6 +619,10 @@ function dsOpenNode(nodeId) {
         body = dsMapSongOption(node, song, 'Mystery revealed', canPlay);
     } else if (node.type === 'shop') {
         return dsOpenShopNode(nodeId);
+    } else if (node.type === 'rest') {
+        return dsOpenRest(nodeId);
+    } else if (node.type === 'treasure') {
+        return dsOpenTreasure(nodeId);
     } else {
         body = dsMapSongOption(node, songMap[node.cf_id], node.type === 'boss' && !_dsData.boss_revealed ? 'Boss' : 'Song', canPlay);
     }
@@ -575,6 +631,7 @@ function dsOpenNode(nodeId) {
         <div class="space-y-3">${body}</div>
         ${debugControls}
     </div>`;
+    dsAnnounce(`${esc(node.id)} node selected`);
 }
 
 function dsMapSongOption(node, song, label, canPlay) {
@@ -710,6 +767,7 @@ async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
                         dsRefreshTokens(); // Refresh token count after song completion
 
                     if (result.is_complete && _dsConfettiDoneFor !== _dsData.date) {
+                        dsAnnounce('Daily complete! Well done!');
                         setTimeout(() => {
                             dsShow('complete');
                             dsRenderComplete(true);
@@ -1068,8 +1126,24 @@ function dsShow(view) {
 
 function dsShowError(msg) {
     dsShow('setlist');
-    document.getElementById('ds-songs').innerHTML =
-        `<p class="text-red-400 text-sm py-8 text-center">${esc(msg)}</p>`;
+    let songsEl = document.getElementById('ds-songs');
+    // Ensure setlist view is visible before accessing children
+    const setlistView = document.getElementById('ds-setlist');
+    if (setlistView && setlistView.classList.contains('hidden')) {
+        setlistView.classList.remove('hidden');
+    }
+    if (songsEl) {
+        songsEl.innerHTML = `<p class="text-red-400 text-sm py-8 text-center">${esc(msg)}</p>`;
+    } else {
+        // Fallback: create container if missing
+        if (setlistView) {
+            songsEl = document.createElement('div');
+            songsEl.id = 'ds-songs';
+            songsEl.className = 'space-y-3';
+            songsEl.innerHTML = `<p class="text-red-400 text-sm py-8 text-center">${esc(msg)}</p>`;
+            setlistView.appendChild(songsEl);
+        }
+    }
 }
 
 // ── Confetti ──────────────────────────────────────────────────────────────────
@@ -1289,8 +1363,16 @@ function dsGoPrevDay() { dsDatePrev(); }
 // Navigate to next day from Day Complete view
 function dsGoNextDay() { dsDateNext(); }
 
-// Keyboard navigation: Left/Right arrows navigate historical days when in complete view
+// Keyboard navigation: Left/Right arrows navigate historical days when in complete view;
+// Enter/Space activates focused map node
 window.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+        const svg = document.querySelector('[role="button"][tabindex="0"]');
+        if (svg && svg.dataset?.nodeId) {
+            dsOpenNode(svg.dataset.nodeId);
+            e.preventDefault();
+        }
+    }
     if (typeof _dsInCompleteView !== 'undefined' && _dsInCompleteView) {
         if (e.key === 'ArrowLeft') {
             dsDatePrev();
@@ -1474,6 +1556,7 @@ function dsRenderShopItem(item, forNode = false) {
             <div class="flex items-center">
                 ${equipBtn}
                 <button onclick="dsBuyItem('${esc(item.id)}', ${forNode ? `'${esc(_dsCurrentNodeId || '')}'` : 'null'})" ${disabled ? 'disabled' : ''}
+                        aria-label="Buy ${esc(item.name)} for ${cost} tokens"
                         class="px-3 py-1 rounded-xl bg-accent hover:bg-accent-light disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs whitespace-nowrap">
                     ${buttonState}
                 </button>
@@ -1607,6 +1690,121 @@ function dsApplyEquipped(equipped) {
     });
 }
 
+async function dsClearNode(nodeId) {
+    try {
+        await fetch(dsApiUrl(`/api/plugins/the_daily/nodes/${encodeURIComponent(nodeId)}/clear`), {
+            method: 'POST',
+            headers: { 'X-Install-Id': dsInstallId() }
+        });
+        await dsInit();
+    } catch (e) {
+        console.error('Failed to clear node:', e);
+    }
+}
+
+async function dsBankProgress(nodeId) {
+    try {
+        await fetch(dsApiUrl(`/api/plugins/the_daily/rest/${encodeURIComponent(nodeId)}`), {
+            method: 'POST',
+            headers: { 'X-Install-Id': dsInstallId(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'bank' })
+        });
+        await dsClearNode(nodeId);
+    } catch (e) {
+        console.error('Failed to bank progress:', e);
+    }
+}
+
+async function dsOpenRest(nodeId) {
+    const panel = document.getElementById('ds-map-panel');
+    if (!panel) return;
+    try {
+        const r = await fetch(dsApiUrl(`/api/plugins/the_daily/rest/${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } });
+        const song = await r.json();
+        panel.innerHTML = `
+            <div class="bg-dark-700/50 border border-green-700/40 rounded-2xl p-4">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="text-xl">🛌</span>
+                    <span class="text-sm font-semibold text-white">Rest Node</span>
+                </div>
+                <div class="space-y-4">
+                    <div class="bg-dark-800/80 rounded-xl p-3 border border-white/5">
+                        <div class="text-xs text-white/50 mb-1 uppercase tracking-wider font-bold">Liner Notes</div>
+                        <div class="text-sm text-white/90 leading-relaxed">${esc(song.notes || 'No notes available.')}</div>
+                    </div>
+                    <div class="flex flex-col gap-2">
+                        <button onclick="dsBankProgress('${nodeId}')" class="w-full px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-xl font-bold transition shadow-lg shadow-green-900/20">💰 Bank Progress</button>
+                        <button onclick="dsClearNode('${nodeId}')" class="w-full px-4 py-2 bg-dark-600 hover:bg-dark-500 text-white/70 rounded-xl font-semibold transition">🏃 Leave</button>
+                    </div>
+                </div>
+            </div>`;
+    } catch (e) {
+        panel.innerHTML = '<div class="text-sm text-red-400">Failed to load rest node.</div>';
+    }
+}
+
+async function dsChooseTreasure(nodeId, type) {
+    try {
+        await fetch(dsApiUrl(`/api/plugins/the_daily/treasure/${encodeURIComponent(nodeId)}`), {
+            method: 'POST',
+            headers: { 'X-Install-Id': dsInstallId(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ peek_type: type })
+        });
+        await dsOpenTreasure(nodeId); // Refresh to show result
+    } catch (e) {
+        console.error('Failed to choose treasure:', e);
+    }
+}
+
+async function dsOpenTreasure(nodeId) {
+    const panel = document.getElementById('ds-map-panel');
+    if (!panel) return;
+    try {
+        const r = await fetch(dsApiUrl(`/api/plugins/the_daily/treasure/${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } });
+        const data = await r.json();
+        
+        if (data.chosen) {
+            // Already chosen, show result
+            panel.innerHTML = `
+                <div class="bg-dark-700/50 border border-yellow-700/40 rounded-2xl p-4">
+                    <div class="flex items-center gap-2 mb-3">
+                        <span class="text-xl">💎</span>
+                        <span class="text-sm font-semibold text-white">Treasure: ${esc(data.chosen)}</span>
+                    </div>
+                    <div class="bg-dark-800/80 rounded-xl p-3 border border-white/5 mb-4 text-xs text-yellow-200/80 whitespace-pre-wrap">
+                        ${esc(JSON.stringify(data.payload, null, 2))}
+                    </div>
+                    <button onclick="dsClearNode('${nodeId}')" class="w-full px-4 py-2 bg-dark-600 hover:bg-dark-500 text-white/70 rounded-xl font-semibold transition">🏃 Leave</button>
+                </div>`;
+            return;
+        }
+
+        const optionsHtml = data.options.map(opt => `
+            <button onclick="dsChooseTreasure('${nodeId}', '${opt.type}')" 
+                class="w-full px-4 py-3 bg-dark-800/80 hover:bg-dark-700 border border-white/5 hover:border-yellow-700/40 rounded-xl text-left transition group">
+                <div class="text-sm font-bold text-white/90 group-hover:text-yellow-400 transition">${esc(opt.label)}</div>
+                <div class="text-xs text-white/40">Glimpse into the future...</div>
+            </button>
+        `).join('');
+
+        panel.innerHTML = `
+            <div class="bg-dark-700/50 border border-yellow-700/40 rounded-2xl p-4">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="text-xl">💎</span>
+                    <span class="text-sm font-semibold text-white">Choose Treasure</span>
+                </div>
+                <div class="space-y-2 mb-4">
+                    ${optionsHtml}
+                </div>
+                <button onclick="dsClearNode('${nodeId}')" class="w-full px-4 py-2 bg-dark-600 hover:bg-dark-500 text-white/70 rounded-xl font-semibold transition">🏃 Skip & Leave</button>
+            </div>`;
+    } catch (e) {
+        panel.innerHTML = '<div class="text-sm text-red-400">Failed to load treasure.</div>';
+    }
+}
+
 async function dsOpenShopNode(nodeId) {
     const panel = document.getElementById('ds-map-panel');
     if (!panel) return;
@@ -1622,9 +1820,10 @@ async function dsOpenShopNode(nodeId) {
                 <span class="text-xl">🛒</span>
                 <span class="text-sm font-semibold text-white">Shop · 10% off (today)</span>
             </div>
-            <div class="grid grid-cols-1 gap-2">
+            <div class="grid grid-cols-1 gap-2 mb-4">
                 ${offerItems.map(i => dsRenderShopItem({ ...i, _node_id: nodeId }, true)).join('')}
             </div>
+            <button onclick="dsClearNode('${nodeId}')" class="w-full px-4 py-2 bg-dark-600 hover:bg-dark-500 text-white/70 rounded-xl font-semibold transition">🏃 Leave</button>
         </div>`;
     } catch (e) {
         panel.innerHTML = '<div class="text-sm text-red-400">Failed to load shop offer.</div>';
@@ -1689,6 +1888,11 @@ window.dsEquip = dsEquip;
 window.dsEquipToggle = dsEquipToggle;
 window.dsApplyEquipped = dsApplyEquipped;
 window.dsOpenShopNode = dsOpenShopNode;
+window.dsOpenRest = dsOpenRest;
+window.dsOpenTreasure = dsOpenTreasure;
+window.dsClearNode = dsClearNode;
+window.dsBankProgress = dsBankProgress;
+window.dsChooseTreasure = dsChooseTreasure;
 window.dsRenderShopItem = dsRenderShopItem;
 window.dsUseBossReroll = dsUseBossReroll;
 window.dsUseLaneReroll = dsUseLaneReroll;

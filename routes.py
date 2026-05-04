@@ -2693,6 +2693,7 @@ def setup(app, context):
             songs = json.loads(songs_json)
             map_data = json.loads(map_json) if map_json else None
             fallback = bool(fallback_int)
+            mod = next((m for m in active if m["id"] == modifier_id), None)
         else:
             pool = _load_pool(today, plugin_dir)
             if not pool:
@@ -2744,6 +2745,10 @@ def setup(app, context):
 
         day_number = (date.fromisoformat(today) - _EPOCH).days + 1
         has_unavailable = any(not s["has_locally"] for s in enriched)
+        mod_label = mod["label"] if mod else modifier_id
+        mod_desc = mod["description"] if mod and "description" in mod else ""
+        mod_icon = mod.get("icon", "") if mod else ""
+        mod_type = mod["type"] if mod and "type" in mod else "filter"
         payload = {
             "date": today,
             "seed": _date_seed(today),
@@ -2751,10 +2756,10 @@ def setup(app, context):
             "day_number": day_number,
             "modifier": {
                 "id": modifier_id,
-                "label": mod["label"],
-                "description": mod["description"],
-                "icon": mod.get("icon", ""),
-                "is_blindside": mod["type"] == "ui",
+                "label": mod_label,
+                "description": mod_desc,
+                "icon": mod_icon,
+                "is_blindside": mod_type == "ui",
             },
             "fallback": fallback,
             "songs": enriched,
@@ -4236,6 +4241,28 @@ def setup(app, context):
             conn.commit()
 
         return {"ok": True, "banked_tokens": tokens, "inventory": _inventory_payload(conn, install_id)}
+
+    @app.post("/api/plugins/the_daily/nodes/{node_id}/clear")
+    async def post_clear_node(node_id: str, request: Request):
+        install_id = _client_install_id(request=request)
+        if not install_id:
+            return {"error": "install_id required"}, 400
+        today = _get_today().isoformat()
+        conn = _get_conn()
+        
+        # Stable cf_id for non-song nodes to avoid collisions and satisfy NOT NULL
+        import hashlib
+        h = int(hashlib.md5(node_id.encode()).hexdigest(), 16) % 1000000
+        cf_id = -1000000 - h
+
+        with _lock:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_completions (date, cf_id, node_id, install_id) VALUES (?, ?, ?, ?)",
+                (today, cf_id, node_id, install_id),
+            )
+            conn.commit()
+        
+        return {"ok": True, "cleared": True}
 
     @app.get("/api/plugins/the_daily/mystery/{node_id}")
     def get_mystery_event(node_id: str, request: Request):
