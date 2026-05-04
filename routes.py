@@ -676,7 +676,8 @@ def _load_pool(date_str, plugin_dir):
                 pool = [s for s in pool
                         if len((s.get("artist") or "").strip()) >= 2
                         and len((s.get("title") or "").strip()) >= 2
-                        and "full album" not in (s.get("title") or "").lower()]
+                        and "full album" not in (s.get("title") or "").lower()
+                        and (s.get("has_lead", True) or s.get("has_rhythm", True))]
                 with _lock:
                     conn.execute(
                         "INSERT OR REPLACE INTO pool_cache (pool_stamp, pool, fetched_at) VALUES (?, ?, ?)",

@@ -44,7 +44,8 @@ def _filter_pool(raw):
     return [s for s in raw
             if len((s.get("artist") or "").strip()) >= 2
             and len((s.get("title") or "").strip()) >= 2
-            and "full album" not in (s.get("title") or "").lower()]
+            and "full album" not in (s.get("title") or "").lower()
+            and (s.get("has_lead", True) or s.get("has_rhythm", True))]
 
 
 def _fetch_manifest():
