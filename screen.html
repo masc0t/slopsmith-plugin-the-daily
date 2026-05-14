@@ -2,23 +2,7 @@
 <div class="max-w-2xl mx-auto px-6 pt-24 pb-16 daily-root">
 
 <style>
-  :root {
-    --lane-standard: #1d4ed8;
-    --lane-drop: #a78bfa;
-    --lane-flat: #14b8a6;
-    --lane-sprint: #10b981;
-    --lane-marathon: #f59e0b;
-  }
-  /* Optional helper to make act labels inherit lane color via currentColor */
-  .ds-svg-lane-group { color: var(--lane-standard); }
-  .ds-svg-act { fill: currentColor; font-family: system-ui, -apple-system, sans-serif; }
-  /* Lane colors mapped to classes for CSS-driven styling */
-  .ds-svg-lane-group.lane-standard { color: var(--lane-standard); }
-  .ds-svg-lane-group.lane-drop { color: var(--lane-drop); }
-  .ds-svg-lane-group.lane-flat { color: var(--lane-flat); }
-  .ds-svg-lane-group.lane-sprint { color: var(--lane-sprint); }
-  .ds-svg-lane-group.lane-marathon { color: var(--lane-marathon); }
-  .ds-svg-lane-group:focus { outline: 2px solid #60a5fa; outline-offset: 2px; outline-radius: 50%; }
+  .ds-svg-node-group:focus { outline: 2px solid #60a5fa; outline-offset: 2px; outline-radius: 50%; }
 </style>
 
     <!-- Loading -->
@@ -50,41 +34,23 @@
             <h2 id="ds-day-name" class="text-4xl font-bold text-white mt-2"></h2>
             <p id="ds-date" class="text-sm text-gray-500 mt-1"></p>
             <p id="ds-modifier-desc" class="text-sm text-gray-400 mt-1 italic"></p>
-            <p id="ds-fallback-notice" class="hidden text-xs text-yellow-500 mt-2">
-                Not enough matching songs in the pool — using full library today.
-            </p>
         </div>
-
-        <!-- Rescan prompt (shown when songs are missing locally) -->
-        <div id="ds-rescan-bar" class="hidden mb-4 flex items-center gap-3 bg-dark-700/40 border border-yellow-700/30 rounded-xl px-4 py-3">
-            <div class="flex-1 min-w-0">
-                <p class="text-sm text-gray-300">Some songs aren't in your library yet.</p>
-                <p id="ds-rescan-status" class="text-xs text-gray-500 mt-0.5">Download the missing CDLC, then rescan to play.</p>
-            </div>
             <button id="ds-btn-rescan" onclick="dsRescanLibrary()" class="bg-dark-600 hover:bg-dark-500 px-4 py-2 rounded-xl text-xs text-gray-300 transition flex-shrink-0">Rescan Library</button>
         </div>
 
         <!-- Song list -->
         <div id="ds-songs" class="space-y-3"></div>
 
-        <!-- Map Legend & Popularity -->
+        <!-- Node type legend -->
         <div id="ds-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
-            <div id="ds-lane-legend" class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
-                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
-                </div>
-                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
-                </div>
-                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
-                </div>
-                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
-                </div>
-                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                    <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
-                </div>
+            <div class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Node type legend">
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>🎸</span> Song</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>⚔️</span> Elite</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>💎</span> Treasure</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>🛌</span> Rest</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>🏪</span> Shop</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>?</span> Mystery</div>
+                <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider"><span>👑</span> Boss</div>
             </div>
             <div id="ds-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
         </div>
@@ -100,9 +66,8 @@
         <p id="ds-complete-name" class="text-xl text-accent-light mb-1"></p>
         <p id="ds-complete-mod" class="text-sm text-gray-400 mb-1"></p>
         <p id="ds-complete-seed" class="text-xs text-gray-600 mb-2"></p>
-        <p id="ds-complete-fallback" class="text-xs text-yellow-500 mb-2 hidden"></p>
         <p id="ds-complete-streak" class="text-sm text-gray-400 mb-6"></p>
-
+        
         <!-- Tab bar -->
         <div class="flex justify-center gap-1 mb-4" role="tablist">
             <button id="ds-tab-today" onclick="dsSwitchTab('today')" role="tab" aria-selected="true" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-accent/20 text-accent border border-accent/50">Setlist</button>
@@ -124,23 +89,6 @@
         <div id="ds-today-content">
             <div id="ds-complete-setlist" class="space-y-3"></div>
             <div id="ds-complete-lane-extras" class="hidden mt-6 pt-6 border-t border-dark-700">
-                <div class="flex flex-wrap justify-center gap-x-4 gap-y-2 mb-3" role="region" aria-label="Lane color legend">
-                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-standard)]"></span> Standard
-                    </div>
-                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-drop)]"></span> Drop
-                    </div>
-                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-flat)]"></span> Flat
-                    </div>
-                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-sprint)]"></span> Sprint
-                    </div>
-                    <div class="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wider">
-                        <span class="w-2.5 h-2.5 rounded-full bg-[var(--lane-marathon)]"></span> Marathon
-                    </div>
-                </div>
                 <div id="ds-complete-lane-popularity" class="text-center text-[10px] text-gray-500 font-mono uppercase tracking-widest"></div>
             </div>
         </div>

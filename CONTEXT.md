@@ -6,10 +6,10 @@ A Slopsmith plugin that delivers a globally-shared daily setlist of CDLC songs. 
 
 ### Setlist
 
-**Daily Setlist**: The five songs served for a given UTC date, plus the modifier that shaped their selection. Persisted in `daily_setlists` table once generated; served from cache on subsequent requests for the same date.
+**Daily Setlist**: The songs served for a given UTC date, plus the modifier that shaped their selection. Persisted in `daily_setlists` table once generated; served from cache on subsequent requests for the same date.
 _Avoid_: daily, today's set, the set
 
-**Modifier**: A named rule that governs how the five songs are selected from the pool. One modifier is active per day, picked deterministically from the Active Modifier Set via date-seeded RNG. A modifier has a `type` (filter, identity, composite, sequence, structural, ordering, ui, meta) that drives the selection algorithm.
+**Modifier**: A named rule that governs how songs are selected from the pool. One modifier is active per day, picked deterministically from the Active Modifier Set via date-seeded RNG. A modifier has a `type` (filter, identity, composite, sequence, structural, ordering, ui, meta) that drives the selection algorithm. Modifiers may return fewer than 5 songs if the pool cannot satisfy the constraint.
 _Avoid_: rule, mode, theme, challenge
 
 **Modifier Type**: The dispatch key that determines which selection algorithm runs for a modifier. Types: `filter` (per-song predicate), `identity` (group by field, pick one group), `composite` (chains multiple rules), `sequence` (adjacent-pair constraint), `structural` (positional constraint), `ordering` (sort after random pick), `ui` (selection unchanged, frontend-only effect), `meta` (wraps or delegates to other modifiers).
@@ -57,6 +57,35 @@ _Avoid_: filter spec, modifier definition language, JSON filter
 **min_plugin_version**: An optional field in a Modifier Stamp specifying the minimum plugin version required to serve that stamp's Active Modifier Set. If the installed plugin is older, the daily is gated: user sees an update prompt, no setlist is served.
 _Avoid_: required version, minimum version, version constraint
 
+### Dungeon
+
+**Dungeon**: The full-screen first-person 3D map view that is the primary interface for The Daily. Replaces the SVG map. Built with ThreeJS in a Doom-era 90s aesthetic (low-res pixelated render target, procedurally generated wall textures). The Dungeon is the Daily Setlist expressed as a game — navigating it is how a player progresses through their nodes for the day.
+_Avoid_: map view, map panel, 3D map
+
+**Room**: The 3D representation of a map node inside the Dungeon. Each Room has a type (forced, elite, mystery, boss, choice, rest, treasure, shop) conveyed by a glowing icon on the door. The player moves from Room to Room by advancing through corridors. The terms "node" (backend/data) and "Room" (frontend/presentation) refer to the same entity at different layers.
+_Avoid_: node (in frontend/UI contexts), tile, cell
+
+**Corridor**: The tunnel between two connected Rooms. Always rendered as a straight passage regardless of the actual DAG topology — the 3D layout is a cosmetic projection of the graph, not a spatially accurate map.
+_Avoid_: edge, path, hallway
+
+**Encounter**: The full-screen overlay that opens when the player arrives at a Room. Surfaces song/node info and available actions (play, download, bank, shop). The Dungeon pauses behind it. Dismissing the Encounter resumes navigation.
+_Avoid_: node panel, song panel, interaction panel
+
+**Wall of Fame Room**: A special Room that appears at the boss exit after the player completes the daily. Renders the Wall of Fame leaderboard inside the Dungeon aesthetic. Accessible only after boss clear.
+_Avoid_: leaderboard screen, leaderboard view
+
+**Diegetic Surface**: A 3D object inside the Dungeon that displays 2D content (leaderboard entries, Passport stamps, error messages) on its visible face. The content is flat and readable — generated as a canvas texture or embedded HTML — but the object is part of the world geometry: the player walks up to it, raycaster detects proximity, interactions happen via clicks on the surface itself rather than a fullscreen overlay. The canonical answer to "is this screen in the game?" — the screen *is* an object you can walk up to. Examples: stone tablet for the Wall of Fame, pedestal guestbook for signing, hall-of-records display cases for Passport.
+_Avoid_: HUD element (HUDs are screen-locked), overlay, panel
+
+**Hub**: The Quake-1-inspired starting chamber that the player loads into when they enter The Daily. Contains diegetic Passages to each top-level area (Today, Archive, Passport, Shop, Wall of Fame). The Wall of Fame Passage is sealed until the player completes today's daily. The Hub also contains the diegetic exit (a labeled door / staircase) that returns the player to the Slopsmith host UI. Replaces the legacy 2D title menu.
+_Avoid_: title menu, lobby, main menu
+
+**Passage**: A diegetic doorway / corridor / slope in the Hub leading into an area. Visual state reflects availability — a sealed Passage (e.g. dark archway, locked gate) becomes unsealed (open, glowing in lane color) when its area becomes accessible. The Wall of Fame Passage is the canonical example: sealed before boss-clear, unsealed after.
+_Avoid_: portal, exit, link
+
+**Archive**: The antechamber reached through the Hub's History Passage. Contains a single diegetic calendar device (e.g. a pedestal-mounted dial) for picking a past UTC date. Selecting a date loads that day's Daily Setlist as a fully-cleared dungeon — same dungeon code path as the present day, with the Wall of Fame Passage already unsealed. The Archive is the input device; the loaded dungeon is the viewer.
+_Avoid_: history view, calendar screen, past dailies page
+
 ### Leaderboard
 
 **Wall of Fame**: The global leaderboard stored in Supabase. Players may sign their name after completing a full daily setlist. Entries include `display_name`, `date`, `streak`, and `day_name`. No per-user identity — anyone can submit any name.
@@ -70,6 +99,10 @@ _Avoid_: mark, play, finish
 
 ## Relationships
 
+- The **Hub** is the player's entry point into The Daily; it contains a **Passage** to each top-level area (today's **Dungeon**, the **Archive**, Passport, Shop, **Wall of Fame Room**)
+- The **Dungeon** is the primary interface for a **Daily Setlist** — each map node becomes a **Room**, each edge becomes a **Corridor**, and interacting with a Room opens an **Encounter**
+- The **Wall of Fame Room** is reached via the Hub's Wall of Fame **Passage**, which is sealed until the boss **Room** in today's Dungeon is cleared; the room renders the **Wall of Fame** leaderboard on **Diegetic Surfaces**
+- The **Archive** is reached via the Hub's History Passage; selecting a date there loads that day's Dungeon as a fully-cleared replay
 - A **Daily Setlist** is produced by applying one **Modifier** to the **Song Pool** active for that UTC date
 - A **Modifier** belongs to the **Active Modifier Set** resolved from the **Modifier Manifest** for a given date
 - A **Data-driven Modifier** is fully specified in a **Modifier Stamp** via the **Predicate DSL**

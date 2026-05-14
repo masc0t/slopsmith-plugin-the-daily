@@ -112,8 +112,10 @@ python preview.py --snapshot snapshots/after-change.json --days 90
 python preview.py --map --days 30
 
 # Force-regenerate today's setlist (e.g. after editing MODIFIERS)
-python reset_today.py            # just the setlist row
-python reset_today.py --pool     # also clear today's pool_cache row
+# IMPORTANT: always restart the container FIRST, then reset. If you reset before
+# restarting, the old code regenerates and saves the row before new code loads.
+docker restart slopsmith-web-1 && sleep 3 && docker exec slopsmith-web-1 python plugins/the_daily/reset_today.py
+docker restart slopsmith-web-1 && sleep 3 && docker exec slopsmith-web-1 python plugins/the_daily/reset_today.py --pool
 
 # Rebuild songs_pool.json (requires DISCORD_USER_TOKEN in repo-root .env)
 python build_pool.py             # incremental — uses checkpoint.json

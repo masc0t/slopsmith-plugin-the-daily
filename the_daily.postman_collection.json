@@ -1,0 +1,1044 @@
+{
+  "info": {
+    "name": "The Daily Plugin",
+    "description": "Postman collection for Slopsmith 'The Daily' plugin API. Contains all endpoints for daily setlists, gameplay, leaderboards, shop, inventory, and system checks.\n\n## Setup\n1. Import this collection into Postman\n2. Create/select an environment with variables:\n   - `baseUrl` - Plugin base URL (e.g., http://localhost:8080)\n   - `installId` - Your install ID (can be any unique string)\n   - `displayName` - Your leaderboard display name\n\n## Quick Start\n- Start with **GET /today** to fetch today's setlist\n- Use **POST /mark** to mark songs/nodes complete\n- Check **GET /leaderboard** for rankings",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "installId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "displayName",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Daily Setlist",
+      "item": [
+        {
+          "name": "GET Today",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/today",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "today"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Daily-Install-Id",
+                "value": "{{installId}}"
+              }
+            ],
+            "description": "Fetch today's daily setlist. Returns the day's songs, modifier info, map (if in Map Mode), progress state, and inventory.\n\n**Response includes:**\n- `date`, `day_name`, `day_number`\n- `modifier` (id, label, description, icon)\n- `songs[]` with cf_id, artist, title, has_locally, done\n- `map` object (nodes, edges, boss, lanes) if Map Mode active\n- `progress` (done/total)\n- `is_complete` boolean\n- `inventory` with items and tokens"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Setlist by Date",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/setlist/{{date}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "setlist", "{{date}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Fetch a historical setlist by date.\n\n**Path Parameters:**\n- `date` - ISO date string (e.g., 2026-04-22)\n\n**Constraints:**\n- Cannot request future dates\n- Returns 400 for invalid date format",
+            "variable": [
+              {
+                "key": "date",
+                "value": "2026-04-22",
+                "type": "string"
+              }
+            ]
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Gameplay",
+      "item": [
+        {
+          "name": "POST Mark Song/Node Complete",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/mark",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "mark"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cf_id\": 12345,\n  \"node_id\": \"boss\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Mark a song or node as played/completed.\n\n**Request Body:**\n- `cf_id` (required) - CustomsForge song ID\n- `node_id` (optional) - Node ID for map mode\n- `action` (optional) - \"commit\" to commit to a node path\n- `install_id` - Your install ID\n- `duration_played` (optional) - Seconds played (min 30 to count)\n\n**Actions:**\n- Omit `action` for standard play tracking\n- Use `\"action\": \"commit\"` to lock in a path choice at a choice node"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Use Item",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/use-item",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "use-item"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"boss_reroll\",\n  \"node_id\": \"boss\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Use a consumable item (boss re-roll, lane re-roll).\n\n**Request Body:**\n- `item_id` (required) - \"boss_reroll\" or \"lane_reroll\"\n- `node_id` (required for lane_reroll) - Node to re-roll\n- `install_id` - Your install ID\n\n**Item Effects:**\n- `boss_reroll` - Replaces the boss song with a new one from the modifier pool\n- `lane_reroll` - Re-rolls non-boss songs on a single lane"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Clear Node",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/nodes/{{nodeId}}/clear",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "nodes", "{{nodeId}}", "clear"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"install_id\": \"{{installId}}\",\n  \"cf_id\": 12345\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Clear a specific node in Map Mode.\n\n**Path Parameters:**\n- `nodeId` - The node ID to clear\n\n**Request Body:**\n- `install_id` - Your install ID\n- `cf_id` - Song ID to mark complete at this node"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Node Interactions",
+      "item": [
+        {
+          "name": "GET Treasure",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/treasure/{{nodeId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "treasure", "{{nodeId}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get treasure node contents (cosmetic/item reveal).\n\n**Path Parameters:**\n- `nodeId` - Treasure node ID",
+            "variable": [
+              {
+                "key": "nodeId",
+                "value": "treasure_1",
+                "type": "string"
+              }
+            ]
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Treasure",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/treasure/{{nodeId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "treasure", "{{nodeId}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"install_id\": \"{{installId}}\",\n  \"choice\": 0\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Claim treasure from a treasure node.\n\n**Path Parameters:**\n- `nodeId` - Treasure node ID\n\n**Request Body:**\n- `install_id` - Your install ID\n- `choice` - Index of item to pick (0, 1, or 2)"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Rest Site",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/rest/{{nodeId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "rest", "{{nodeId}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get rest site options (heal, upgrade, skip).\n\n**Path Parameters:**\n- `nodeId` - Rest node ID",
+            "variable": [
+              {
+                "key": "nodeId",
+                "value": "rest_1",
+                "type": "string"
+              }
+            ]
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Rest Site",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/rest/{{nodeId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "rest", "{{nodeId}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"install_id\": \"{{installId}}\",\n  \"choice\": \"heal\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Select a rest site action.\n\n**Path Parameters:**\n- `nodeId` - Rest node ID\n\n**Request Body:**\n- `install_id` - Your install ID\n- `choice` - Action: \"heal\", \"upgrade\", or \"skip\""
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Mystery Node",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/mystery/{{nodeId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "mystery", "{{nodeId}}"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get mystery node event details.\n\n**Path Parameters:**\n- `nodeId` - Mystery node ID\n\n**Event Types:**\n- `guess_year` - Guess the release year of a song\n- `blind_pick` - Pick a song from hidden options\n- `replay` - Replay a song from past dailies",
+            "variable": [
+              {
+                "key": "nodeId",
+                "value": "mystery_1",
+                "type": "string"
+              }
+            ]
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Mystery Submit",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/mystery/{{nodeId}}/submit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "mystery", "{{nodeId}}", "submit"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"install_id\": \"{{installId}}\",\n  \"answer\": \"1985\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Submit answer for a mystery node event.\n\n**Path Parameters:**\n- `nodeId` - Mystery node ID\n\n**Request Body:**\n- `install_id` - Your install ID\n- `answer` - The answer (year string for guess_year, cf_id for blind_pick)"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Progress",
+      "item": [
+        {
+          "name": "GET Streak",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/streak",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "streak"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get the current streak (consecutive days completed).\n\n**Response:**\n```json\n{\n  \"streak\": 7,\n  \"last_completed\": \"2026-05-01\"\n}\n```"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "stats"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get player statistics including:\n- Total completions\n- Unique modifiers seen\n- Songs played\n- Tokens earned/spent\n- Lane clear counts\n- Decades explored"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Passport",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/passport",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "passport"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get earned stamps/badges (passport).\n\n**Stamp Types:**\n- `lane_{lane}_{count}` - Lane mastery (10, 25, 50 clears)\n- `modifier_{id}` - Seen a specific modifier\n- `decade_{year}s` - Played songs from a decade\n- `streak_{n}` - Streak milestones (every 7 days)\n- `completions_{n}` - Total completion milestones (50, 100, 200, 500)"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Leaderboard",
+      "item": [
+        {
+          "name": "GET Leaderboard",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/leaderboard?date={{leaderboardDate}}&lane={{lane}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "leaderboard"],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "{{leaderboardDate}}"
+                },
+                {
+                  "key": "lane",
+                  "value": "{{lane}}"
+                }
+              ]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Fetch leaderboard entries for a specific date/lane.\n\n**Query Parameters:**\n- `date` (optional) - ISO date. Defaults to today.\n- `lane` (optional) - Filter by lane (standard, sprint, marathon, drop, flat, daily)\n\n**Response:**\n```json\n{\n  \"date\": \"2026-05-05\",\n  \"entries\": [\n    {\"display_name\": \"Player1\", \"streak\": 5, \"completed_at\": \"...\"}\n  ],\n  \"total_entries\": 100\n}\n```",
+            "variable": [
+              {
+                "key": "leaderboardDate",
+                "value": "",
+                "type": "string"
+              },
+              {
+                "key": "lane",
+                "value": "",
+                "type": "string"
+              }
+            ]
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Sign (Submit Score)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/sign",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "sign"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_name\": \"{{displayName}}\",\n  \"rating\": 1,\n  \"message\": \"Great setlist!\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Sign today's leaderboard (submit completion).\n\n**Requirements:**\n- Today's setlist must be fully completed\n- Cannot sign historical days\n\n**Request Body:**\n- `display_name` (required) - 2-20 chars, alphanumeric + spaces\n- `rating` (optional) - 1 (thumbs up), -1 (thumbs down), or 2 (fire)\n- `message` (optional) - Up to 60 chars\n- `install_id` - Your install ID\n\n**Rate Limit:** 5 submissions per IP per day"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Shop",
+      "item": [
+        {
+          "name": "GET Shop",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/shop",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "shop"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get today's shop offerings.\n\n**Returns:**\n- 3 random items from cosmetics + consumables\n- Item details: id, name, cost, description, type\n- Your current token balance"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Shop Buy",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/shop/buy",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "shop", "buy"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"boss_reroll\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Purchase an item from the shop.\n\n**Request Body:**\n- `item_id` - ID of item to buy\n- `install_id` - Your install ID\n\n**Items Available:**\n- Consumables: `boss_reroll` (8 tokens), `lane_reroll` (12 tokens)\n- Cosmetics: `flair_glow`, `theme_papercraft`, `skin_neonsprint`, `calendar_pastel`"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Shop Refund",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/shop/refund",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "shop", "refund"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"boss_reroll\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Refund a purchased item (50% token value).\n\n**Request Body:**\n- `item_id` - Item to refund\n- `install_id` - Your install ID\n\n**Note:** Can only refund items that haven't been used."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Inventory",
+      "item": [
+        {
+          "name": "GET Inventory",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/inventory",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "inventory"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get current inventory including:\n- Consumable items and counts\n- Token balance\n- Owned cosmetics\n- Equipped cosmetics\n- Starter pack status"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Equip",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/equip",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "equip"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_id\": \"flair_glow\",\n  \"equip\": true,\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Equip or unequip a cosmetic item.\n\n**Request Body:**\n- `item_id` - Cosmetic ID to equip/unequip\n- `equip` - true to equip, false to unequip\n- `install_id` - Your install ID"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Recovery Code",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/recovery-code",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "recovery-code"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Get your recovery code (4-word BIP39-style).\n\n**Purpose:** Backup code to restore inventory on new install.\n\n**Format:** `word-word-word-word` (e.g., \"forest-anchor-rapid-mint\")"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST Adopt Recovery Code",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/recovery-code/adopt",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "recovery-code", "adopt"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recovery_code\": \"forest-anchor-rapid-mint\",\n  \"install_id\": \"{{installId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Adopt (restore) inventory from a recovery code.\n\n**Request Body:**\n- `recovery_code` - 4-word code to restore\n- `install_id` - Your new install ID\n\n**Warning:** Will overwrite any existing inventory for this install ID."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "System",
+      "item": [
+        {
+          "name": "POST Sync Now",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/sync-now",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "sync-now"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Manually trigger a sync to Supabase (push local stamps/inventory)."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "if (!pm.environment.get('installId')) {",
+                  "    pm.environment.set('installId', 'test-' + Date.now());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Health",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "health"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Basic health check endpoint.\n\n**Returns:**\n```json\n{\"status\": \"ok\"}\n```"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Health Diag",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/health_diag",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "health_diag"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Diagnostic health check with detailed status.\n\n**Returns:** DB status, pool cache info, modifier manifest status, Supabase connectivity."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET Test",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/plugins/the_daily/test",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "plugins", "the_daily", "test"]
+            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Test endpoint that returns plugin version and configuration.\n\n**Returns:**\n```json\n{\n  \"version\": \"1.0.0\",\n  \"debug\": false,\n  \"today\": \"2026-05-05\"\n}\n```"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

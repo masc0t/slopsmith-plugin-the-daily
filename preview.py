@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -32,7 +33,7 @@ import sqlite3
 from plugins.the_daily import routes
 _temp_db = sqlite3.connect(":memory:")
 _temp_db.execute("CREATE TABLE IF NOT EXISTS daily_completions (date TEXT, cf_id INTEGER, completed_at TEXT)")
-_temp_db.execute("CREATE TABLE IF NOT EXISTS daily_setlists (date TEXT PRIMARY KEY, day_name TEXT, modifier TEXT, songs TEXT, song_count INTEGER, map TEXT, fallback INTEGER, lane_paths TEXT, pool_stamp TEXT)")
+_temp_db.execute("CREATE TABLE IF NOT EXISTS daily_setlists (date TEXT PRIMARY KEY, day_name TEXT, modifier TEXT, songs TEXT, song_count INTEGER, map TEXT, lane_paths TEXT, pool_stamp TEXT)")
 _temp_db.execute("CREATE TABLE IF NOT EXISTS pool_cache (pool_stamp TEXT PRIMARY KEY, pool TEXT, fetched_at TEXT)")
 routes._conn = _temp_db
 routes._db_path = ":memory:"
@@ -107,39 +108,16 @@ def _mod_by_id(active: list, modifier_id: str) -> dict:
     return next((m for m in active if m["id"] == modifier_id), {})
 
 
-def _simulate_day(d: date, pool: list, pool_stamp: str, history: dict, active: list, map_mode: bool = False) -> tuple:
+def _simulate_day(d: date, pool: list, pool_stamp: str, history: dict, active: list) -> tuple:
     date_str = d.isoformat()
-
-    used_cf_ids = set()
-    for j in range(1, 15):
-        for s in history.get((d - timedelta(days=j)).isoformat(), []):
-            used_cf_ids.add(s["cf_id"])
-    active_pool = (
-        [s for s in pool if s["cf_id"] not in used_cf_ids]
-        or pool
-    )
-    if len(active_pool) < DEFAULT_SONG_COUNT:
-        active_pool = pool
 
     modifier_id = _pick_modifier(date_str, active)
 
-    exclude = None
-    if modifier_id == "artist_takeover":
-        exclude = set()
-        for j in range(1, 15):
-            past_songs = history.get((d - timedelta(days=j)).isoformat(), [])
-            if past_songs:
-                exclude.add((past_songs[0].get("artist") or "").lower())
-
-    map_data = None
-    if map_mode:
-        map_data, songs, fallback = _build_map(date_str, modifier_id, active_pool, active, exclude=exclude)
-        song_count = 1
-    else:
-        songs, song_count, fallback = _select_songs(date_str, modifier_id, active_pool, active, exclude=exclude)
+    map_data, songs = _build_map(date_str, modifier_id, pool, active)
+    song_count = sum(1 for s in songs if s.get("cf_id"))
     mod = _mod_by_id(active, modifier_id)
     day_name = _day_name(date_str, mod, songs)
-    return modifier_id, songs, song_count, fallback, day_name, map_data, pool_stamp
+    return modifier_id, songs, song_count, day_name, map_data, pool_stamp
 
 
 def _song_lookup(songs: list) -> dict:
@@ -158,7 +136,7 @@ def _song_label(song: dict) -> str:
 
 
 def _node_label(node: dict, lanes: dict) -> str:
-    type_icons = {"forced": "●", "choice": "◇", "mystery": "?", "boss": "♛"}
+    type_icons = {"forced": "●", "choice": "◇", "mystery": "?", "boss": "♛", "rest": "☕", "shop": "🏪"}
     lane = node.get("lane")
     lane_icon = lanes.get(lane, "") if lane else ""
     return f"{node['id']}:{type_icons.get(node.get('type'), '●')}{lane_icon}"
@@ -245,7 +223,7 @@ def _build_snapshot(days: int, start: date, map_mode: bool = False) -> dict:
         d = today + timedelta(days=i)
         date_str = d.isoformat()
 
-        modifier_id, songs, song_count, fallback, day_name, map_data, day_stamp = _simulate_day(d, pool, pool_stamp, history, active, map_mode=map_mode)
+        modifier_id, songs, song_count, day_name, map_data, day_stamp = _simulate_day(d, pool, pool_stamp, history, active)
         history[date_str] = songs
 
         day_entry = {
@@ -256,9 +234,8 @@ def _build_snapshot(days: int, start: date, map_mode: bool = False) -> dict:
             "modifier_label": _mod_by_id(active, modifier_id).get("label", modifier_id),
             "day_name": day_name,
             "song_count": song_count,
-            "fallback": fallback,
             "song_ids": [s["cf_id"] for s in songs[:song_count]],
-            "pool_stamp": day_stamp,
+            "pool_stamp": pool_stamp,
         }
 
         if map_mode and map_data:
@@ -274,24 +251,23 @@ def _build_snapshot(days: int, start: date, map_mode: bool = False) -> dict:
     return snapshot
 
 
-def run(days: int = 90, compact: bool = False, start: date = None, map_mode: bool = False, snapshot_path: str = None):
+def run(days: int = 90, compact: bool = False, start: date = None, map_mode: bool = False, snapshot_path: str = None, init_history: dict = None):
     today = start or datetime.utcnow().date()
     pool, pool_stamp = _load_pool(today)
     active = _load_active_modifier_set(today)
     print(f"Pool: {len(pool):,} songs (stamp: {pool_stamp})\n")
 
-    history: dict[str, list] = {}
+    history: dict[str, list] = dict(init_history) if init_history else {}
 
     modifier_counts: dict[str, int] = {}
     shape_counts: dict[str, int] = {}
     lane_counts: dict[str, int] = {}
-    fallback_days: list[str] = []
 
     for i in range(days):
         d = today + timedelta(days=i)
         date_str = d.isoformat()
 
-        modifier_id, songs, song_count, fallback, day_name, map_data, _ = _simulate_day(d, pool, pool_stamp, history, active, map_mode=map_mode)
+        modifier_id, songs, song_count, day_name, map_data, _ = _simulate_day(d, pool, pool_stamp, history, active)
         history[date_str] = songs
         modifier_counts[modifier_id] = modifier_counts.get(modifier_id, 0) + 1
         if map_mode and map_data:
@@ -301,28 +277,24 @@ def run(days: int = 90, compact: bool = False, start: date = None, map_mode: boo
 
         mod = _mod_by_id(active, modifier_id)
         day_number = (d - _EPOCH).days + 1
-        warn = "  ⚠ FALLBACK" if fallback else ""
         seed = _date_seed(date_str)
 
         if compact:
             map_bits = f"  {map_data['shape']:<10} {len(map_data['nodes']):>2} nodes" if map_mode and map_data else ""
-            print(f"#{day_number:>4}  {date_str}  {seed}  {mod['icon']} {mod['label']:<24}  {day_name}{map_bits}{warn}")
+            print(f"#{day_number:>4}  {date_str}  {seed}  {mod['icon']} {mod['label']:<24}  {day_name}{map_bits}")
         else:
             print(f"{'─' * 72}")
-            print(f"Day #{day_number}  {date_str}  {seed}  {mod['icon']} {mod['label']}  —  {day_name}{warn}")
+            print(f"Day #{day_number}  {date_str}  {seed}  {mod['icon']} {mod['label']}  —  {day_name}")
             if map_mode:
                 _print_map_ascii(map_data, songs, active)
             else:
-                for s in songs:
+                for s in songs[:DEFAULT_SONG_COUNT]:
                     year = s.get("year") or "????"
                     tuning = s.get("tuning") or "—"
                     album = s.get("album") or ""
                     print(f"  • {s['artist']:<32}  {s['title']:<36}  {year}  {tuning}")
                     if album:
                         print(f"    {'':32}  {album}")
-
-        if fallback:
-            fallback_days.append(f"#{day_number} {date_str} ({mod['label']})")
 
     print(f"\n{'═' * 72}")
     print(f"Summary — {days} days from {today}")
@@ -348,13 +320,6 @@ def run(days: int = 90, compact: bool = False, start: date = None, map_mode: boo
         print(f"\nSnapshot written to {snapshot_path}")
         return
 
-    if fallback_days:
-        print(f"\n  Fallback days ({len(fallback_days)}):")
-        for fd in fallback_days:
-            print(f"    {fd}")
-    else:
-        print("\n  No fallback days.")
-
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Preview upcoming Daily setlists")
@@ -371,4 +336,5 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     start = date.fromisoformat(args.start) if args.start else None
+
     run(days=args.days, compact=args.compact, start=start, map_mode=args.map, snapshot_path=args.snapshot)

@@ -128,9 +128,8 @@ class TestModifierFunctionality(unittest.TestCase):
             from plugins.the_daily.routes import _ALGORITHM_REGISTRY
             if key in _ALGORITHM_REGISTRY:
                 key = _ALGORITHM_REGISTRY[key]
-            candidates, fallback = _identity_candidates("2026-04-22", self.pool, key, 5, mod.get("min_pool"))
-            if not fallback:
-                self.assertGreaterEqual(len(candidates), 5)
+            candidates = _identity_candidates("2026-04-22", self.pool, key, 5, mod.get("min_pool"))
+            self.assertGreater(len(candidates), 0, f"Expected at least one candidate for {mod['id']}")
 
 
 class TestSelectSongs(unittest.TestCase):
@@ -143,17 +142,32 @@ class TestSelectSongs(unittest.TestCase):
         d = "2026-04-22"
         for _ in range(10):
             mod_id = _pick_modifier(d, TEST_ACTIVE)
-            songs, count, fallback = _select_songs(d, mod_id, self.pool, TEST_ACTIVE)
-            self.assertEqual(count, DEFAULT_SONG_COUNT)
-            self.assertEqual(len(songs), DEFAULT_SONG_COUNT)
-            self.assertEqual(len({s["cf_id"] for s in songs}), DEFAULT_SONG_COUNT)
+            songs, count = _select_songs(d, mod_id, self.pool, TEST_ACTIVE)
+            self.assertLessEqual(count, DEFAULT_SONG_COUNT)
+            self.assertGreater(count, 0)
+            self.assertEqual(len(songs), count)
+            self.assertLessEqual(len({s["cf_id"] for s in songs}), DEFAULT_SONG_COUNT)
 
     def test_no_duplicate_cf_ids(self):
         d = "2026-04-22"
         mod_id = _pick_modifier(d, TEST_ACTIVE)
-        songs, _, _ = _select_songs(d, mod_id, self.pool, TEST_ACTIVE)
+        songs, _ = _select_songs(d, mod_id, self.pool, TEST_ACTIVE)
         cf_ids = [s["cf_id"] for s in songs]
         self.assertEqual(len(cf_ids), len(set(cf_ids)))
+
+    def test_select_can_return_fewer_than_five(self):
+        from plugins.the_daily.routes import _ALGORITHM_REGISTRY
+        d = "2026-04-22"
+        for mod in TEST_ACTIVE[:10]:
+            if mod["type"] == "filter" and "fn" in mod:
+                fn = _ALGORITHM_REGISTRY.get(mod["fn"])
+                if fn:
+                    matches = [s for s in self.pool if fn(s)]
+                    if matches:
+                        songs, count = _select_songs(d, mod["id"], self.pool, TEST_ACTIVE)
+                        self.assertLessEqual(count, 5)
+                        self.assertGreater(count, 0)
+                        break
 
 
 class TestDayName(unittest.TestCase):
@@ -214,14 +228,14 @@ class TestCompositeSelect(unittest.TestCase):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "discography" not in active_ids:
             self.skipTest("discography not in modifiers")
-        songs, count, fallback = _select_composite("2026-04-22", "discography", self.pool, 5, TEST_ACTIVE)
+        songs, count = _select_composite("2026-04-22", "discography", self.pool, 5, TEST_ACTIVE)
         self.assertGreaterEqual(count, 5)
 
     def test_time_machine(self):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "time_machine" not in active_ids:
             self.skipTest("time_machine not in modifiers")
-        songs, count, fallback = _select_composite("2026-04-22", "time_machine", self.pool, 5, TEST_ACTIVE)
+        songs, count = _select_composite("2026-04-22", "time_machine", self.pool, 5, TEST_ACTIVE)
         self.assertGreaterEqual(count, 5)
 
 
@@ -235,14 +249,14 @@ class TestSequenceSelect(unittest.TestCase):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "title_chain" not in active_ids:
             self.skipTest("title_chain not in modifiers")
-        songs, count, fallback = _select_sequence("2026-04-22", "title_chain", self.pool, 5, TEST_ACTIVE)
+        songs, count = _select_sequence("2026-04-22", "title_chain", self.pool, 5, TEST_ACTIVE)
         self.assertGreaterEqual(count, 5)
 
     def test_palette_swap(self):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "palette_swap" not in active_ids:
             self.skipTest("palette_swap not in modifiers")
-        songs, count, fallback = _select_sequence("2026-04-22", "palette_swap", self.pool, 5, TEST_ACTIVE)
+        songs, count = _select_sequence("2026-04-22", "palette_swap", self.pool, 5, TEST_ACTIVE)
         self.assertGreaterEqual(count, 5)
 
 
@@ -256,19 +270,17 @@ class TestStructuralSelect(unittest.TestCase):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "bookends" not in active_ids:
             self.skipTest("bookends not in modifiers")
-        songs, count, fallback = _select_structural("2026-04-22", "bookends", self.pool, 5, TEST_ACTIVE)
-        if not fallback:
-            self.assertEqual(songs[0]["artist"], songs[-1]["artist"])
+        songs, count = _select_structural("2026-04-22", "bookends", self.pool, 5, TEST_ACTIVE)
+        self.assertEqual(songs[0]["artist"], songs[-1]["artist"])
 
     def test_rival_camps(self):
         active_ids = [m["id"] for m in TEST_ACTIVE]
         if "rival_camps" not in active_ids:
             self.skipTest("rival_camps not in modifiers")
-        songs, count, fallback = _select_structural("2026-04-22", "rival_camps", self.pool, 5, TEST_ACTIVE)
-        if not fallback:
-            artists = [s["artist"] for s in songs]
-            unique = set(artists)
-            self.assertEqual(len(unique), 2)
+        songs, count = _select_structural("2026-04-22", "rival_camps", self.pool, 5, TEST_ACTIVE)
+        artists = [s["artist"] for s in songs]
+        unique = set(artists)
+        self.assertEqual(len(unique), 2)
 
 
 class TestLocalMatching(unittest.TestCase):

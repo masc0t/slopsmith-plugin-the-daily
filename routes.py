@@ -16,6 +16,11 @@ import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+from sts_map import generate_sts_map, sts_seed_int as _sts_seed_int
+
 
 def _date_seed(date_str):
     return hashlib.md5(date_str.encode()).hexdigest()[:6]
@@ -250,6 +255,10 @@ def _eval_predicate(song: dict, predicate: dict) -> bool:
         field = predicate.get("field", "")
         value = song.get(field, "").replace(" ", "")
         return len(value) > 0 and not value.isalnum()
+    if op == "field_has_digit":
+        field = predicate.get("field", "")
+        value = song.get(field, "")
+        return any(c.isdigit() for c in value)
     return False
 
 
@@ -472,6 +481,13 @@ _conn = None
 _lock = threading.Lock()
 
 
+def _close_conn():
+    global _conn
+    if _conn is not None:
+        _conn.close()
+        _conn = None
+
+
 def _get_conn():
     global _conn
     if _conn is None:
@@ -550,7 +566,6 @@ def _get_conn():
             );
         """)
         _ensure_column(_conn, "daily_setlists", "map", "TEXT")
-        _ensure_column(_conn, "daily_setlists", "fallback", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(_conn, "daily_completions", "node_id", "TEXT")
         _ensure_column(_conn, "daily_completions", "install_id", "TEXT")
         _ensure_column(_conn, "daily_completions", "committed_lane", "TEXT")
@@ -655,6 +670,16 @@ def _latest_leq_stamp(stamps: list, target_date: date) -> str | None:
     return max(valid)
 
 
+def _filter_pool(pool):
+    """Filter raw pool to eligible songs. Applied on every read so filter changes
+    take effect without clearing the cache."""
+    return [s for s in pool
+            if len((s.get("artist") or "").strip()) >= 2
+            and len((s.get("title") or "").strip()) >= 2
+            and "full album" not in (s.get("title") or "").lower()
+            and (s.get("has_lead", False) or s.get("has_rhythm", False))]
+
+
 def _load_pool(date_str, plugin_dir):
     """Load pool for a specific date using manifest+stamp versioning."""
     target_date = date.fromisoformat(date_str)
@@ -669,22 +694,24 @@ def _load_pool(date_str, plugin_dir):
                 "SELECT pool FROM pool_cache WHERE pool_stamp = ?", (stamp,)
             ).fetchone()
             if row:
-                return json.loads(row[0])
+                return _filter_pool(json.loads(row[0]))
 
             pool = _fetch_pool_by_stamp(stamp)
             if pool:
-                pool = [s for s in pool
-                        if len((s.get("artist") or "").strip()) >= 2
-                        and len((s.get("title") or "").strip()) >= 2
-                        and "full album" not in (s.get("title") or "").lower()
-                        and (s.get("has_lead", True) or s.get("has_rhythm", True))]
                 with _lock:
                     conn.execute(
                         "INSERT OR REPLACE INTO pool_cache (pool_stamp, pool, fetched_at) VALUES (?, ?, ?)",
                         (stamp, json.dumps(pool), datetime.utcnow().isoformat())
                     )
                     conn.commit()
-                return pool
+                return _filter_pool(pool)
+
+    # Fallback to bundled pool if remote fetch fails
+    bundled_path = plugin_dir / "songs_pool.json"
+    if bundled_path.exists():
+        with open(bundled_path) as f:
+            pool = json.load(f)
+        return _filter_pool(pool)
 
     raise RuntimeError(f"Failed to fetch pool from releases for {date_str}")
 
@@ -876,7 +903,7 @@ def _pick_modifier(date_str, active):
     return ids[0]
 
 
-def _identity_candidates(date_str, pool, key, count, min_pool=None, exclude=None, seed_suffix=None):
+def _identity_candidates(date_str, pool, key, count, min_pool=None, seed_suffix=None):
     seed_key = seed_suffix or (key if isinstance(key, str) else "callable")
     rng = random.Random(_date_seed(date_str) + seed_key)
 
@@ -906,16 +933,14 @@ def _identity_candidates(date_str, pool, key, count, min_pool=None, exclude=None
 
     threshold = max(min_pool or 0, count)
     eligible = {k: v for k, v in groups.items() if len(v) >= threshold}
-    if exclude:
-        eligible = {k: v for k, v in eligible.items() if str(k).lower() not in exclude}
     while not eligible and threshold > 1:
         threshold -= 1
         eligible = {k: v for k, v in groups.items() if len(v) >= threshold}
     if not eligible:
-        return pool, True
+        return pool[:count], min(count, len(pool))
 
     chosen = rng.choice(sorted(eligible.keys(), key=str))
-    return eligible[chosen], False
+    return eligible[chosen], len(eligible[chosen])
 
 
 def _field_value(song, field):
@@ -930,12 +955,6 @@ def _field_value(song, field):
     if isinstance(v, str):
         v = v.strip() or None
     return v
-
-
-def _fallback_sample(pool, count, date_str, seed_suffix):
-    """Return count random songs from pool, used when a modifier cannot be satisfied."""
-    rng = random.Random(_date_seed(date_str) + seed_suffix + "fallback")
-    return rng.sample(pool, min(count, len(pool))), count, True
 
 
 def _select_composite(date_str, modifier_id, pool, count, active):
@@ -976,16 +995,14 @@ def _select_composite(date_str, modifier_id, pool, count, active):
 
             eligible = {k: v for k, v in id_groups.items() if _group_ok(v)}
             if not eligible:
-                return _fallback_sample(pool, count, date_str, modifier_id)
+                return candidates[:count], len(candidates[:count])
             chosen_key = rng.choice(sorted(eligible.keys(), key=str))
             candidates = eligible[chosen_key]
         else:
-            candidates, fallback = _identity_candidates(
+            candidates, _ = _identity_candidates(
                 date_str, candidates, identity_field, count,
                 seed_suffix=modifier_id,
             )
-            if fallback:
-                return _fallback_sample(pool, count, date_str, modifier_id)
 
     if unique_fields:
         for ufield in unique_fields:
@@ -1000,7 +1017,7 @@ def _select_composite(date_str, modifier_id, pool, count, active):
             candidates = picked if picked else candidates
 
     if len(candidates) < count:
-        return _fallback_sample(pool, count, date_str, modifier_id)
+        return candidates[:count], len(candidates[:count])
 
     selected = rng.sample(candidates, min(count, len(candidates)))
 
@@ -1010,7 +1027,7 @@ def _select_composite(date_str, modifier_id, pool, count, active):
         except Exception:
             pass
 
-    return selected, len(selected), False
+    return selected, len(selected)
 
 
 def _select_sequence(date_str, modifier_id, pool, count, active):
@@ -1036,9 +1053,9 @@ def _select_sequence(date_str, modifier_id, pool, count, active):
             else:
                 break
         if len(chain) >= count:
-            return chain[:count], count, False
+            return chain[:count], count
 
-    return _fallback_sample(pool, count, date_str, modifier_id)
+    return chain, len(chain)
 
 
 def _select_structural(date_str, modifier_id, pool, count, active):
@@ -1056,16 +1073,15 @@ def _select_structural(date_str, modifier_id, pool, count, active):
                 groups.setdefault(v, []).append(s)
         eligible = {k: v for k, v in groups.items() if len(v) >= 2}
         if not eligible:
-            return _fallback_sample(pool, count, date_str, modifier_id)
+            return pool[:count], min(count, len(pool))
         artist = rng.choice(sorted(eligible.keys()))
         b1, b2 = rng.sample(eligible[artist], 2)
         used = {b1["cf_id"], b2["cf_id"]}
         others = [s for s in pool if s["cf_id"] not in used]
         rng.shuffle(others)
         middle = others[:count - 2]
-        if len(middle) < count - 2:
-            return _fallback_sample(pool, count, date_str, modifier_id)
-        return [b1] + middle + [b2], count, False
+        result = [b1] + middle + [b2]
+        return result, len(result)
 
     elif shape == "alternating":
         groups: dict = {}
@@ -1076,7 +1092,7 @@ def _select_structural(date_str, modifier_id, pool, count, active):
         half = (count + 1) // 2
         eligible = {k: v for k, v in groups.items() if len(v) >= half}
         if len(eligible) < 2:
-            return _fallback_sample(pool, count, date_str, modifier_id)
+            return pool[:count], min(count, len(pool))
         artists = sorted(eligible.keys())
         rng.shuffle(artists)
         a1, a2 = artists[0], artists[1]
@@ -1087,21 +1103,19 @@ def _select_structural(date_str, modifier_id, pool, count, active):
             src = pool_a1 if i % 2 == 0 else pool_a2
             if src:
                 result.append(src.pop(0))
-        if len(result) < count:
-            return _fallback_sample(pool, count, date_str, modifier_id)
-        return result, count, False
+        return result, len(result)
 
-    return _fallback_sample(pool, count, date_str, modifier_id)
+    return pool[:count], min(count, len(pool))
 
 
-def _select_meta(date_str, modifier_id, pool, count, active, exclude=None):
+def _select_meta(date_str, modifier_id, pool, count, active):
     """meta: delegates or wraps other modifiers."""
     non_meta = [m["id"] for m in active if m.get("type") != "meta"]
     rng = random.Random(_date_seed(date_str) + modifier_id + "meta")
 
     if modifier_id == "dealers_choice":
         chosen = rng.choice(non_meta)
-        return _select_songs(date_str, chosen, pool, active, exclude=exclude)
+        return _select_songs(date_str, chosen, pool, active)
 
     if modifier_id == "double_trouble":
         chosen = rng.sample(non_meta, 2)
@@ -1120,19 +1134,18 @@ def _select_meta(date_str, modifier_id, pool, count, active, exclude=None):
                     candidates = filtered
         rng2 = random.Random(_date_seed(date_str) + "songs")
         selected = rng2.sample(candidates, min(count, len(candidates)))
-        return selected, len(selected), False
+        return selected, len(selected)
 
     # reanimated, secret_handshake — random selection
     rng2 = random.Random(_date_seed(date_str) + "songs")
     selected = rng2.sample(pool, min(count, len(pool)))
-    return selected, len(selected), False
+    return selected, len(selected)
 
 
-def _select_songs(date_str, modifier_id, pool, active, exclude=None):
+def _select_songs(date_str, modifier_id, pool, active):
     mod = next(m for m in active if m["id"] == modifier_id)
     mod_type = mod["type"]
     count = mod.get("count", DEFAULT_SONG_COUNT)
-    fallback = False
 
     if mod_type in ("filter", "filter+count"):
         if "predicate" in mod:
@@ -1141,21 +1154,18 @@ def _select_songs(date_str, modifier_id, pool, active, exclude=None):
             fn_name = mod["fn"]
             fn = _ALGORITHM_REGISTRY.get(fn_name)
             if fn is None:
-                candidates = pool
+                candidates = []  # Unknown function - don't fall back to full pool
             else:
                 candidates = [s for s in pool if fn(s)]
         else:
             candidates = pool
-        if len(candidates) < count:
-            candidates = pool
-            fallback = True
     elif mod_type == "identity":
         key = mod.get("key")
         if key in _ALGORITHM_REGISTRY:
             key = _ALGORITHM_REGISTRY[key]
-        candidates, fallback = _identity_candidates(
+        candidates, _ = _identity_candidates(
             date_str, pool, key, count, mod.get("min_pool"),
-            exclude=exclude, seed_suffix=modifier_id,
+            seed_suffix=modifier_id,
         )
         count = DEFAULT_SONG_COUNT
     elif mod_type == "composite":
@@ -1167,7 +1177,7 @@ def _select_songs(date_str, modifier_id, pool, active, exclude=None):
     elif mod_type == "structural":
         return _select_structural(date_str, modifier_id, pool, count, active)
     elif mod_type == "meta":
-        return _select_meta(date_str, modifier_id, pool, count, active, exclude=exclude)
+        return _select_meta(date_str, modifier_id, pool, count, active)
     else:
         candidates = pool
 
@@ -1184,7 +1194,7 @@ def _select_songs(date_str, modifier_id, pool, active, exclude=None):
             except Exception:
                 pass
 
-    return selected, len(selected), fallback
+    return selected, len(selected)
 
 
 # ── Map Mode generation ───────────────────────────────────────────────────────
@@ -1221,15 +1231,6 @@ MAP_LANES = {
     },
 }
 
-MAP_SHAPE_WEIGHTS = [
-    ("fork", 30),
-    ("diamond", 30),
-    ("crossroads", 20),
-    ("bramble", 12),
-    ("spiral", 8),
-]
-
-
 def _song_duration_seconds(song):
     raw = song.get("duration")
     if raw is None or raw == "":
@@ -1256,104 +1257,35 @@ def _song_duration_seconds(song):
     return None
 
 
-def _weighted_choice(rng, weighted_items):
-    total = sum(weight for _, weight in weighted_items)
-    pick = rng.uniform(0, total)
-    upto = 0
-    for item, weight in weighted_items:
-        upto += weight
-        if pick <= upto:
-            return item
-    return weighted_items[-1][0]
-
-
-def _map_shape_template(shape, act=None, row_offset=0):
-    def _row(r):
-        return r + row_offset
-    if shape == "fork":
-        return [
-            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2"], "act": act},
-            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
-            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 2, "lane_slot": 1, "edges": ["n4"], "act": act},
-            {"id": f"n3_{act}" if act else "n3", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
-            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 2, "lane_slot": 1, "edges": ["nb"], "act": act},
-            {"id": f"nb_{act}" if act else "nb", "row": _row(3), "col": 1, "lane_slot": None, "edges": [], "act": act},
-        ]
-    if shape == "diamond":
-        return [
-            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2"], "act": act},
-            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
-            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 2, "lane_slot": 1, "edges": ["n3"], "act": act},
-            {"id": f"n3_{act}" if act else "n3", "row": _row(2), "col": 1, "lane_slot": None, "edges": ["n4", "n5"], "act": act},
-            {"id": f"n4_{act}" if act else "n4", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
-            {"id": f"n5_{act}" if act else "n5", "row": _row(3), "col": 2, "lane_slot": 1, "edges": ["nb"], "act": act},
-            {"id": f"nb_{act}" if act else "nb", "row": _row(4), "col": 1, "lane_slot": None, "edges": [], "act": act},
-        ]
-    if shape == "crossroads":
-        return [
-            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2", "n3"], "act": act},
-            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n4", "n5"], "act": act},
-            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 1, "lane_slot": 1, "edges": ["n5"], "act": act},
-            {"id": f"n3_{act}" if act else "n3", "row": _row(1), "col": 2, "lane_slot": 2, "edges": ["n5", "n6"], "act": act},
-            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n7"], "act": act},
-            {"id": f"n5_{act}" if act else "n5", "row": _row(2), "col": 1, "lane_slot": 1, "edges": ["n7"], "act": act},
-            {"id": f"n6_{act}" if act else "n6", "row": _row(2), "col": 2, "lane_slot": 2, "edges": ["n7"], "act": act},
-            {"id": f"n7_{act}" if act else "n7", "row": _row(3), "col": 1, "lane_slot": None, "edges": ["nb"], "act": act},
-            {"id": f"nb_{act}" if act else "nb", "row": _row(4), "col": 1, "lane_slot": None, "edges": [], "act": act},
-        ]
-    if shape == "bramble":
-        return [
-            {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 1, "lane_slot": None, "edges": ["n1", "n2", "n3"], "act": act},
-            {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n4", "n5"], "act": act},
-            {"id": f"n2_{act}" if act else "n2", "row": _row(1), "col": 1, "lane_slot": 1, "edges": ["n5", "n6"], "act": act},
-            {"id": f"n3_{act}" if act else "n3", "row": _row(1), "col": 2, "lane_slot": 2, "edges": ["n6"], "act": act},
-            {"id": f"n4_{act}" if act else "n4", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n8"], "act": act},
-            {"id": f"n5_{act}" if act else "n5", "row": _row(2), "col": 1, "lane_slot": 1, "edges": ["n7", "n8"], "act": act},
-            {"id": f"n6_{act}" if act else "n6", "row": _row(2), "col": 2, "lane_slot": 2, "edges": ["n7"], "act": act},
-            {"id": f"n7_{act}" if act else "n7", "row": _row(3), "col": 2, "lane_slot": 2, "edges": ["n9"], "act": act},
-            {"id": f"n8_{act}" if act else "n8", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["n9"], "act": act},
-            {"id": f"n9_{act}" if act else "n9", "row": _row(4), "col": 1, "lane_slot": None, "edges": ["nb"], "act": act},
-            {"id": f"nb_{act}" if act else "nb", "row": _row(5), "col": 1, "lane_slot": None, "edges": [], "act": act},
-        ]
-    # spiral as fallback
-    return [
-        {"id": f"n0_{act}" if act else "n0", "row": _row(0), "col": 0, "lane_slot": 0, "edges": ["n1"], "act": act},
-        {"id": f"n1_{act}" if act else "n1", "row": _row(1), "col": 0, "lane_slot": 0, "edges": ["n2"], "act": act},
-        {"id": f"n2_{act}" if act else "n2", "row": _row(2), "col": 0, "lane_slot": 0, "edges": ["n3"], "act": act},
-        {"id": f"n3_{act}" if act else "n3", "row": _row(3), "col": 0, "lane_slot": 0, "edges": ["n4"], "act": act},
-        {"id": f"n4_{act}" if act else "n4", "row": _row(4), "col": 0, "lane_slot": 0, "edges": ["nb"], "act": act},
-        {"id": f"nb_{act}" if act else "nb", "row": _row(5), "col": 0, "lane_slot": None, "edges": [], "act": act},
-    ]
-
-
-def _map_modifier_pool(date_str, modifier_id, pool, active, exclude=None):
+def _map_modifier_pool(date_str, modifier_id, pool, active):
     mod = next(m for m in active if m["id"] == modifier_id)
     count = mod.get("count", DEFAULT_SONG_COUNT)
-    fallback = False
 
     if mod["type"] in ("filter", "filter+count"):
         if "predicate" in mod:
             candidates = [s for s in pool if _eval_predicate(s, mod["predicate"])]
         elif "fn" in mod:
             fn = _ALGORITHM_REGISTRY.get(mod["fn"])
-            candidates = [s for s in pool if fn and fn(s)] if fn else pool
+            if fn is None:
+                candidates = []  # Unknown function - don't fall back to full pool
+            else:
+                candidates = [s for s in pool if fn(s)]
         else:
             candidates = pool
         if len(candidates) < count:
-            return pool, True
-        return candidates, False
+            return pool
+        return candidates
 
     if mod["type"] == "identity":
         key = mod.get("key")
         if key in _ALGORITHM_REGISTRY:
             key = _ALGORITHM_REGISTRY[key]
-        candidates, fallback = _identity_candidates(
+        return _identity_candidates(
             date_str, pool, key, count, mod.get("min_pool"),
-            exclude=exclude, seed_suffix=modifier_id + "map",
-        )
-        return candidates, fallback
+            seed_suffix=modifier_id + "map",
+        )[0]
 
-    return pool, False
+    return pool
 
 
 def _boss_eligible(song):
@@ -1580,35 +1512,6 @@ ROOM_TYPES = {
     },
 }
 
-def _assign_map_node_types(nodes, rng):
-    mystery_count = 0
-    elite_count = 0
-    for node in nodes:
-        if node["id"] == "nb":
-            node["type"] = "boss"
-        elif node["row"] == 0:
-            node["type"] = "forced"  # Start node
-        else:
-            roll = rng.random()
-            if roll < 0.15:
-                node["type"] = "elite"
-                elite_count += 1
-            elif roll < 0.30:
-                node["type"] = "treasure"
-            elif roll < 0.45:
-                node["type"] = "rest"
-            elif roll < 0.60:
-                node["type"] = "shop"
-            elif roll < 0.85:
-                node["type"] = "forced"
-            elif mystery_count < 2:
-                node["type"] = "mystery"
-                mystery_count += 1
-            else:
-                node["type"] = "forced"
-    return nodes
-
-
 def _node_song_need(node):
     if node["type"] == "choice":
         return 3
@@ -1646,59 +1549,34 @@ def _song_decade(song):
     return (y // 10) * 10
 
 
-def _resolve_lane_candidates(lane_id, lane_def, pool, need, rng, seed_suffix):
-    if lane_def.get("dynamic") == "decade":
-        groups = {}
-        for song in pool:
-            decade = _song_decade(song)
-            if decade is not None:
-                groups.setdefault(decade, []).append(song)
-        eligible = [d for d, songs in groups.items() if len(songs) >= need]
-        if not eligible:
-            return None, None, None
-        local_rng = random.Random(seed_suffix + lane_id)
-        local_rng.shuffle(eligible)
-        decade = eligible[0]
-        resolved_id = f"decade_{decade}s"
-        return resolved_id, lane_def.get("icon", ""), groups[decade]
-    return lane_id, lane_def.get("icon", ""), [s for s in pool if lane_def["fn"](s)]
 
+def _build_map(date_str, modifier_id, pool, active):
+    modifier_pool = _map_modifier_pool(date_str, modifier_id, pool, active)
 
-def _build_spiral_map(date_str, modifier_id, pool, active, fallback):
-    rng = random.Random(_date_seed(date_str) + modifier_id + "mapfallback")
-    # Use fork shape for multiple branching tracks instead of linear spiral
-    nodes = _assign_map_node_types(_map_shape_template("fork"), rng)
-    boss_pool = [s for s in pool if _boss_eligible(s)] or pool
+    daily_map, _ = generate_sts_map(_sts_seed_int(date_str))
+    nodes = daily_map["nodes"]
+
+    rng = random.Random(_date_seed(date_str) + modifier_id + "map")
+
+    boss_pool = [s for s in modifier_pool if _boss_eligible(s)] or modifier_pool
     if not boss_pool:
-        return None, [], True
-
+        return None, []
     boss = rng.choice(boss_pool)
     used_cf_ids = {boss["cf_id"]}
     songs = {boss["cf_id"]: boss}
 
-    # Assign multiple lanes from MAP_LANES for variety
-    lane_ids = [lid for lid in MAP_LANES if lid != "decade"]
-    rng.shuffle(lane_ids)
-    lane_slots = sorted({n["lane_slot"] for n in nodes if n.get("lane_slot") is not None})
-    slot_to_lane = {slot: lane_ids[i % len(lane_ids)] for i, slot in enumerate(lane_slots)} if lane_ids else {}
-
     for node in nodes:
-        slot = node.pop("lane_slot", None)
         if node["id"] == "nb":
-            node["lane"] = None
             node["cf_id"] = boss["cf_id"]
             continue
-        node["lane"] = slot_to_lane.get(slot, "standard")
         need = _node_song_need(node)
         if need == 0:
             continue
-        lane_def = MAP_LANES.get(node["lane"], {})
-        lane_pool = pool if not lane_def.get("fn") else [s for s in pool if lane_def["fn"](s)]
-        picked = _sample_unused(rng, lane_pool, need, used_cf_ids)
+        picked = _sample_unused(rng, modifier_pool, need, used_cf_ids)
         if not picked:
             picked = _sample_unused(rng, pool, need, used_cf_ids)
         if not picked:
-            return None, [], True
+            return None, []
         for song in picked:
             songs[song["cf_id"]] = song
         if node["type"] == "choice":
@@ -1709,149 +1587,13 @@ def _build_spiral_map(date_str, modifier_id, pool, active, fallback):
         else:
             node["cf_id"] = picked[0]["cf_id"]
 
-    lanes = {lid: MAP_LANES[lid]["icon"] for lid in lane_ids if lid in MAP_LANES}
     return {
-        "shape": "fork",
-        "start": "n0",
+        "shape": "sts",
+        "start": daily_map["start"],
         "boss": "nb",
         "nodes": nodes,
-        "lanes": lanes,
-    }, list(songs.values()), fallback
-
-
-ACTS = ['Act 1', 'Act 2', 'Act 3']
-
-
-def _build_map(date_str, modifier_id, pool, active, exclude=None):
-    modifier_pool, modifier_fallback = _map_modifier_pool(date_str, modifier_id, pool, active, exclude=exclude)
-
-    mod = next(m for m in active if m["id"] == modifier_id)
-    collapse_to_spiral = mod["type"] == "identity"
-    if collapse_to_spiral and len(modifier_pool) < DEFAULT_SONG_COUNT:
-        collapse_to_spiral = False
-    rng = random.Random(_date_seed(date_str) + modifier_id + "map")
-    shape = "spiral" if collapse_to_spiral else _weighted_choice(rng, MAP_SHAPE_WEIGHTS)
-    nodes = _assign_map_node_types(_map_shape_template(shape), rng)
-
-    boss_pool = [s for s in modifier_pool if _boss_eligible(s)]
-    if not boss_pool:
-        return _build_spiral_map(date_str, modifier_id, pool, active, True)
-    boss = rng.choice(boss_pool)
-    used_cf_ids = {boss["cf_id"]}
-
-    lane_slots = sorted({n["lane_slot"] for n in nodes if n.get("lane_slot") is not None})
-    if collapse_to_spiral:
-        lane_ids = [modifier_id]
-        lane_defs = {modifier_id: {"icon": mod.get("icon", ""), "fn": lambda s: True}}
-    else:
-        lane_defs = MAP_LANES
-        lane_need = {slot: 0 for slot in lane_slots}
-        for node in nodes:
-            slot = node.get("lane_slot")
-            if slot is not None:
-                lane_need[slot] += _node_song_need(node)
-
-        eligible = []
-        lane_candidate_map = {}
-        lane_icon_map = {}
-        required_lane_capacity = max(lane_need.values() or [1])
-        for lane_id, lane in lane_defs.items():
-            resolved_id, icon, lane_pool = _resolve_lane_candidates(
-                lane_id, lane, [s for s in modifier_pool if s.get("cf_id") != boss["cf_id"]],
-                required_lane_capacity, rng, _date_seed(date_str) + modifier_id + "lane",
-            )
-            if resolved_id and len(lane_pool) >= required_lane_capacity:
-                eligible.append(resolved_id)
-                lane_candidate_map[resolved_id] = lane_pool
-                lane_icon_map[resolved_id] = icon
-        rng.shuffle(eligible)
-        if len(eligible) < len(lane_slots):
-            return _build_spiral_map(date_str, modifier_id, pool, active, True)
-        lane_ids = eligible[:len(lane_slots)]
-
-    slot_to_lane = {slot: lane_ids[i] for i, slot in enumerate(lane_slots)}
-    songs = {boss["cf_id"]: boss}
-
-    # Assign ACT to forced nodes based on row (first row = ACT 1, second = ACT 2, etc.)
-    act_number = 1
-    forced_nodes_in_row = {}
-    for node in nodes:
-        if node.get("type") == "forced":
-            row = node.get("row", 0)
-            forced_nodes_in_row.setdefault(row, []).append(node)
-    
-    # Tag the start forced node as Act 1 and the boss as Act 2.
-    # Lane-internal forced nodes (e.g. drop lane's mid-forced) don't get
-    # act labels — they're part of a single act, not act dividers.
-    for node in nodes:
-        if node.get("type") == "forced" and node.get("row") == 0:
-            node["act"] = "AC_1"
-        elif node.get("type") == "boss":
-            node["act"] = "AC_2"
-
-    for node in nodes:
-        slot = node.pop("lane_slot", None)
-        lane_id = slot_to_lane.get(slot)
-        node["lane"] = lane_id
-        if node["id"] == "nb":
-            node["cf_id"] = boss["cf_id"]
-            continue
-
-        need = _node_song_need(node)
-        if need == 0:
-            continue
-        if lane_id and not collapse_to_spiral:
-            candidates = lane_candidate_map[lane_id]
-        else:
-            candidates = modifier_pool
-        picked = _sample_unused(rng, candidates, need, used_cf_ids)
-        if not picked:
-            return _build_spiral_map(date_str, modifier_id, pool, active, True)
-        for song in picked:
-            songs[song["cf_id"]] = song
-        if node["type"] == "choice":
-            node["cf_ids"] = [s["cf_id"] for s in picked]
-        elif node["type"] == "mystery":
-            node["cf_pool"] = [s["cf_id"] for s in picked]
-            node = _enrich_mystery_node(date_str, node, pool)
-        else:
-            node["cf_id"] = picked[0]["cf_id"]
-
-    # Build nodes_by_lane for lane tracking
-    nodes_by_lane = {}
-    for node in nodes:
-        lane = node.get("lane")
-        if lane:
-            if lane not in nodes_by_lane:
-                nodes_by_lane[lane] = {"first_node": node, "count": 0}
-            nodes_by_lane[lane]["count"] += 1
-
-    # Build lanes by ACT type
-    lanes = {}
-    lane_act_map = {}
-    if collapse_to_spiral:
-        lanes[modifier_id] = mod.get("icon", "")
-    else:
-        # Group lanes by ACT type for proper routing
-        for lane_id in lane_ids:
-            # Get the first node to determine ACT type
-            lane_info = nodes_by_lane.get(lane_id, {})
-            sample_node = lane_info.get("first_node")
-            if sample_node and sample_node.get("type") in ["forced", "elite", "treasure", "rest", "shop"]:
-                lane_act_map[lane_id] = sample_node.get("act", "AC_1")
-            else:
-                lane_act_map[lane_id] = "AC_1"
-            lanes[lane_id] = lane_icon_map[lane_id]
-
-    return {
-        "shape": shape,
-        "start": "n0",
-        "boss": "nb",
-        "nodes": nodes,
-        "lanes": lanes,
-        "lane_acts": lane_act_map,
-        "acts": {"min": 1, "max": act_number},
-    }, list(songs.values()), modifier_fallback
+        "lanes": {},
+    }, list(songs.values())
 
 
 def _song_by_id(songs):
@@ -1940,11 +1682,11 @@ def _map_committed_node_ids(conn, date_str, install_id):
 def _get_or_generate_setlist(conn, date_str, plugin_dir):
     """Get or generate a setlist for any date. Used by peek endpoints for foresight."""
     row = conn.execute(
-        "SELECT day_name, modifier, songs, song_count, map, fallback, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
+        "SELECT day_name, modifier, songs, song_count, map, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
         (date_str,),
     ).fetchone()
     if row:
-        day_name, modifier_id, songs_json, song_count, map_json, fallback_int, lane_paths_json, pool_stamp = row
+        day_name, modifier_id, songs_json, song_count, map_json, lane_paths_json, pool_stamp = row
         songs = json.loads(songs_json)
         map_data = json.loads(map_json) if map_json else None
         return {
@@ -1953,7 +1695,6 @@ def _get_or_generate_setlist(conn, date_str, plugin_dir):
             "songs": songs,
             "song_count": song_count,
             "map": map_data,
-            "fallback": bool(fallback_int),
             "lane_paths": json.loads(lane_paths_json) if lane_paths_json else None,
             "pool_stamp": pool_stamp,
         }
@@ -1967,14 +1708,12 @@ def _get_or_generate_setlist(conn, date_str, plugin_dir):
     if not pool:
         return None
     modifier_id = _pick_modifier(date_str, active)
-    active_pool = _daily_active_pool(conn, date_str, pool)
-    exclude = _daily_artist_exclude(conn, date_str, modifier_id)
     target_date = date.fromisoformat(date_str)
     
     # Build lane_paths for generated setlist
     lane_paths = None
     if target_date >= MAP_MODE_START:
-        map_data, songs, fallback = _build_map(date_str, modifier_id, active_pool, active, exclude=exclude)
+        map_data, songs = _build_map(date_str, modifier_id, pool, active)
         song_count = 1
         # Extract lane_paths from map_data
         if map_data and map_data.get("nodes"):
@@ -1987,7 +1726,7 @@ def _get_or_generate_setlist(conn, date_str, plugin_dir):
                     nodes_by_lane[lane].append(node["id"])
             lane_paths = nodes_by_lane
     else:
-        songs, song_count, fallback = _select_songs(date_str, modifier_id, active_pool, active, exclude=exclude)
+        songs, song_count = _select_songs(date_str, modifier_id, pool, active)
         map_data = None
     mod = next(m for m in active if m["id"] == modifier_id)
     day_name = _day_name(date_str, mod, songs)
@@ -1997,9 +1736,9 @@ def _get_or_generate_setlist(conn, date_str, plugin_dir):
     with _lock:
         conn.execute(
             "INSERT OR IGNORE INTO daily_setlists "
-            "(date, day_name, modifier, songs, song_count, map, fallback, lane_paths, pool_stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(date, day_name, modifier, songs, song_count, map, lane_paths, pool_stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (date_str, day_name, modifier_id, json.dumps(songs), song_count,
-             json.dumps(map_data) if map_data else None, 1 if fallback else 0,
+             json.dumps(map_data) if map_data else None,
              json.dumps(lane_paths) if lane_paths else None, pool_stamp),
         )
         conn.commit()
@@ -2010,7 +1749,6 @@ def _get_or_generate_setlist(conn, date_str, plugin_dir):
         "songs": songs,
         "song_count": song_count,
         "map": map_data,
-        "fallback": fallback,
         "lane_paths": lane_paths,
         "pool_stamp": pool_stamp,
     }
@@ -2062,7 +1800,10 @@ def _map_available_state(conn, date_str, map_data, install_id=None):
     nodes = _node_by_id(map_data)
     cleared = _map_cleared_node_ids(conn, date_str)
     committed = _map_committed_node_ids(conn, date_str, install_id)
-    reachable = {map_data.get("start")}
+    if map_data.get("shape") == "sts":
+        reachable = {n_id for n_id, n in nodes.items() if n.get("row") == 0}
+    else:
+        reachable = {map_data.get("start")}
     for node_id in cleared:
         node = nodes.get(node_id)
         if node:
@@ -2097,7 +1838,10 @@ def _debug_map_state(map_data, cleared=None, committed=None):
     nodes = _node_by_id(map_data)
     cleared = set(cleared or [])
     committed = set(committed or [])
-    reachable = {map_data.get("start")}
+    if map_data.get("shape") == "sts":
+        reachable = {n_id for n_id, n in nodes.items() if n.get("row") == 0}
+    else:
+        reachable = {map_data.get("start")}
     for node_id in cleared:
         node = nodes.get(node_id)
         if node:
@@ -2274,38 +2018,6 @@ def _lane_popularity(entries):
         {"lane": lane, "count": count, "percent": round((count / total) * 100)}
         for lane, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     ]
-
-
-def _daily_active_pool(conn, date_str, pool):
-    used_cf_ids = set()
-    current = date.fromisoformat(date_str)
-    for i in range(1, 15):
-        past = (current - timedelta(days=i)).isoformat()
-        past_row = conn.execute(
-            "SELECT songs FROM daily_setlists WHERE date = ?", (past,)
-        ).fetchone()
-        if past_row:
-            for s in json.loads(past_row[0]):
-                used_cf_ids.add(s["cf_id"])
-    fresh_pool = [s for s in pool if s["cf_id"] not in used_cf_ids]
-    return fresh_pool if len(fresh_pool) >= DEFAULT_SONG_COUNT else pool
-
-
-def _daily_artist_exclude(conn, date_str, modifier_id):
-    if modifier_id != "artist_takeover":
-        return None
-    exclude = set()
-    current = date.fromisoformat(date_str)
-    for i in range(1, 15):
-        past = (current - timedelta(days=i)).isoformat()
-        past_row = conn.execute(
-            "SELECT modifier, songs FROM daily_setlists WHERE date = ?", (past,)
-        ).fetchone()
-        if past_row and past_row[0] == "artist_takeover":
-            past_songs = json.loads(past_row[1])
-            if past_songs:
-                exclude.add((past_songs[0].get("artist") or "").lower())
-    return exclude
 
 
 # ── Local library matching ────────────────────────────────────────────────────
@@ -2671,29 +2383,25 @@ def setup(app, context):
             raise
 
         row = conn.execute(
-            "SELECT day_name, modifier, songs, song_count, map, fallback, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
+            "SELECT day_name, modifier, songs, song_count, map, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
             (today,),
         ).fetchone()
 
-        fallback = False
         map_data = None
         if debug_map:
             pool = _load_pool(today, plugin_dir)
             if not pool:
                 return {"error": "Song pool is empty. Run build_pool.py to populate it."}
             modifier_id = _pick_modifier(today, active)
-            active_pool = _daily_active_pool(conn, today, pool)
-            exclude = _daily_artist_exclude(conn, today, modifier_id)
             mod = next(m for m in active if m["id"] == modifier_id)
-            map_data, songs, fallback = _build_map(today, modifier_id, active_pool, active, exclude=exclude)
+            map_data, songs = _build_map(today, modifier_id, pool, active)
             song_count = 1
             day_name = _day_name(today, mod, songs)
             pool_stamp = _get_pool_stamp(today)
         elif row:
-            day_name, modifier_id, songs_json, song_count, map_json, fallback_int, lane_paths_json, pool_stamp = row
+            day_name, modifier_id, songs_json, song_count, map_json, lane_paths_json, pool_stamp = row
             songs = json.loads(songs_json)
             map_data = json.loads(map_json) if map_json else None
-            fallback = bool(fallback_int)
             mod = next((m for m in active if m["id"] == modifier_id), None)
         else:
             pool = _load_pool(today, plugin_dir)
@@ -2703,13 +2411,11 @@ def setup(app, context):
             modifier_id = _pick_modifier(today, active)
             mod = next(m for m in active if m["id"] == modifier_id)
 
-            active_pool = _daily_active_pool(conn, today, pool)
-            exclude = _daily_artist_exclude(conn, today, modifier_id)
             if today_date >= MAP_MODE_START:
-                map_data, songs, fallback = _build_map(today, modifier_id, active_pool, active, exclude=exclude)
+                map_data, songs = _build_map(today, modifier_id, pool, active)
                 song_count = 1
             else:
-                songs, song_count, fallback = _select_songs(today, modifier_id, active_pool, active, exclude=exclude)
+                songs, song_count = _select_songs(today, modifier_id, pool, active)
             day_name = _day_name(today, mod, songs)
 
             # Build lane_paths from map_data for committed lane computation
@@ -2729,8 +2435,8 @@ def setup(app, context):
             with _lock:
                 conn.execute(
                     "INSERT OR IGNORE INTO daily_setlists "
-                    "(date, day_name, modifier, songs, song_count, map, fallback, lane_paths, pool_stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (today, day_name, modifier_id, json.dumps(songs), song_count, json.dumps(map_data) if map_data else None, 1 if fallback else 0, json.dumps(lane_paths) if lane_paths else None, pool_stamp),
+                    "(date, day_name, modifier, songs, song_count, map, lane_paths, pool_stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (today, day_name, modifier_id, json.dumps(songs), song_count, json.dumps(map_data) if map_data else None, json.dumps(lane_paths) if lane_paths else None, pool_stamp),
                 )
                 conn.commit()
 
@@ -2762,7 +2468,6 @@ def setup(app, context):
                 "icon": mod_icon,
                 "is_blindside": mod_type == "ui",
             },
-            "fallback": fallback,
             "songs": enriched,
             "song_count": song_count,
             "progress": {"done": progress_done, "total": progress_total},
@@ -2821,35 +2526,12 @@ def setup(app, context):
             if not pool:
                 return None
 
-            # Exclude songs used in the last 14 days before the target date
-            used_cf = set()
-            for i in range(1, 15):
-                past = (targ - timedelta(days=i)).isoformat()
-                past_row = conn.execute("SELECT songs FROM daily_setlists WHERE date = ?", (past,)).fetchone()
-                if past_row:
-                    for s in json.loads(past_row[0]):
-                        used_cf.add(s.get("cf_id"))
-
-            fresh_pool = [s for s in pool if s.get("cf_id") not in used_cf]
-            active_pool = fresh_pool if len(fresh_pool) >= DEFAULT_SONG_COUNT else pool
-
-            exclude = None
-            if mod_id == "artist_takeover":
-                exclude = set()
-                for i in range(1, 15):
-                    past = (targ - timedelta(days=i)).isoformat()
-                    past_row = conn.execute("SELECT modifier, songs FROM daily_setlists WHERE date = ?", (past,)).fetchone()
-                    if past_row and past_row[0] == "artist_takeover":
-                        past_songs = json.loads(past_row[1])
-                        if past_songs:
-                            exclude.add((past_songs[0].get("artist") or "").lower())
-
             map_data = None
             if targ >= MAP_MODE_START:
-                map_data, songs, fallback = _build_map(target_date_str, mod_id, active_pool, active, exclude=exclude)
+                map_data, songs = _build_map(target_date_str, mod_id, pool, active)
                 song_count = 1
             else:
-                songs, song_count, fallback = _select_songs(target_date_str, mod_id, active_pool, active, exclude=exclude)
+                songs, song_count = _select_songs(target_date_str, mod_id, pool, active)
             day_name = _day_name(target_date_str, mod, songs)
 
             # Build lane_paths from map_data
@@ -2888,7 +2570,6 @@ def setup(app, context):
                     "icon": mod.get("icon", ""),
                     "is_blindside": mod["type"] == "ui",
                 },
-                "fallback": fallback,
                 "songs": enriched,
                 "song_count": song_count,
                 "progress": {"done": progress_done, "total": progress_total},
@@ -2900,7 +2581,7 @@ def setup(app, context):
             }
 
         # Helper to build payload from a retrieved row
-        def build_payload(row, is_historical: bool, mod_id, songs, song_count, done_ids=None, map_data=None, fallback=False, pool_stamp=None):
+        def build_payload(row, is_historical: bool, mod_id, songs, song_count, done_ids=None, map_data=None, pool_stamp=None):
             if not row:
                 return None
             day_name = row[0]
@@ -2928,7 +2609,7 @@ def setup(app, context):
                 if lane_paths_json:
                     try:
                         lane_paths = json.loads(lane_paths_json)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         pass
             payload = {
                 "date": date_str,
@@ -2942,7 +2623,6 @@ def setup(app, context):
                     "icon": mod.get("icon", ""),
                     "is_blindside": mod["type"] == "ui",
                 },
-                "fallback": fallback,
                 "songs": enriched,
                 "song_count": song_count,
                 "progress": {"done": progress_done, "total": progress_total},
@@ -2959,27 +2639,27 @@ def setup(app, context):
 
         # Today
         row = conn.execute(
-            "SELECT day_name, modifier, songs, song_count, map, fallback, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
+            "SELECT day_name, modifier, songs, song_count, map, lane_paths, pool_stamp FROM daily_setlists WHERE date = ?",
             (date_str,),
         ).fetchone()
         if target == today_date:
             if not row:
                 return {"error": "No setlist for today"}, 404
-            day_name, modifier_id, songs_json, song_count, map_json, fallback_int, lane_paths_json, pool_stamp = row
+            day_name, modifier_id, songs_json, song_count, map_json, lane_paths_json, pool_stamp = row
             songs = json.loads(songs_json)
             map_data = json.loads(map_json) if map_json else None
             # Enrich completion state for today
             done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
-            payload = build_payload(row, False, modifier_id, songs, song_count, done_ids, map_data=map_data, fallback=bool(fallback_int), pool_stamp=pool_stamp)
+            payload = build_payload(row, False, modifier_id, songs, song_count, done_ids, map_data=map_data, pool_stamp=pool_stamp)
             return payload
 
         # Historical
         if row:
-            day_name, modifier_id, songs_json, song_count, map_json, fallback_int, lane_paths_json, pool_stamp = row
+            day_name, modifier_id, songs_json, song_count, map_json, lane_paths_json, pool_stamp = row
             songs = json.loads(songs_json)
             map_data = json.loads(map_json) if map_json else None
             done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
-            payload = build_payload(row, True, modifier_id, songs, song_count, done_ids, map_data=map_data, fallback=bool(fallback_int), pool_stamp=pool_stamp)
+            payload = build_payload(row, True, modifier_id, songs, song_count, done_ids, map_data=map_data, pool_stamp=pool_stamp)
             return payload
         # Not found for historical date: generate locally if date is historical
         if target < today_date:
@@ -3013,9 +2693,7 @@ def setup(app, context):
             conn = _get_conn()
             pool = _load_pool(today, plugin_dir)
             modifier_id = _pick_modifier(today)
-            active_pool = _daily_active_pool(conn, today, pool)
-            exclude = _daily_artist_exclude(conn, today, modifier_id)
-            map_data, _, _ = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            map_data, _ = _build_map(today, modifier_id, pool, _get_active_modifier(today))
             if not map_data or not node_id:
                 return {"error": "node_id required"}
             client_cleared = set(data.get("cleared_node_ids") or [])
@@ -3044,9 +2722,30 @@ def setup(app, context):
         if debug_no_save:
             pool = _load_pool(today, plugin_dir)
             modifier_id = _pick_modifier(today)
-            active_pool = _daily_active_pool(conn, today, pool)
-            exclude = _daily_artist_exclude(conn, today, modifier_id)
-            map_data, songs, _ = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            map_data, songs = _build_map(today, modifier_id, pool, _get_active_modifier(today))
+            state = _debug_map_state(map_data, set(data.get("cleared_node_ids") or []), set(data.get("committed_node_ids") or []))
+            return {
+                "ok": True,
+                "debug_no_save": True,
+                "force_complete": True,
+                "progress": {"done": len(state["cleared_node_ids"]), "total": len(map_data.get("nodes", []))},
+                **state,
+                "inventory": {"items": [BOSS_REROLL_ITEM] * 99, "counts": {BOSS_REROLL_ITEM: 99}},
+            }
+        if not cf_id:
+            return {"error": "cf_id required"}
+        today = _get_today().isoformat()
+        if debug_no_save and data.get("debug_date"):
+            try:
+                today = date.fromisoformat(str(data.get("debug_date"))).isoformat()
+            except Exception:
+                today = _get_today().isoformat()
+        conn = _get_conn()
+
+        if debug_no_save:
+            pool = _load_pool(today, plugin_dir)
+            modifier_id = _pick_modifier(today)
+            map_data, songs = _build_map(today, modifier_id, pool, _get_active_modifier(today))
             song_count = 1
         else:
             row = conn.execute(
@@ -3170,9 +2869,7 @@ def setup(app, context):
         if debug_no_save:
             pool = _load_pool(today, plugin_dir)
             modifier_id = _pick_modifier(today)
-            active_pool = _daily_active_pool(conn, today, pool)
-            exclude = _daily_artist_exclude(conn, today, modifier_id)
-            map_data, songs, _ = _build_map(today, modifier_id, active_pool, exclude=exclude)
+            map_data, songs = _build_map(today, modifier_id, pool, _get_active_modifier(today))
             state = _debug_map_state(map_data, set(data.get("cleared_node_ids") or []), set(data.get("committed_node_ids") or []))
         else:
             row = conn.execute(
@@ -3202,10 +2899,8 @@ def setup(app, context):
 
             boss_node = _node_by_id(map_data).get(map_data.get("boss"))
             pool = _load_pool(today, plugin_dir)
-            active_pool = _daily_active_pool(conn, today, pool)
-            modifier_pool, _ = _map_modifier_pool(
-                today, modifier_id, active_pool,
-                exclude=_daily_artist_exclude(conn, today, modifier_id),
+            modifier_pool = _map_modifier_pool(
+                today, modifier_id, pool, _get_active_modifier(today),
             )
             map_song_ids = {cf_id for node in map_data.get("nodes", []) for cf_id in _node_song_ids(node)}
             eligible = [s for s in modifier_pool if _boss_eligible(s) and s.get("cf_id") not in map_song_ids]
@@ -3418,7 +3113,6 @@ def setup(app, context):
         day_name = row[0] if row else f"Daily #{day_num}"
         modifier_id = row[1] if row and len(row) > 1 else None
         seed = _date_seed(target.isoformat()) if target else None
-        fallback = False
 
         if active:
             mod = next((m for m in active if m["id"] == modifier_id), {"label": "", "description": "", "icon": "", "type": "filter"}) if modifier_id else {}
@@ -3439,7 +3133,6 @@ def setup(app, context):
                 "day_number": day_num,
                 "seed": seed,
                 "modifier": modifier,
-                "fallback": fallback,
                 "entries": [],
                 "lane_popularity": [],
                 "available": True,
@@ -3473,18 +3166,17 @@ def setup(app, context):
                 last_updated = max(times)
 
         payload = {
-            "date": target.isoformat(),
-            "day_name": day_name,
-            "day_number": day_num,
-            "seed": seed,
-            "modifier": modifier,
-            "fallback": fallback,
-            "entries": entries or [],
-            "lane_popularity": _lane_popularity(entries or []),
-            "available": True,
-            "total_entries": len(entries or []),
-            "last_updated": last_updated,
-        }
+                "date": target.isoformat(),
+                "day_name": day_name,
+                "day_number": day_num,
+                "seed": seed,
+                "modifier": modifier,
+                "entries": entries or [],
+                "lane_popularity": _lane_popularity(entries or []),
+                "available": True,
+                "total_entries": len(entries or []),
+                "last_updated": last_updated,
+            }
         _lb_cache[cache_key] = (int(_time.time()) + LB_CACHE_TTL, payload)
         return payload
 
@@ -3571,6 +3263,84 @@ def setup(app, context):
             return {"error": "install_id required"}
         ok = _mirror_push(install_id)  # synchronous, not debounced
         return {"ok": ok}
+
+    @app.post("/api/plugins/the_daily/reset-day")
+    def reset_day(data: dict):
+        install_id = _client_install_id(data=data)
+        if not install_id:
+            return {"error": "install_id required"}
+        today = _get_today().isoformat()
+        conn = _get_conn()
+        # Wipe today's run state for this install: cleared songs, committed
+        # lanes, node-action records, boss rerolls, stamps earned today.
+        # Reverse today's token ledger from the running inventory balance,
+        # then wipe the ledger (this also refunds tokens spent on shop
+        # purchases today, since each purchase logs a negative ledger row).
+        # Same-day cosmetic purchases are reversed: items added to the
+        # cosmetics list and any equipped-slot pointers are cleared, then the
+        # daily_purchases rows are deleted. Consumables don't touch the
+        # cosmetics list — their persistent side-effects live in
+        # daily_boss_rerolls / daily_node_actions, which are wiped above.
+        # Long-term state untouched: prior days' progress, prior days'
+        # cosmetic purchases, and the day's setlist content itself.
+        with _lock:
+            delta = conn.execute(
+                "SELECT COALESCE(SUM(delta), 0) FROM daily_token_ledger WHERE install_id = ? AND date = ?",
+                (install_id, today),
+            ).fetchone()[0] or 0
+            if delta:
+                conn.execute(
+                    "UPDATE daily_inventory SET tokens = MAX(0, tokens - ?) WHERE install_id = ?",
+                    (delta, install_id),
+                )
+            conn.execute("DELETE FROM daily_token_ledger WHERE install_id = ? AND date = ?", (install_id, today))
+            conn.execute("DELETE FROM daily_completions WHERE date = ?", (today,))
+            conn.execute("DELETE FROM daily_node_commits WHERE date = ?", (today,))
+            conn.execute("DELETE FROM daily_node_actions WHERE date = ?", (today,))
+            conn.execute("DELETE FROM daily_boss_rerolls WHERE date = ?", (today,))
+            conn.execute("DELETE FROM daily_stamps WHERE install_id = ? AND earned_date = ?", (install_id, today))
+
+            # Reverse same-day cosmetic purchases.
+            purchased_today_rows = conn.execute(
+                "SELECT item_id FROM daily_purchases WHERE install_id = ? AND substr(purchased_at, 1, 10) = ?",
+                (install_id, today),
+            ).fetchall()
+            reversed_items = sorted({r[0] for r in purchased_today_rows})
+            if reversed_items:
+                inv_row = conn.execute(
+                    "SELECT cosmetics, equipped FROM daily_inventory WHERE install_id = ?",
+                    (install_id,),
+                ).fetchone()
+                if inv_row:
+                    try:
+                        cosmetics = json.loads(inv_row[0] or "[]")
+                    except Exception:
+                        cosmetics = []
+                    try:
+                        equipped = json.loads(inv_row[1] or "{}")
+                    except Exception:
+                        equipped = {}
+                    removed = set(reversed_items)
+                    cosmetics = [c for c in cosmetics if c not in removed]
+                    equipped = {slot: item for slot, item in equipped.items() if item not in removed}
+                    conn.execute(
+                        "UPDATE daily_inventory SET cosmetics = ?, equipped = ? WHERE install_id = ?",
+                        (json.dumps(sorted(set(cosmetics))), json.dumps(equipped), install_id),
+                    )
+                conn.execute(
+                    "DELETE FROM daily_purchases WHERE install_id = ? AND substr(purchased_at, 1, 10) = ?",
+                    (install_id, today),
+                )
+
+            conn.commit()
+        if "_mirror_push_debounced" in globals():
+            _mirror_push_debounced(install_id)
+        return {
+            "ok": True,
+            "date": today,
+            "tokens_reversed": delta,
+            "purchases_reversed": reversed_items,
+        }
 
     @app.get("/api/plugins/the_daily/shop")
     def get_shop(request: Request, node_id: str | None = None):
@@ -4015,7 +3785,17 @@ def setup(app, context):
             data = _get_or_generate_setlist(conn, tomorrow, plugin_dir)
             if not data or not data["map"]:
                 return None, "Tomorrow's map not available"
-            lanes = data["map"].get("lanes", {})
+            # Lane info lives in `lane_paths` ({lane_name: [node_id...]}). The
+            # `map["lanes"]` field is a placeholder always returned as {} by
+            # _build_map; reading it gives an empty result.
+            lanes = data.get("lane_paths") or {}
+            if not lanes:
+                # Fall back to deriving from nodes if lane_paths wasn't computed.
+                lanes = {}
+                for node in data["map"].get("nodes", []):
+                    lane = node.get("lane")
+                    if lane:
+                        lanes.setdefault(lane, []).append(node["id"])
             lane_labels = {k: _lane_label_py(k) for k in lanes if k != "act_labels"}
             return {
                 "type": "tomorrow_lanes",
@@ -4092,11 +3872,31 @@ def setup(app, context):
             (install_id, today, node_id),
         ).fetchone()
 
+        payload = json.loads(chosen[1]) if chosen and chosen[1] else None
+
+        # Self-heal payloads that were saved by an earlier broken _resolve_peek
+        # (e.g. tomorrow_lanes with an empty lanes dict). Re-resolve and persist
+        # so the user doesn't have to Restart Run to see correct data.
+        if chosen and payload is not None:
+            peek_type = chosen[0].replace("peek:", "")
+            broken = (peek_type == "tomorrow_lanes" and not payload.get("lanes"))
+            if broken:
+                fresh, err = _resolve_peek(today, node_id, peek_type, install_id, plugin_dir)
+                if not err and fresh and fresh.get("lanes"):
+                    payload = fresh
+                    with _lock:
+                        conn.execute(
+                            "UPDATE daily_node_actions SET payload = ? "
+                            "WHERE install_id = ? AND date = ? AND node_id = ? AND action = ?",
+                            (json.dumps(fresh), install_id, today, node_id, chosen[0]),
+                        )
+                        conn.commit()
+
         result = {
             "node_id": node_id,
             "options": [{"type": t, "label": PEEK_LABELS.get(t, t), "chosen": chosen is not None and chosen[0] == "peek:{}".format(t)} for t in options],
             "chosen": chosen[0].replace("peek:", "") if chosen else None,
-            "payload": json.loads(chosen[1]) if chosen and chosen[1] else None,
+            "payload": payload,
         }
         return result
 
@@ -4118,7 +3918,7 @@ def setup(app, context):
         conn = _get_conn()
 
         existing = conn.execute(
-            "SELECT action FROM daily_node_actions WHERE install_id = ? AND date = ? AND node_id = ? AND action LIKE 'peek:%'",
+            "SELECT action, payload FROM daily_node_actions WHERE install_id = ? AND date = ? AND node_id = ? AND action LIKE 'peek:%'",
             (install_id, today, node_id),
         ).fetchone()
         if existing and existing[0] != "peek:{}".format(peek_type):

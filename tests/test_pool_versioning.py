@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -83,17 +83,19 @@ class TestLoadPoolHardFail(unittest.TestCase):
         _init_tmp_db()
 
     def test_raises_when_no_pool_available(self):
-        plugin_dir = Path(__file__).parent.parent
-        with patch.object(routes, "_fetch_manifest", return_value=None):
-            with self.assertRaises(RuntimeError):
-                _load_pool("2026-05-01", plugin_dir)
-
-    def test_raises_when_fetch_fails(self):
-        plugin_dir = Path(__file__).parent.parent
-        with patch.object(routes, "_fetch_manifest", return_value=["2026-99-99"]):
-            with patch.object(routes, "_fetch_pool_by_stamp", return_value=None):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = Path(tmpdir)
+            with patch.object(routes, "_fetch_manifest", return_value=None):
                 with self.assertRaises(RuntimeError):
                     _load_pool("2026-05-01", plugin_dir)
+
+    def test_raises_when_fetch_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_dir = Path(tmpdir)
+            with patch.object(routes, "_fetch_manifest", return_value=["2026-99-99"]):
+                with patch.object(routes, "_fetch_pool_by_stamp", return_value=None):
+                    with self.assertRaises(RuntimeError):
+                        _load_pool("2026-05-01", plugin_dir)
 
 
 class TestSchemaPoolStamp(unittest.TestCase):
@@ -117,9 +119,9 @@ class TestUTCDate(unittest.TestCase):
         # Strip env override and verify _get_today returns a date object derived from UTC.
         os.environ.pop("THE_DAILY_TEST_TODAY", None)
         result = routes._get_today()
-        expected = datetime.utcnow().date()
+        expected = datetime.now(timezone.utc).date()
         # Within a 1-second tolerance (could roll midnight mid-test).
-        self.assertIn(result, (expected, datetime.utcnow().date()))
+        self.assertIn(result, (expected, datetime.now(timezone.utc).date()))
 
     def test_get_today_respects_env_override(self):
         os.environ["THE_DAILY_TEST_TODAY"] = "2026-06-15"

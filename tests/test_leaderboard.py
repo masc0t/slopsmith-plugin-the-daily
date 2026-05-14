@@ -22,10 +22,18 @@ def _make_app_with_routes(base_dir: Path, supabase_url: str = ""):
     routes = _load_routes_module(base_dir)
     routes.SUPABASE_URL = supabase_url
     routes._lb_cache.clear()
+    
+    # Force connection to be closed before setup
+    routes._close_conn()
+    
+    # Use in-memory DB
+    routes._db_path = ":memory:"
+    
     # Freeze today's date for deterministic tests
     os.environ["THE_DAILY_TEST_TODAY"] = "2026-04-24"
     app = FastAPI()
     routes.setup(app, {"config_dir": base_dir, "meta_db": SimpleNamespace(conn=None)})
+    
     return app, routes
 
 

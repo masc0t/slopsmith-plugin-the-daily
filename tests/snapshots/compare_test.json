@@ -15,7 +15,6 @@
       "modifier_label": "Drop Day",
       "day_name": "Daily #10",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         98267,
         63880,
@@ -32,7 +31,6 @@
       "modifier_label": "Drop Day",
       "day_name": "Daily #11",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         79628,
         85668,
@@ -49,7 +47,6 @@
       "modifier_label": "Typecast",
       "day_name": "Daily #12",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         78638,
         75749,
@@ -66,7 +63,6 @@
       "modifier_label": "Title Track",
       "day_name": "Daily #13",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         70295,
         85122,
@@ -83,7 +79,6 @@
       "modifier_label": "Palette Swap",
       "day_name": "Daily #14",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         63298,
         76386,
@@ -100,7 +95,6 @@
       "modifier_label": "Title Track",
       "day_name": "Daily #15",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         98521,
         95169,
@@ -117,7 +111,6 @@
       "modifier_label": "Color Wheel",
       "day_name": "Daily #16",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         62883,
         70510,
@@ -134,7 +127,6 @@
       "modifier_label": "Class Reunion",
       "day_name": "Daily #17",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         69049,
         85943,
@@ -151,7 +143,6 @@
       "modifier_label": "Drop Day",
       "day_name": "Daily #18",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         69259,
         65632,
@@ -168,7 +159,6 @@
       "modifier_label": "One Artist Takeover",
       "day_name": "Red Velvet",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         87719,
         88967,
@@ -185,7 +175,6 @@
       "modifier_label": "Standard Issue",
       "day_name": "Daily #20",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         69227,
         99227,
@@ -202,7 +191,6 @@
       "modifier_label": "One Word",
       "day_name": "Daily #21",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         75108,
         59261,
@@ -219,7 +207,6 @@
       "modifier_label": "Title Chain",
       "day_name": "Daily #22",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         94722,
         80155,
@@ -236,7 +223,6 @@
       "modifier_label": "Escalating Era",
       "day_name": "Daily #23",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         86645,
         88359,
@@ -253,7 +239,6 @@
       "modifier_label": "One Word",
       "day_name": "Daily #24",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         71037,
         74300,
@@ -270,7 +255,6 @@
       "modifier_label": "Prime Time",
       "day_name": "Daily #25",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         84177,
         61842,
@@ -287,7 +271,6 @@
       "modifier_label": "Motion Picture",
       "day_name": "Daily #26",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         95373,
         79123,
@@ -304,7 +287,6 @@
       "modifier_label": "Counterclockwise",
       "day_name": "Daily #27",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         86686,
         77297,
@@ -321,7 +303,6 @@
       "modifier_label": "Decade Night",
       "day_name": "The 1970s",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         93798,
         70034,
@@ -338,7 +319,6 @@
       "modifier_label": "Album Side",
       "day_name": "Man's Best Friend",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         96004,
         95924,
@@ -355,7 +335,6 @@
       "modifier_label": "Secret Handshake",
       "day_name": "Daily #30",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         89276,
         67951,
@@ -372,7 +351,6 @@
       "modifier_label": "Rival Camps",
       "day_name": "Daily #31",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         96579,
         91246,
@@ -389,7 +367,6 @@
       "modifier_label": "Time Machine",
       "day_name": "Daily #32",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         75906,
         80268,
@@ -406,7 +383,6 @@
       "modifier_label": "Reanimated",
       "day_name": "Daily #33",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         60808,
         88253,
@@ -423,7 +399,6 @@
       "modifier_label": "Class Reunion",
       "day_name": "Daily #34",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         59399,
         64645,
@@ -440,7 +415,6 @@
       "modifier_label": "Leap Year",
       "day_name": "Daily #35",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         74113,
         90223,
@@ -457,7 +431,6 @@
       "modifier_label": "Album Side",
       "day_name": "GRIM AGE",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         88388,
         88382,
@@ -474,7 +447,6 @@
       "modifier_label": "Discography",
       "day_name": "Daily #37",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         81301,
         92599,
@@ -491,7 +463,6 @@
       "modifier_label": "Compound Word",
       "day_name": "Daily #38",
       "song_count": 5,
-      "fallback": false,
       "song_ids": [
         84215,
         60858,
@@ -508,7 +479,6 @@
       "modifier_label": "Double Trouble",
       "day_name": "Daily #39",
       "song_count": 2,
-      "fallback": false,
       "song_ids": [
         99556,
         99558

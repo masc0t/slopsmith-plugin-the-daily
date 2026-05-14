@@ -95,7 +95,6 @@ tests/
 - ✓ Displays progress bar with correct values
 - ✓ Shows 5 song cards
 - ✓ Displays rescan bar when songs missing locally
-- ✓ Shows fallback notice when modifier falls back
 
 ### Map Rendering Tests
 - ✓ Renders SVG map with lane classes (lane-standard, etc.)
