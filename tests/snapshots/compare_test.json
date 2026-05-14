@@ -1,0 +1,488 @@
+{
+  "meta": {
+    "generated_at": "2026-05-01",
+    "days": 30,
+    "map_mode": false,
+    "epoch": "2026-04-22",
+    "pool_size": 35767
+  },
+  "days": [
+    {
+      "date": "2026-05-01",
+      "day_number": 10,
+      "seed": "db29c2",
+      "modifier": "drop_day",
+      "modifier_label": "Drop Day",
+      "day_name": "Daily #10",
+      "song_count": 5,
+      "song_ids": [
+        98267,
+        63880,
+        74301,
+        77193,
+        61622
+      ]
+    },
+    {
+      "date": "2026-05-02",
+      "day_number": 11,
+      "seed": "9d2c74",
+      "modifier": "drop_day",
+      "modifier_label": "Drop Day",
+      "day_name": "Daily #11",
+      "song_count": 5,
+      "song_ids": [
+        79628,
+        85668,
+        70262,
+        94087,
+        63558
+      ]
+    },
+    {
+      "date": "2026-05-03",
+      "day_number": 12,
+      "seed": "bec70d",
+      "modifier": "typecast",
+      "modifier_label": "Typecast",
+      "day_name": "Daily #12",
+      "song_count": 5,
+      "song_ids": [
+        78638,
+        75749,
+        68462,
+        63601,
+        81240
+      ]
+    },
+    {
+      "date": "2026-05-04",
+      "day_number": 13,
+      "seed": "5004f4",
+      "modifier": "title_track",
+      "modifier_label": "Title Track",
+      "day_name": "Daily #13",
+      "song_count": 5,
+      "song_ids": [
+        70295,
+        85122,
+        76084,
+        75982,
+        96919
+      ]
+    },
+    {
+      "date": "2026-05-05",
+      "day_number": 14,
+      "seed": "5081a3",
+      "modifier": "palette_swap",
+      "modifier_label": "Palette Swap",
+      "day_name": "Daily #14",
+      "song_count": 5,
+      "song_ids": [
+        63298,
+        76386,
+        83598,
+        65451,
+        98639
+      ]
+    },
+    {
+      "date": "2026-05-06",
+      "day_number": 15,
+      "seed": "51244d",
+      "modifier": "title_track",
+      "modifier_label": "Title Track",
+      "day_name": "Daily #15",
+      "song_count": 5,
+      "song_ids": [
+        98521,
+        95169,
+        89252,
+        87646,
+        73350
+      ]
+    },
+    {
+      "date": "2026-05-07",
+      "day_number": 16,
+      "seed": "68a262",
+      "modifier": "color_wheel",
+      "modifier_label": "Color Wheel",
+      "day_name": "Daily #16",
+      "song_count": 5,
+      "song_ids": [
+        62883,
+        70510,
+        72818,
+        81137,
+        67082
+      ]
+    },
+    {
+      "date": "2026-05-08",
+      "day_number": 17,
+      "seed": "eff81a",
+      "modifier": "class_reunion",
+      "modifier_label": "Class Reunion",
+      "day_name": "Daily #17",
+      "song_count": 5,
+      "song_ids": [
+        69049,
+        85943,
+        64046,
+        66290,
+        59569
+      ]
+    },
+    {
+      "date": "2026-05-09",
+      "day_number": 18,
+      "seed": "d6a790",
+      "modifier": "drop_day",
+      "modifier_label": "Drop Day",
+      "day_name": "Daily #18",
+      "song_count": 5,
+      "song_ids": [
+        69259,
+        65632,
+        91824,
+        94888,
+        84496
+      ]
+    },
+    {
+      "date": "2026-05-10",
+      "day_number": 19,
+      "seed": "460272",
+      "modifier": "artist_takeover",
+      "modifier_label": "One Artist Takeover",
+      "day_name": "Red Velvet",
+      "song_count": 5,
+      "song_ids": [
+        87719,
+        88967,
+        76797,
+        87840,
+        89695
+      ]
+    },
+    {
+      "date": "2026-05-11",
+      "day_number": 20,
+      "seed": "e1fc14",
+      "modifier": "e_standard",
+      "modifier_label": "Standard Issue",
+      "day_name": "Daily #20",
+      "song_count": 5,
+      "song_ids": [
+        69227,
+        99227,
+        93931,
+        67627,
+        64622
+      ]
+    },
+    {
+      "date": "2026-05-12",
+      "day_number": 21,
+      "seed": "71ad64",
+      "modifier": "one_word",
+      "modifier_label": "One Word",
+      "day_name": "Daily #21",
+      "song_count": 5,
+      "song_ids": [
+        75108,
+        59261,
+        88978,
+        76441,
+        62807
+      ]
+    },
+    {
+      "date": "2026-05-13",
+      "day_number": 22,
+      "seed": "f367c7",
+      "modifier": "title_chain",
+      "modifier_label": "Title Chain",
+      "day_name": "Daily #22",
+      "song_count": 5,
+      "song_ids": [
+        94722,
+        80155,
+        99101,
+        95651,
+        90469
+      ]
+    },
+    {
+      "date": "2026-05-14",
+      "day_number": 23,
+      "seed": "33136a",
+      "modifier": "escalating_era",
+      "modifier_label": "Escalating Era",
+      "day_name": "Daily #23",
+      "song_count": 5,
+      "song_ids": [
+        86645,
+        88359,
+        82443,
+        80302,
+        96846
+      ]
+    },
+    {
+      "date": "2026-05-15",
+      "day_number": 24,
+      "seed": "4c39a7",
+      "modifier": "one_word",
+      "modifier_label": "One Word",
+      "day_name": "Daily #24",
+      "song_count": 5,
+      "song_ids": [
+        71037,
+        74300,
+        59339,
+        66785,
+        75539
+      ]
+    },
+    {
+      "date": "2026-05-16",
+      "day_number": 25,
+      "seed": "95627d",
+      "modifier": "prime_time",
+      "modifier_label": "Prime Time",
+      "day_name": "Daily #25",
+      "song_count": 5,
+      "song_ids": [
+        84177,
+        61842,
+        76262,
+        68610,
+        85412
+      ]
+    },
+    {
+      "date": "2026-05-17",
+      "day_number": 26,
+      "seed": "7ca35a",
+      "modifier": "motion_picture",
+      "modifier_label": "Motion Picture",
+      "day_name": "Daily #26",
+      "song_count": 5,
+      "song_ids": [
+        95373,
+        79123,
+        79689,
+        91700,
+        92486
+      ]
+    },
+    {
+      "date": "2026-05-18",
+      "day_number": 27,
+      "seed": "5ec717",
+      "modifier": "counterclockwise",
+      "modifier_label": "Counterclockwise",
+      "day_name": "Daily #27",
+      "song_count": 5,
+      "song_ids": [
+        86686,
+        77297,
+        79179,
+        79160,
+        95769
+      ]
+    },
+    {
+      "date": "2026-05-19",
+      "day_number": 28,
+      "seed": "f18223",
+      "modifier": "decade_night",
+      "modifier_label": "Decade Night",
+      "day_name": "The 1970s",
+      "song_count": 5,
+      "song_ids": [
+        93798,
+        70034,
+        59208,
+        99557,
+        66595
+      ]
+    },
+    {
+      "date": "2026-05-20",
+      "day_number": 29,
+      "seed": "4501b6",
+      "modifier": "album_side",
+      "modifier_label": "Album Side",
+      "day_name": "Man's Best Friend",
+      "song_count": 5,
+      "song_ids": [
+        96004,
+        95924,
+        95876,
+        96018,
+        96003
+      ]
+    },
+    {
+      "date": "2026-05-21",
+      "day_number": 30,
+      "seed": "ac64f7",
+      "modifier": "secret_handshake",
+      "modifier_label": "Secret Handshake",
+      "day_name": "Daily #30",
+      "song_count": 5,
+      "song_ids": [
+        89276,
+        67951,
+        79480,
+        75324,
+        83233
+      ]
+    },
+    {
+      "date": "2026-05-22",
+      "day_number": 31,
+      "seed": "0a2529",
+      "modifier": "rival_camps",
+      "modifier_label": "Rival Camps",
+      "day_name": "Daily #31",
+      "song_count": 5,
+      "song_ids": [
+        96579,
+        91246,
+        96922,
+        91243,
+        97952
+      ]
+    },
+    {
+      "date": "2026-05-23",
+      "day_number": 32,
+      "seed": "355f9d",
+      "modifier": "time_machine",
+      "modifier_label": "Time Machine",
+      "day_name": "Daily #32",
+      "song_count": 5,
+      "song_ids": [
+        75906,
+        80268,
+        70506,
+        65849,
+        82387
+      ]
+    },
+    {
+      "date": "2026-05-24",
+      "day_number": 33,
+      "seed": "e56209",
+      "modifier": "reanimated",
+      "modifier_label": "Reanimated",
+      "day_name": "Daily #33",
+      "song_count": 5,
+      "song_ids": [
+        60808,
+        88253,
+        74968,
+        74994,
+        83355
+      ]
+    },
+    {
+      "date": "2026-05-25",
+      "day_number": 34,
+      "seed": "d08248",
+      "modifier": "class_reunion",
+      "modifier_label": "Class Reunion",
+      "day_name": "Daily #34",
+      "song_count": 5,
+      "song_ids": [
+        59399,
+        64645,
+        78636,
+        95918,
+        72208
+      ]
+    },
+    {
+      "date": "2026-05-26",
+      "day_number": 35,
+      "seed": "c74277",
+      "modifier": "leap_year",
+      "modifier_label": "Leap Year",
+      "day_name": "Daily #35",
+      "song_count": 5,
+      "song_ids": [
+        74113,
+        90223,
+        81974,
+        95619,
+        99367
+      ]
+    },
+    {
+      "date": "2026-05-27",
+      "day_number": 36,
+      "seed": "30fa32",
+      "modifier": "album_side",
+      "modifier_label": "Album Side",
+      "day_name": "GRIM AGE",
+      "song_count": 5,
+      "song_ids": [
+        88388,
+        88382,
+        88381,
+        88390,
+        88386
+      ]
+    },
+    {
+      "date": "2026-05-28",
+      "day_number": 37,
+      "seed": "2ff4d6",
+      "modifier": "discography",
+      "modifier_label": "Discography",
+      "day_name": "Daily #37",
+      "song_count": 5,
+      "song_ids": [
+        81301,
+        92599,
+        92597,
+        82548,
+        70619
+      ]
+    },
+    {
+      "date": "2026-05-29",
+      "day_number": 38,
+      "seed": "fc6e68",
+      "modifier": "compound_word",
+      "modifier_label": "Compound Word",
+      "day_name": "Daily #38",
+      "song_count": 5,
+      "song_ids": [
+        84215,
+        60858,
+        67825,
+        69983,
+        83983
+      ]
+    },
+    {
+      "date": "2026-05-30",
+      "day_number": 39,
+      "seed": "7f8168",
+      "modifier": "double_trouble",
+      "modifier_label": "Double Trouble",
+      "day_name": "Daily #39",
+      "song_count": 2,
+      "song_ids": [
+        99556,
+        99558
+      ]
+    }
+  ]
+}
