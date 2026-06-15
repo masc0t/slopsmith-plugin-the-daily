@@ -303,7 +303,9 @@ setTimeout(() => {
 
   const screenHtmlPath = path.join(__dirname, '..', 'screen.html');
   const screenHtml = fs.readFileSync(screenHtmlPath, 'utf8');
-  assert(screenHtml.includes('.ds-svg-lane-group:focus'), 'screen.html should have focus ring CSS for SVG nodes');
+  // The focusable element (tabindex="0") is the node group, so the focus ring
+  // must target .ds-svg-node-group:focus — that is the element keyboard nav lands on.
+  assert(screenHtml.includes('.ds-svg-node-group:focus'), 'screen.html should have focus ring CSS for the focusable SVG node groups');
 
   // Summary
   console.log('\n=== Summary ===');

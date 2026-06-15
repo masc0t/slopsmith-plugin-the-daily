@@ -37,6 +37,7 @@ const NODE_TYPE_ICONS = {
     "rest": "🛌",
     "shop": "🏪",
     "mystery": "?",
+    "choice": "◇",
     "boss": "👑",
 };
 
@@ -5562,6 +5563,49 @@ function _dsBuildShopRoom(THREE, overlay, d) {
     return { start: start, destroy: destroy };
 }
 
+// Cheap WebGL-capability probe. The dungeon's full-screen takeover hides the
+// rest of Slopsmith, so if the 3D context can't be created we must show a
+// recoverable, pure-DOM error rather than a black screen the user can't escape.
+function _dsWebGLAvailable() {
+    try {
+        const c = document.createElement('canvas');
+        return !!(window.WebGLRenderingContext &&
+            (c.getContext('webgl') || c.getContext('experimental-webgl')));
+    } catch (e) {
+        return false;
+    }
+}
+
+// Pure-DOM fatal overlay (no WebGL) with a guaranteed escape hatch. Used when
+// the 3D scene can't be built. Without this the ESC handler — which lives
+// inside the hub/dungeon scene that failed to build — never registers, trapping
+// the user on a black full-screen takeover.
+function _dsShowDungeonFatal(overlay, title, body) {
+    overlay.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.25rem;font-family:monospace;text-align:center;padding:2rem;';
+    wrap.innerHTML =
+        '<div style="font-size:2.5rem;">🎸</div>' +
+        '<div style="font-size:1.1rem;letter-spacing:.18em;color:#f87171;text-transform:uppercase;">' + title + '</div>' +
+        '<div style="max-width:34rem;font-size:.85rem;line-height:1.6;color:#94a3b8;">' + body + '</div>';
+    const btn = document.createElement('button');
+    btn.textContent = 'EXIT';
+    btn.style.cssText = 'margin-top:.5rem;padding:.6rem 2rem;border:1px solid #475569;background:#1e293b;color:#e2e8f0;font-family:monospace;letter-spacing:.2em;cursor:pointer;border-radius:.5rem;';
+    btn.onmouseenter = () => { btn.style.borderColor = '#94a3b8'; };
+    btn.onmouseleave = () => { btn.style.borderColor = '#475569'; };
+    const bail = () => {
+        window.removeEventListener('keydown', onKey, true);
+        try { dsDungeonExit(); } catch (e) {}
+        try { dsRender(); } catch (e) {}
+        try { dsShow('setlist'); } catch (e) {}
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); bail(); } };
+    btn.onclick = bail;
+    wrap.appendChild(btn);
+    overlay.appendChild(wrap);
+    window.addEventListener('keydown', onKey, true);
+}
+
 async function dsDungeonEnter(d) {
     let overlay = document.getElementById('ds-dungeon-overlay');
     if (!overlay) {
@@ -5577,9 +5621,16 @@ async function dsDungeonEnter(d) {
         try {
             _dsTHREE = await import('https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.min.js');
         } catch (e) {
-            overlay.innerHTML = '<div style="padding:2rem;color:#f87171;font-family:monospace;">ThreeJS failed to load.<br>Check your internet connection.</div>';
+            _dsShowDungeonFatal(overlay, 'Connection required',
+                "The Daily couldn't load its 3D engine. Check your internet connection and try again.");
             return;
         }
+    }
+
+    if (!_dsWebGLAvailable()) {
+        _dsShowDungeonFatal(overlay, 'Graphics unavailable',
+            "The Daily's dungeon needs WebGL, which your browser or device isn't providing right now. Enable hardware acceleration or try another browser to play today's run.");
+        return;
     }
 
     // Tear down any existing hub, dungeon, WoF Room, archive, or hall before entering the Hub.
@@ -5594,8 +5645,17 @@ async function dsDungeonEnter(d) {
     // through Hub and dungeon without restart between room transitions.
     if (_dsAudio) _dsAudio.init();
     if (_dsAudio) _dsAudio.setRoomMotif('hub');
-    _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-    _dsHub.start();
+    try {
+        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
+        _dsHub.start();
+    } catch (e) {
+        console.error('[daily] hub scene failed to build:', e);
+        _dsHub = null;
+        _dsShowDungeonFatal(overlay, 'Dungeon failed to load',
+            'Something went wrong building the 3D scene' +
+            (e && e.message ? ' (' + e.message + ').' : '.') +
+            ' Try reloading Slopsmith.');
+    }
 }
 
 function dsDungeonExit() {
@@ -5921,6 +5981,13 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
 function _dsBuildDungeon(THREE, container, d) {
     const map = d.map;
     const RENDER_W = 320, RENDER_H = 200;
+    // World scale: geometry is authored in small units, but Quake's physics
+    // constants are used *literally* (maxspeed 320, friction 4, cl_bob 0.02, …) —
+    // they only feel right at Quake's scale. The whole world renders inside a
+    // group scaled up to Quake units; the camera moves through it in raw Quake
+    // units. Geometry/props/doors keep their small literals (the group scales
+    // them); only camera-space quantities, light ranges, and fog are × WS.
+    const WS = 64;
 
     // Navigation state
     const state = {
@@ -5940,22 +6007,32 @@ function _dsBuildDungeon(THREE, container, d) {
     canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x000000, 9, 14);
-    const camera = new THREE.PerspectiveCamera(70, RENDER_W / RENDER_H, 0.1, 50);
-    camera.position.set(0, 0.3, 0);
+    // Everything except the camera lives under this scaled group (see WS above).
+    const world = new THREE.Group();
+    world.scale.setScalar(WS);
+    scene.add(world);
+    scene.fog = new THREE.Fog(0x000000, 9 * WS, 14 * WS);
+    // Quake default fov is 90 *horizontal*; three.js wants vertical fov. CalcFov
+    // (gl_screen.js): fov_y = atan(h / (w / tan(fov_x/2))) → 64° at 320×200.
+    const camera = new THREE.PerspectiveCamera(64, RENDER_W / RENDER_H, 4, 6000);
+    camera.position.set(0, 0.3 * WS, 0);
 
-    // Lights
+    // Lights live in the scaled world. PointLight.distance is world-space and is
+    // NOT scaled by the parent group's transform, so ranges are × WS by hand.
     const ambientLight = new THREE.AmbientLight(0x221109);
-    scene.add(ambientLight);
-    const torch1 = new THREE.PointLight(0xff6622, 2.2, 10);
+    world.add(ambientLight);
+    // decay 0: falloff windows smoothly to 0 at `distance` instead of inverse-
+    // square, so intensities tuned for the small geometry still light the world
+    // once distance is scaled by WS. (r155+ PointLight defaults to decay 2.)
+    const torch1 = new THREE.PointLight(0xff6622, 2.2, 10 * WS, 0);
     torch1.position.set(-1.6, 1.0, -2);
-    scene.add(torch1);
-    const torch2 = new THREE.PointLight(0xff6622, 1.8, 10);
+    world.add(torch1);
+    const torch2 = new THREE.PointLight(0xff6622, 1.8, 10 * WS, 0);
     torch2.position.set(1.6, 1.0, -5);
-    scene.add(torch2);
-    const doorGlow = new THREE.PointLight(0x1d4ed8, 2, 6);
+    world.add(torch2);
+    const doorGlow = new THREE.PointLight(0x1d4ed8, 2, 6 * WS, 0);
     doorGlow.position.set(0, 0.3, -8);
-    scene.add(doorGlow);
+    world.add(doorGlow);
 
     // ── Procedural stone texture ──────────────────────────────────────────────
     function stoneTexture(r, g, b, ru, rv) {
@@ -5999,11 +6076,12 @@ function _dsBuildDungeon(THREE, container, d) {
     // Wider corridor (CW=8) so multiple fanned doors at the back wall are visible
     // and turning to face them produces meaningful angle changes.
     const CW = 8, CH = 3, CL = 10, CY = 0.3;
+    const EYE = CY * WS;   // camera eye height in world (Quake) units
     const addPlane = (geo, mat, rx, ry, px, py, pz) => {
         const m = new THREE.Mesh(geo, mat);
         m.rotation.set(rx, ry, 0);
         m.position.set(px, py, pz);
-        scene.add(m);
+        world.add(m);
         return m;
     };
     const roomMeshes = {};
@@ -6347,12 +6425,12 @@ function _dsBuildDungeon(THREE, container, d) {
 
     // Perimeter torch lights for boss room — initially unlit; slice 007 ignites them
     const bossPerimTorches = [
-        new THREE.PointLight(0xff4411, 0, 7),
-        new THREE.PointLight(0xff4411, 0, 7),
-        new THREE.PointLight(0xff4411, 0, 7),
-        new THREE.PointLight(0xff4411, 0, 7),
+        new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
+        new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
+        new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
+        new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
     ];
-    bossPerimTorches.forEach(l => scene.add(l));
+    bossPerimTorches.forEach(l => world.add(l));
     // Expose for slice 007 boss-clear celebration
     window._dsDungeonBossTorches = bossPerimTorches;
 
@@ -6361,8 +6439,8 @@ function _dsBuildDungeon(THREE, container, d) {
     let campfireLight = null;
 
     function clearRoomProp() {
-        if (roomProp) { scene.remove(roomProp); disposeMeshGroup(roomProp); roomProp = null; }
-        if (campfireLight) { scene.remove(campfireLight); campfireLight = null; }
+        if (roomProp) { world.remove(roomProp); disposeMeshGroup(roomProp); roomProp = null; }
+        if (campfireLight) { world.remove(campfireLight); campfireLight = null; }
     }
 
     function disposeMeshGroup(obj) {
@@ -6563,7 +6641,7 @@ function _dsBuildDungeon(THREE, container, d) {
         });
 
         // Warm point light above the pile — gold glow on surrounding walls
-        const pileGlow = new THREE.PointLight(0xffcc44, 1.6, 5.0);
+        const pileGlow = new THREE.PointLight(0xffcc44, 1.6, 5.0 * WS, 0);
         pileGlow.position.set(0, pileY + 0.55, pz);
         g.add(pileGlow);
 
@@ -6626,7 +6704,7 @@ function _dsBuildDungeon(THREE, container, d) {
         });
 
         // Altar glow light — violet, slow pulse driven by render loop
-        const altarGlow = new THREE.PointLight(0x9940f0, 1.0, 6.0);
+        const altarGlow = new THREE.PointLight(0x9940f0, 1.0, 6.0 * WS, 0);
         altarGlow.position.set(0, floorY + 0.90, altarZ);
         g.add(altarGlow);
         g._altarGlow = altarGlow;
@@ -6758,7 +6836,7 @@ function _dsBuildDungeon(THREE, container, d) {
         });
 
         // Warm focal light above the counter
-        const counterGlow = new THREE.PointLight(0xffcc88, 2.2, 4.5);
+        const counterGlow = new THREE.PointLight(0xffcc88, 2.2, 4.5 * WS, 0);
         counterGlow.position.set(0, floorY + 2.0, counterZ);
         g.add(counterGlow);
 
@@ -6796,7 +6874,7 @@ function _dsBuildDungeon(THREE, container, d) {
         bossPerimTorches.forEach(l => { l.intensity = 0; });
         doorGlow.intensity = 2;
         if (nodeType === 'forced') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = forcedWallMat;
             roomMeshes.wallR.material = forcedWallMat;
@@ -6809,9 +6887,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x1d4ed8);
             roomProp = buildForcedProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'elite') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = eliteWallMat;
             roomMeshes.wallR.material = eliteWallMat;
@@ -6824,9 +6902,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x660000);
             roomProp = buildEliteProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'boss') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             const bossCleared = nodeId && getCleared().has(nodeId);
             applyRoomScale(true);
             roomMeshes.wallL.material = bossWallMat;
@@ -6842,9 +6920,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 5.5, CY - BH / 2 + 2.2, -2.5);
             doorGlow.color.setHex(0x660000);
             roomProp = buildBossProp(bossCleared);
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'treasure') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = treasureWallMat;
             roomMeshes.wallR.material = treasureWallMat;
@@ -6857,9 +6935,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0xd4a017);
             roomProp = buildTreasureProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'rest') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = restWallMat;
             roomMeshes.wallR.material = restWallMat;
@@ -6872,13 +6950,13 @@ function _dsBuildDungeon(THREE, container, d) {
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x6b3a10); doorGlow.intensity = 0.7;
-            campfireLight = new THREE.PointLight(0xff5810, 2.6, 9);
+            campfireLight = new THREE.PointLight(0xff5810, 2.6, 9 * WS, 0);
             campfireLight.position.set(0, CY - CH / 2 + 0.45, -3.2);
-            scene.add(campfireLight);
+            world.add(campfireLight);
             roomProp = buildRestProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'mystery') {
-            scene.fog.near = 5; scene.fog.far = 11;
+            scene.fog.near = 5 * WS; scene.fog.far = 11 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = mysteryWallMat;
             roomMeshes.wallR.material = mysteryWallMat;
@@ -6891,9 +6969,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x8b5cf6);
             roomProp = buildMysteryProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else if (nodeType === 'shop') {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             roomMeshes.wallL.material = shopWallMat;
             roomMeshes.wallR.material = shopWallMat;
@@ -6906,9 +6984,9 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0xd4a017);
             roomProp = buildShopProp();
-            scene.add(roomProp);
+            world.add(roomProp);
         } else {
-            scene.fog.near = 9; scene.fog.far = 14;
+            scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
             const [wl, wr, fl, cl, bk] = DEFAULT_MATS;
             roomMeshes.wallL.material = wl;
@@ -6944,8 +7022,15 @@ function _dsBuildDungeon(THREE, container, d) {
     canvasWrap.appendChild(minimapCanvas);
 
     const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'display:none;position:absolute;top:38%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
+    dirLabel.style.cssText = 'display:none;opacity:0;transition:opacity .18s ease;position:absolute;top:38%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
     canvasWrap.appendChild(dirLabel);
+
+    // One-time controls hint (mouselook needs a click to engage Pointer Lock).
+    const hintEl = document.createElement('div');
+    hintEl.textContent = 'CLICK TO LOOK · WASD MOVE · SHIFT RUN · E ENTER';
+    hintEl.style.cssText = 'position:absolute;bottom:64px;left:50%;transform:translateX(-50%);color:#7a7a7a;font-family:monospace;font-size:0.7rem;letter-spacing:.18em;z-index:4;pointer-events:none;text-shadow:0 0 6px #000;transition:opacity .4s ease;';
+    canvasWrap.appendChild(hintEl);
+    function hideHint() { if (hintEl) { hintEl.style.opacity = '0'; } }
 
     const exitBtn = document.createElement('button');
     exitBtn.textContent = '☰ MENU';
@@ -6965,17 +7050,22 @@ function _dsBuildDungeon(THREE, container, d) {
     const btnFwd = document.createElement('button');
     btnFwd.innerHTML = '▲';
     btnFwd.style.cssText = 'width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
-    btnFwd.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') moveForward(); };
+    // Touch/no-mouse fallback: hold ▲ to walk forward (toward whatever you face).
+    const _btnFwdHold = (v) => (ev) => { ev.preventDefault(); if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') keys.f = v; };
+    btnFwd.addEventListener('pointerdown', _btnFwdHold(true));
+    btnFwd.addEventListener('pointerup', _btnFwdHold(false));
+    btnFwd.addEventListener('pointerleave', _btnFwdHold(false));
+    btnFwd.addEventListener('pointercancel', _btnFwdHold(false));
     const navRow = document.createElement('div');
     navRow.style.cssText = 'display:flex;gap:4px;';
     const btnLeft = document.createElement('button');
     btnLeft.innerHTML = '◀';
     btnLeft.style.cssText = 'width:44px;height:44px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
-    btnLeft.onclick = () => { if (_dsAudio) _dsAudio.init(); cycleExit(-1); };
+    btnLeft.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') yaw += 0.35; };
     const btnRight = document.createElement('button');
     btnRight.innerHTML = '▶';
     btnRight.style.cssText = 'width:44px;height:44px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
-    btnRight.onclick = () => { if (_dsAudio) _dsAudio.init(); cycleExit(1); };
+    btnRight.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') yaw -= 0.35; };
     navRow.appendChild(btnLeft);
     navRow.appendChild(btnRight);
     navPad.appendChild(btnFwd);
@@ -7011,8 +7101,8 @@ function _dsBuildDungeon(THREE, container, d) {
     // camera physically moves toward that door's xz position.
     function rebuildDoors(edges) {
         for (const ds of doorState) {
-            scene.remove(ds.frame);
-            scene.remove(ds.fill);
+            world.remove(ds.frame);
+            world.remove(ds.fill);
             ds.frame.geometry.dispose();
             ds.fill.geometry.dispose();
             ds.fillM.dispose();
@@ -7029,11 +7119,11 @@ function _dsBuildDungeon(THREE, container, d) {
             const [col, emv] = DOOR_COL[tgt?.type] || [0x111111, 0x040404];
             const frame = new THREE.Mesh(new THREE.PlaneGeometry(1.7, 2.5), doorFrameMat);
             frame.position.set(x, CY, z + 0.01);
-            scene.add(frame);
+            world.add(frame);
             const fillM = new THREE.MeshLambertMaterial({ color: col, emissive: emv });
             const fill = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), fillM);
             fill.position.set(x, CY, z + 0.02);
-            scene.add(fill);
+            world.add(fill);
             doorState.push({ frame, fill, fillM, edge: edges[i], target: tgt, x, z: z + 0.02 });
         }
     }
@@ -7049,19 +7139,147 @@ function _dsBuildDungeon(THREE, container, d) {
         ambientLight.color.setHex(TYPE_TINT[nodeType] || 0x221109);
     }
 
-    // ── Camera facing (lookAt-based) ──────────────────────────────────────────
-    const lookTarget    = new THREE.Vector3(0, CY, -CL);
-    const curLookTarget = new THREE.Vector3(0, CY, -CL);
+    // ── Quake-style first-person controls ─────────────────────────────────────
+    // Control scheme ported from mrdoob/three-quake (src/in_web.js + pmove.js):
+    // Pointer-Lock mouselook with Quake's view-angle math, and WASD movement with
+    // Quake ground physics (PM_Friction + PM_Accelerate). The corridor is a real
+    // walkable box; reaching a doorway triggers the node transition that used to
+    // be an arrow-key selection.
+    const DEG2RAD = Math.PI / 180;
+    // Authentic Quake: angle delta = mouse * sensitivity(3) * m_yaw/m_pitch(0.022).
+    const LOOK_SENS = 0.022 * 3 * DEG2RAD;
+    const PITCH_MAX = 80 * DEG2RAD;            // Quake clamps pitch to ~±80°
+    // Literal Quake values — the world is sized to Quake units (WS), so these are
+    // used 1:1, not scaled. sv_maxspeed 320, sv_accelerate 10, sv_friction 4,
+    // sv_stopspeed 100.
+    const MOVE_MAXSPEED = 320, MOVE_ACCEL = 10, MOVE_FRICTION = 4;
+    const MOVE_STOPSPEED = 100;
+    // Run model: walk at cl_forwardspeed(200); +speed multiplies by
+    // cl_movespeedkey(2.0), capped at sv_maxspeed(320).
+    const MOVE_WALKSPEED = 200;
+    const RUN_MULT = 2.0;                       // cl_movespeedkey
+    // View bob — literal Quake V_CalcBob: cl_bob 0.02, cl_bobcycle 0.6, cl_bobup 0.5.
+    const CL_BOB = 0.02, CL_BOBCYCLE = 0.6, CL_BOBUP = 0.5;
+    // View roll — literal Quake V_CalcRoll: cl_rollangle 2°, cl_rollspeed 200.
+    const CL_ROLLANGLE = 2.0, CL_ROLLSPEED = 200;
+    // Interior collision bounds, in world (Quake) units — the small geometry
+    // literals × WS. Far wall (Z_FAR) holds the doors; Z_BACK is the recess behind
+    // the spawn; X_LIMIT keeps the player off the side walls.
+    const X_LIMIT = (CW / 2 - 0.5) * WS, Z_BACK = 1.0 * WS, Z_FAR = -(CL - 0.45) * WS, DOOR_HALF = 0.7 * WS;
+
+    let yaw = 0, pitch = 0;                     // radians; yaw 0 faces the doors (-z)
+    const vel = { x: 0, z: 0 };                 // floor-plane velocity (units/sec)
+    const keys = { f: false, b: false, l: false, r: false, run: false };
+    let mxAccum = 0, myAccum = 0;
+    let bobTime = 0, viewRoll = 0;              // V_CalcBob accumulator; current roll (rad)
+    let pointerLocked = false;
+    camera.rotation.order = 'YXZ';
+
+    function resetView() {
+        yaw = 0; pitch = 0; vel.x = 0; vel.z = 0;
+        mxAccum = 0; myAccum = 0; bobTime = 0; viewRoll = 0;
+        keys.f = keys.b = keys.l = keys.r = keys.run = false;
+        camera.position.set(0, EYE, 0);
+        camera.rotation.set(0, 0, 0);
+    }
 
     function selectedDoor() {
         if (!doorState.length) return null;
         return doorState[state.faceIdx % doorState.length];
     }
 
-    function setLookTargetForSelected() {
+    // Door the player is looking at most directly (smallest yaw difference) —
+    // drives the highlight + label, so with free mouselook the labelled door is
+    // the one in your gaze, not merely the nearest by x.
+    function nearestDoorIdx() {
+        let best = 0, bestDiff = Infinity;
+        for (let i = 0; i < doorState.length; i++) {
+            const d = doorState[i];
+            const yawTo = Math.atan2(-(d.x * WS - camera.position.x), -(d.z * WS - camera.position.z));
+            let diff = Math.abs(yaw - yawTo);
+            while (diff > Math.PI) diff = Math.abs(diff - 2 * Math.PI);
+            if (diff < bestDiff) { bestDiff = diff; best = i; }
+        }
+        return best;
+    }
+
+    // One Quake ground-move step: friction, then accelerate, then integrate and
+    // collide against the corridor. Walking into a door opening enters that node.
+    function moveStep(dt) {
+        const fwd = (keys.f ? 1 : 0) - (keys.b ? 1 : 0);
+        const strafe = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
+        const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+        // forward = (-sinY, -cosY); right = (cosY, -sinY)
+        let wx = -sinY * fwd + cosY * strafe;
+        let wz = -cosY * fwd - sinY * strafe;
+        const wlen = Math.hypot(wx, wz);
+        let wishspeed = 0;
+        if (wlen > 0) {
+            wx /= wlen; wz /= wlen;
+            // +speed (Shift) scales wishspeed by cl_movespeedkey, capped at maxspeed.
+            wishspeed = Math.min(keys.run ? MOVE_WALKSPEED * RUN_MULT : MOVE_WALKSPEED, MOVE_MAXSPEED);
+        }
+
+        // PM_Friction
+        const speed = Math.hypot(vel.x, vel.z);
+        if (speed > 0.0001) {
+            const control = speed < MOVE_STOPSPEED ? MOVE_STOPSPEED : speed;
+            const newspeed = Math.max(0, speed - control * MOVE_FRICTION * dt) / speed;
+            vel.x *= newspeed; vel.z *= newspeed;
+        } else { vel.x = 0; vel.z = 0; }
+
+        // PM_Accelerate
+        if (wishspeed > 0) {
+            const add = wishspeed - (vel.x * wx + vel.z * wz);
+            if (add > 0) {
+                const accel = Math.min(MOVE_ACCEL * dt * wishspeed, add);
+                vel.x += accel * wx; vel.z += accel * wz;
+            }
+        }
+
+        let nx = camera.position.x + vel.x * dt;
+        let nz = camera.position.z + vel.z * dt;
+
+        if (nz <= Z_FAR + 0.55 * WS) {
+            let entered = -1;
+            for (let i = 0; i < doorState.length; i++) {
+                if (Math.abs(nx - doorState[i].x * WS) <= DOOR_HALF) { entered = i; break; }
+            }
+            if (entered >= 0) { state.faceIdx = entered; enterDoor(); return; }
+            nz = Z_FAR + 0.55 * WS; vel.z = 0;  // solid wall between doors
+        }
+        if (nz > Z_BACK) { nz = Z_BACK; vel.z = 0; }
+        if (nx < -X_LIMIT) { nx = -X_LIMIT; vel.x = 0; }
+        if (nx >  X_LIMIT) { nx =  X_LIMIT; vel.x = 0; }
+        camera.position.x = nx;
+        camera.position.z = nz;
+
+        // View bob — literal Quake V_CalcBob (view.js): cycle phase advances with
+        // real time (asymmetric via cl_bobup), amplitude = speed × cl_bob, clamped.
+        bobTime += dt;
+        let cycle = (bobTime - Math.floor(bobTime / CL_BOBCYCLE) * CL_BOBCYCLE) / CL_BOBCYCLE;
+        if (cycle < CL_BOBUP) cycle = Math.PI * cycle / CL_BOBUP;
+        else cycle = Math.PI + Math.PI * (cycle - CL_BOBUP) / (1 - CL_BOBUP);
+        const gs = Math.hypot(vel.x, vel.z);
+        let bob = gs * CL_BOB;
+        bob = bob * 0.3 + bob * 0.7 * Math.sin(cycle);
+        bob = Math.max(-7, Math.min(4, bob));
+        camera.position.y = EYE + bob;
+
+        // View roll — direct port of V_CalcRoll: bank into lateral velocity.
+        let side = vel.x * cosY + vel.z * (-sinY);   // dot(velocity, right)
+        const sign = side < 0 ? -1 : 1;
+        side = Math.abs(side);
+        const rollDeg = (side < CL_ROLLSPEED ? side * CL_ROLLANGLE / CL_ROLLSPEED : CL_ROLLANGLE) * sign;
+        viewRoll = -rollDeg * DEG2RAD;   // negative: camera banks toward the strafe
+    }
+
+    // Begin the walk-through transition for the currently-aligned door.
+    function enterDoor() {
         const sel = selectedDoor();
-        if (sel) lookTarget.set(sel.x, CY, sel.z);
-        else     lookTarget.set(0, CY, -CL);
+        if (!sel || state.phase !== 'idle') return;
+        yaw = Math.atan2(-(sel.x * WS - camera.position.x), -(sel.z * WS - camera.position.z));
+        moveForward();
     }
 
     // ── Enter a node (rebuild doors + tint + room theme) ──────────────────────
@@ -7076,7 +7294,7 @@ function _dsBuildDungeon(THREE, container, d) {
         updateSelection();
     }
 
-    // ── Selection update (cycleExit / dismiss; no door rebuild) ───────────────
+    // ── Selection update (highlight the faced door; no door rebuild) ──────────
     function updateSelection() {
         const sel = selectedDoor();
         const multiExit = doorState.length > 1;
@@ -7094,10 +7312,8 @@ function _dsBuildDungeon(THREE, container, d) {
             doorGlow.color.setHex(col);
             doorGlow.position.set(sel.x * 0.6, 0.4, sel.z * 0.7);
             doorGlow.visible = true;
-            setLookTargetForSelected();
         } else {
             doorGlow.visible = false;
-            setLookTargetForSelected();
         }
 
         btnFwd.style.opacity   = sel ? '1' : '0.3';
@@ -7178,6 +7394,8 @@ function _dsBuildDungeon(THREE, container, d) {
     // ── Encounter ─────────────────────────────────────────────────────────────
     function showEncounter(nodeId) {
         state.phase = 'encounter';
+        // Release the mouse so the DOM encounter panel is clickable.
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         const n = nodeById(nodeId);
         if (!n) return;
 
@@ -7213,18 +7431,11 @@ function _dsBuildDungeon(THREE, container, d) {
         state.nextId = sel.edge;
         state.moveStartX = camera.position.x;
         state.moveStartZ = camera.position.z;
-        state.moveTargetX = sel.x;
-        state.moveTargetZ = sel.z;
+        state.moveTargetX = sel.x * WS;        // door coords are local; camera is world
+        state.moveTargetZ = sel.z * WS;
         state.phase = 'moving';
         state.moveTween = 0;
         state._lastStep = -1;
-    }
-
-    function cycleExit(dir) {
-        if (state.phase !== 'idle') return;
-        if (doorState.length <= 1) return;
-        state.faceIdx = ((state.faceIdx + dir) + doorState.length) % doorState.length;
-        updateSelection();
     }
 
     // ── RAF loop ──────────────────────────────────────────────────────────────
@@ -7235,13 +7446,6 @@ function _dsBuildDungeon(THREE, container, d) {
         state.rafId = requestAnimationFrame(loop);
         const dt = Math.min((now - prevTime) / 1000, 0.1);
         prevTime = now;
-
-        // Smooth camera lookAt toward selected door — turning is the *camera*
-        // pivoting, not the world rotating. Slower turn while walking so the
-        // movement reads as cautious / hesitant; snappier when idle so picking
-        // an exit still feels responsive.
-        const turnSpeed = state.phase === 'moving' ? 3.5 : 9;
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * turnSpeed));
 
         const flicker = Math.sin(now * 0.0023) * 0.4 + Math.sin(now * 0.0071) * 0.2;
         if (roomProp && roomProp._altarGlow) {
@@ -7258,52 +7462,73 @@ function _dsBuildDungeon(THREE, container, d) {
             campfireLight.intensity = 2.6 + fireFlicker;
         }
 
-        if (state.phase === 'moving') {
-            // 2.4s walk with cubic in/out — slow, cautious pacing for an
-            // eerie / scared feel. Going much faster makes the dungeon feel
-            // like a transport puzzle; this duration lets the player feel the
-            // distance to each door.
-            state.moveTween = Math.min(state.moveTween + dt / 3.0, 1);
+        if (state.phase === 'idle') {
+            // Apply accumulated Pointer-Lock mouse deltas to view angles (Quake).
+            if (mxAccum !== 0 || myAccum !== 0) {
+                yaw   -= mxAccum * LOOK_SENS;
+                pitch -= myAccum * LOOK_SENS;
+                if (pitch >  PITCH_MAX) pitch =  PITCH_MAX;
+                if (pitch < -PITCH_MAX) pitch = -PITCH_MAX;
+                mxAccum = 0; myAccum = 0;
+            }
+            moveStep(dt);   // may transition to 'moving' when a doorway is entered
+            // Highlight whichever door the player is lined up with.
+            if (state.phase === 'idle' && doorState.length) {
+                const ni = nearestDoorIdx();
+                if (ni !== (state.faceIdx % doorState.length)) { state.faceIdx = ni; updateSelection(); }
+                // The dir label is screen-pinned, so only reveal it while the
+                // player is actually looking toward that door (free mouselook).
+                const sel = doorState[state.faceIdx % doorState.length];
+                if (sel && dirLabel.style.display !== 'none') {
+                    const yawToDoor = Math.atan2(-(sel.x - camera.position.x), -(sel.z - camera.position.z));
+                    let diff = yaw - yawToDoor;
+                    while (diff >  Math.PI) diff -= 2 * Math.PI;
+                    while (diff < -Math.PI) diff += 2 * Math.PI;
+                    dirLabel.style.opacity = Math.abs(diff) < 0.5 ? '1' : '0';
+                }
+            }
+        } else if (state.phase === 'moving') {
+            // Walk-through transition: ~1.4s glide to the chosen door, then the
+            // encounter overlay covers the canvas while the new room is built.
+            state.moveTween = Math.min(state.moveTween + dt / 1.4, 1);
             const t = easeInOutCubic(state.moveTween);
             camera.position.x = state.moveStartX + (state.moveTargetX - state.moveStartX) * t;
             camera.position.z = state.moveStartZ + (state.moveTargetZ - state.moveStartZ) * t;
-            // Head bob: subtle, slow — small amplitude so it reads as careful
-            // footing rather than confident strides.
-            camera.position.y = CY + Math.sin(t * Math.PI * 4) * 0.022;
-            // Footstep scheduling — four stone steps across the walk
+            camera.position.y = EYE + Math.sin(t * Math.PI * 4) * 1.3;
             var stepIdx = Math.floor(state.moveTween * 4);
             if (stepIdx > (state._lastStep || -1)) {
                 state._lastStep = stepIdx;
                 if (_dsAudio) _dsAudio.playFootstep(0.5 + (stepIdx / 4) * 0.3);
             }
-
             if (state.moveTween >= 1) {
-                // Arrived — encounter overlay covers the canvas; rebuild scene
-                // for the new node behind it, then snap camera home. When user
-                // dismisses encounter, the new room (different doors, different
-                // tint) is visible without any fade trick.
                 state.phase = 'encounter';
                 if (_dsAudio) _dsAudio.playDoorOpen();
                 if (_dsAudio) _dsAudio.setRoomMotif(nodeById(state.nextId)?.type);
                 showEncounter(state.nextId);
                 enterNode(state.nextId);
                 state.nextId = null;
-                camera.position.set(0, CY, 0);
-                curLookTarget.copy(lookTarget);
+                resetView();
                 savePos();
             }
-        } else {
-            // Subtle idle breathing
-            camera.position.y = CY + Math.sin(now * 0.0015) * 0.008;
-            camera.position.x += (0 - camera.position.x) * Math.min(1, dt * 4);
-            camera.position.z += (0 - camera.position.z) * Math.min(1, dt * 4);
         }
 
-        camera.lookAt(curLookTarget);
+        // Roll only applies to free movement; scripted walk/encounter stay level.
+        camera.rotation.set(pitch, yaw, state.phase === 'idle' ? viewRoll : 0);
         renderer.render(scene, camera);
     }
 
-    // ── Input ─────────────────────────────────────────────────────────────────
+    // ── Input (Quake controls) ──────────────────────────────────────────────────
+    // WASD / arrows move (mouse turns), so left/right strafe rather than cycle.
+    function setMoveKey(e, down) {
+        switch (e.key) {
+            case 'w': case 'W': case 'ArrowUp':    keys.f = down; return true;
+            case 's': case 'S': case 'ArrowDown':  keys.b = down; return true;
+            case 'a': case 'A': case 'ArrowLeft':  keys.l = down; return true;
+            case 'd': case 'D': case 'ArrowRight': keys.r = down; return true;
+            case 'Shift': keys.run = down; return true;   // +speed (run)
+        }
+        return false;
+    }
     const onKey = (e) => {
         if (_dsAudio) _dsAudio.init();
         if (state.phase === 'encounter') {
@@ -7311,17 +7536,36 @@ function _dsBuildDungeon(THREE, container, d) {
             return;
         }
         if (e.key === 'Escape') {
-            _dsShowPauseMenu(d); e.preventDefault();
-        } else if (e.key === 'ArrowLeft' || e.key === 'a') {
-            cycleExit(-1); e.preventDefault();
-        } else if (e.key === 'ArrowRight' || e.key === 'd') {
-            cycleExit(1); e.preventDefault();
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ' || e.key === 'Enter') {
-            if (state.phase === 'idle') { moveForward(); e.preventDefault(); }
+            if (pointerLocked && document.exitPointerLock) document.exitPointerLock();
+            _dsShowPauseMenu(d); e.preventDefault(); return;
         }
+        // Interact with the current room (open its encounter) — only when offered.
+        if ((e.key === 'Enter' || e.key === 'e' || e.key === 'E') &&
+            state.phase === 'idle' && interactBtn.style.display !== 'none') {
+            showEncounter(state.nodeId); e.preventDefault(); return;
+        }
+        if (setMoveKey(e, true)) { hideHint(); e.preventDefault(); }
     };
+    const onKeyUp = (e) => { if (setMoveKey(e, false)) e.preventDefault(); };
+    const onMouseMove = (e) => {
+        if (!pointerLocked || state.phase !== 'idle') return;
+        mxAccum += e.movementX || 0;
+        myAccum += e.movementY || 0;
+    };
+    const onPointerLockChange = () => {
+        pointerLocked = (document.pointerLockElement === canvas);
+        if (pointerLocked) hideHint();
+    };
+    const onBlur = () => { keys.f = keys.b = keys.l = keys.r = keys.run = false; };
     window.addEventListener('keydown', onKey);
-    canvas.addEventListener('click', () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') moveForward(); });
+    window.addEventListener('keyup', onKeyUp);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    window.addEventListener('blur', onBlur);
+    canvas.addEventListener('click', () => {
+        if (_dsAudio) _dsAudio.init();
+        if (state.phase === 'idle' && !pointerLocked && canvas.requestPointerLock) canvas.requestPointerLock();
+    });
 
     // ── Public API ────────────────────────────────────────────────────────────
     function start() {
@@ -7333,7 +7577,7 @@ function _dsBuildDungeon(THREE, container, d) {
             if (!cl.size && !committed.size) {
                 // Fresh STS: run the RAF loop first so the corridor renders behind the picker
                 enterNode(state.nodeId);
-                curLookTarget.copy(lookTarget);
+                resetView();
                 prevTime = performance.now();
                 state.rafId = requestAnimationFrame(loop);
                 showLanePicker();
@@ -7355,7 +7599,7 @@ function _dsBuildDungeon(THREE, container, d) {
             savePos();
         }
         enterNode(state.nodeId);
-        curLookTarget.copy(lookTarget);
+        resetView();
         prevTime = performance.now();
         state.rafId = requestAnimationFrame(loop);
     }
@@ -7418,7 +7662,7 @@ function _dsBuildDungeon(THREE, container, d) {
             state.phase = 'idle';
             enterNode(nodeId);
             savePos();
-            curLookTarget.copy(lookTarget);
+            resetView();
             showEncounter(nodeId);
         };
         state.phase = 'encounter';
@@ -7427,10 +7671,15 @@ function _dsBuildDungeon(THREE, container, d) {
     function destroy() {
         if (state.rafId) cancelAnimationFrame(state.rafId);
         window.removeEventListener('keydown', onKey);
+        window.removeEventListener('keyup', onKeyUp);
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('pointerlockchange', onPointerLockChange);
+        window.removeEventListener('blur', onBlur);
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         window._dsDungeonDismiss = null;
         window._dsDungeonBossTorches = null;
         clearRoomProp();
-        bossPerimTorches.forEach(l => scene.remove(l));
+        bossPerimTorches.forEach(l => world.remove(l));
         rebuildDoors([]); // dispose any remaining door geometry/materials
         renderer.dispose();
         [wallMat, floorMat, ceilMat, backMat, doorFrameMat,
