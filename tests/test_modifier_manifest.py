@@ -134,11 +134,33 @@ class TestLoadModifierManifest(unittest.TestCase):
         result2 = _load_modifier_manifest("2026-04-22")
         self.assertEqual(result2, mock_manifest)
 
-    def test_offline_raises(self):
+    def test_offline_raises_without_bundled(self):
+        # Remote unreachable AND no bundled manifest in the given dir -> offline.
+        import tempfile
         routes._fetch_modifier_manifest = lambda: None
-        with self.assertRaises(RuntimeError) as cm:
-            _load_modifier_manifest("2026-04-22")
+        with tempfile.TemporaryDirectory() as empty_dir:
+            with self.assertRaises(RuntimeError) as cm:
+                _load_modifier_manifest("2026-04-22", plugin_dir=Path(empty_dir))
         self.assertEqual(str(cm.exception), "offline")
+
+    def test_offline_falls_back_to_bundled(self):
+        # Remote unreachable but a bundled manifest exists -> use it instead of
+        # hard-failing offline (mirrors the bundled songs_pool.json pool seed).
+        import tempfile
+        routes._fetch_modifier_manifest = lambda: None
+        bundled = {"stamps": [{"date": "2026-04-22", "min_plugin_version": None, "active": []}]}
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "modifiers-manifest.json").write_text(json.dumps(bundled), encoding="utf-8")
+            result = _load_modifier_manifest("2026-04-22", plugin_dir=Path(d))
+        self.assertEqual(result, bundled)
+
+    def test_real_bundled_manifest_is_valid(self):
+        # The shipped modifiers-manifest.json must be loadable so offline installs
+        # have a working fallback. Guards against it going missing/corrupt.
+        routes._fetch_modifier_manifest = lambda: None
+        result = _load_modifier_manifest("2026-04-22")
+        self.assertIn("stamps", result)
+        self.assertTrue(len(result["stamps"]) > 0)
 
     def test_fetches_on_miss(self):
         mock_manifest = {"stamps": [{"date": "2026-05-01", "min_plugin_version": None, "active": []}]}

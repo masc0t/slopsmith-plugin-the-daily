@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import urllib.request
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -302,7 +302,12 @@ def _get_purchase_time(install_id: str, item_id: str):
     if not row:
         return None
     try:
-        return datetime.fromisoformat(row[0])
+        dt = datetime.fromisoformat(row[0])
+        # Normalize to naive UTC so callers can compare against datetime.utcnow()
+        # (the codebase's naive-UTC convention) without tz-mismatch errors.
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except Exception:
         return None
 
@@ -746,8 +751,14 @@ def _fetch_modifier_manifest() -> dict | None:
         return None
 
 
-def _load_modifier_manifest(date_str: str) -> dict:
-    """Load modifier manifest for a date, using cache or fetching."""
+def _load_modifier_manifest(date_str: str, plugin_dir: Path | None = None) -> dict:
+    """Load modifier manifest for a date, using cache or fetching.
+
+    Falls back to the bundled modifiers-manifest.json (shipped with the plugin,
+    like songs_pool.json is for the pool) when the remote fetch fails and nothing
+    is cached. Without this, an install that can't reach the release hard-fails
+    "offline" even though it has everything needed to run today's daily.
+    """
     conn = _get_conn()
 
     row = conn.execute(
@@ -757,16 +768,26 @@ def _load_modifier_manifest(date_str: str) -> dict:
         return json.loads(row[0])
 
     manifest = _fetch_modifier_manifest()
-    if manifest is None:
-        raise RuntimeError("offline")
+    if manifest is not None:
+        with _lock:
+            conn.execute(
+                "INSERT OR REPLACE INTO modifier_manifest_cache (date, manifest, fetched_at) VALUES (?, ?, ?)",
+                (date_str, json.dumps(manifest), datetime.utcnow().isoformat())
+            )
+            conn.commit()
+        return manifest
 
-    with _lock:
-        conn.execute(
-            "INSERT OR REPLACE INTO modifier_manifest_cache (date, manifest, fetched_at) VALUES (?, ?, ?)",
-            (date_str, json.dumps(manifest), datetime.utcnow().isoformat())
-        )
-        conn.commit()
-    return manifest
+    # Remote unreachable and nothing cached — fall back to the bundled manifest.
+    # Not cached, so a later successful remote fetch can still supersede it.
+    bundled_path = (plugin_dir or Path(__file__).parent) / "modifiers-manifest.json"
+    if bundled_path.exists():
+        try:
+            with open(bundled_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    raise RuntimeError("offline")
 
 
 def _resolve_modifier_stamp(manifest: dict, date_str: str) -> dict:
@@ -2153,7 +2174,11 @@ def _get_client_ip(request):
     xff = request.headers.get("X-Forwarded-For")
     if xff:
         return xff.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+    # Starlette/FastAPI Request exposes the peer via request.client, not the
+    # Flask-style request.remote_addr. request.client is None for some ASGI
+    # transports (e.g. TestClient without a client triple), so guard it.
+    client = getattr(request, "client", None)
+    return (client.host if client else None) or "unknown"
 
 
 def _validate_display_name(name):
@@ -2510,6 +2535,14 @@ def setup(app, context):
 
         conn = _get_conn()
         plugin_dir = Path(__file__).parent
+        # The active modifier list is needed by build_payload() below to resolve a
+        # stored modifier id to its label/description/icon. Fetch once at function
+        # scope; fall back to an empty list (build_payload defaults gracefully) if
+        # the manifest is unreachable so historical/cached rows still render.
+        try:
+            active = _get_active_modifier(date_str)
+        except RuntimeError:
+            active = []
         # Historical locally-generated setlist (seed-based) when data is not in DB
         def _generate_historical_setlist(target_date_str: str):
             try:
@@ -3321,11 +3354,16 @@ def setup(app, context):
                     except Exception:
                         equipped = {}
                     removed = set(reversed_items)
-                    cosmetics = [c for c in cosmetics if c not in removed]
+                    # cosmetics is a list of {"id", "purchased_at"} objects (with
+                    # possible legacy bare-string entries); compare by id.
+                    cosmetics = [
+                        c for c in cosmetics
+                        if (c.get("id") if isinstance(c, dict) else c) not in removed
+                    ]
                     equipped = {slot: item for slot, item in equipped.items() if item not in removed}
                     conn.execute(
                         "UPDATE daily_inventory SET cosmetics = ?, equipped = ? WHERE install_id = ?",
-                        (json.dumps(sorted(set(cosmetics))), json.dumps(equipped), install_id),
+                        (json.dumps(cosmetics), json.dumps(equipped), install_id),
                     )
                 conn.execute(
                     "DELETE FROM daily_purchases WHERE install_id = ? AND substr(purchased_at, 1, 10) = ?",
@@ -3348,7 +3386,8 @@ def setup(app, context):
         conn = _get_conn()
         inv = _inventory_payload(conn, install_id) if install_id else {"tokens": 0, "cosmetics": [], "equipped": {}}
         tokens = inv["tokens"]
-        owned = set(inv["cosmetics"])
+        # cosmetics are {"id", "purchased_at"} objects (legacy bare strings tolerated).
+        owned = {c["id"] if isinstance(c, dict) else c for c in inv["cosmetics"]}
         equipped = inv.get("equipped", {})
         equipped_ids = set(equipped.values()) if equipped else set()
 
@@ -3362,7 +3401,7 @@ def setup(app, context):
                 "owned": cid in owned,
                 "equipped": cid in equipped_ids,
                 "affordable": tokens >= c["cost"],
-                "purchased_at": next((x["purchased_at"] for x in inv.get("cosmetics", []) if x["id"] == cid), None),
+                "purchased_at": next((x.get("purchased_at") for x in inv.get("cosmetics", []) if isinstance(x, dict) and x.get("id") == cid), None),
             })
         for cid, c in CONSUMABLES.items():
             items.append({
@@ -3412,17 +3451,26 @@ def setup(app, context):
                 (install_id,)
             ).fetchone()
             tokens = inv[0] if inv else 0
-            owned = set(json.loads(inv[1])) if inv and inv[1] else set()
+            # Cosmetics are stored as a list of objects: [{"id", "purchased_at"}].
+            # Normalize any legacy bare-string entries to the object shape.
+            owned_list = [
+                c if isinstance(c, dict) else {"id": c}
+                for c in (json.loads(inv[1]) if inv and inv[1] else [])
+            ]
+            owned_ids = {c["id"] for c in owned_list}
 
-            if cosmetic and item_id in owned:
+            if cosmetic and item_id in owned_ids:
                 return {"error": "Already owned"}
             if tokens < cost:
                 return {"error": "Insufficient tokens"}
 
             new_tokens = tokens - cost
             if cosmetic:
-                owned.add(item_id)
-                cosmetics_blob = json.dumps(sorted(owned))
+                owned_list.append({
+                    "id": item_id,
+                    "purchased_at": datetime.utcnow().date().isoformat(),
+                })
+                cosmetics_blob = json.dumps(owned_list)
                 conn.execute("""
                     INSERT INTO daily_inventory (install_id, tokens, cosmetics) VALUES (?, ?, ?)
                     ON CONFLICT(install_id) DO UPDATE SET tokens = ?, cosmetics = ?
@@ -3471,15 +3519,20 @@ def setup(app, context):
             if not inv:
                 return {"error": "Inventory not found"}
             tokens = inv[0]
-            owned = set(json.loads(inv[1]) if inv[1] else [])
-            if item_id not in owned:
+            owned_list = [
+                c if isinstance(c, dict) else {"id": c}
+                for c in (json.loads(inv[1]) if inv[1] else [])
+            ]
+            owned_ids = {c["id"] for c in owned_list}
+            if item_id not in owned_ids:
                 return {"error": "Item not owned"}
-            owned.discard(item_id)
+            owned_list = [c for c in owned_list if c.get("id") != item_id]
             new_tokens = tokens + cosmetic["cost"]
+            cosmetics_blob = json.dumps(owned_list)
             conn.execute("""
                 INSERT INTO daily_inventory (install_id, tokens, cosmetics) VALUES (?, ?, ?)
                 ON CONFLICT(install_id) DO UPDATE SET tokens = ?, cosmetics = ?
-            """, (install_id, new_tokens, json.dumps(sorted(owned)), new_tokens, json.dumps(sorted(owned))))
+            """, (install_id, new_tokens, cosmetics_blob, new_tokens, cosmetics_blob))
             conn.execute(
                 "INSERT INTO daily_token_ledger (install_id, date, delta, reason) VALUES (?, ?, ?, ?)",
                 (install_id, datetime.utcnow().date().isoformat(), cosmetic["cost"], f"refund:{item_id}")
