@@ -1,5 +1,7 @@
 # The Daily as static daily ritual
 
+> **Revised in part by [ADR 0010](0010-quake-first-person-controls.md).** This ADR's "Ceremony is the point" stance treated abstract movement tweens as load-bearing ritual. Under ADR 0010, movement *within* a room is now player-driven (Quake mouselook + WASD), while the *between-room* tweens, the Hub-to-Today commitment, and the boss-clear two-beat remain non-skippable ceremony. The no-skip-path and cosmetic-projection stances survive; corridors become *lightly* navigational (walk to the door you want) but still do not encode topology, and the minimap is still the macro-navigation tool.
+
 ADR 0007 chose to replace the SVG map with a first-person dungeon. ADR 0008 placed that dungeon inside a Quake-style Hub and committed every screen to live in-world via diegetic surfaces. Both ADRs answered *what to build* and *where things go*. Neither answered *what kind of experience The Daily is asking the player to commit to*. As we sized the cumulative scope (Hub, Archive, six themed room types, audio, no 2D fallback) it became clear the experiential framing — "the dungeon is the only way in, every day, forever, identical" — is itself a load-bearing decision with real alternatives that were explicitly considered and rejected. Recording those trade-offs.
 
 ## Decision

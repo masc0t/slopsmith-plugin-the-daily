@@ -1,5 +1,7 @@
 # ThreeJS first-person dungeon replaces SVG map
 
+> **Superseded in part by [ADR 0010](0010-quake-first-person-controls.md).** The "Movement model" and "Navigation" sections below — abstract tween-to-node movement, the camera auto-facing a selected door, and left/right arrow exit-cycling — are replaced by Quake first-person controls (Pointer Lock mouselook + WASD with Quake ground physics). The renderer, visual style, cosmetic-projection geometry, minimap, encounter overlay, and full-screen takeover described here all remain in force.
+
 The Daily's map was a 2D SVG graph — nodes as circles, edges as lines, row/col grid. It worked but wasn't a game. The intent is to turn The Daily into an actual game within Slopsmith: a first-person dungeon crawler where the player walks through rooms (nodes) and plays songs as encounters. We replaced the SVG renderer with a ThreeJS first-person view styled after 90s Doom-era crawlers.
 
 ## Decision
