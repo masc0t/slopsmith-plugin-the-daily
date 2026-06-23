@@ -135,6 +135,38 @@ class TestFieldLenGte(unittest.TestCase):
         self.assertFalse(_eval_predicate(song, pred))
 
 
+class TestWordCount(unittest.TestCase):
+    def test_exact_two_words(self):
+        song = {"title": "Human Sadness"}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertTrue(_eval_predicate(song, pred))
+
+    def test_one_word_fails(self):
+        song = {"title": "Dare"}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertFalse(_eval_predicate(song, pred))
+
+    def test_three_words_fails(self):
+        song = {"title": "Death and Glitz"}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertFalse(_eval_predicate(song, pred))
+
+    def test_collapses_extra_whitespace(self):
+        song = {"title": "  Gone   With  "}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertTrue(_eval_predicate(song, pred))
+
+    def test_missing_field_treated_as_empty(self):
+        song = {}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertFalse(_eval_predicate(song, pred))
+
+    def test_none_field_treated_as_empty(self):
+        song = {"title": None}
+        pred = {"op": "word_count", "field": "title", "n": 2}
+        self.assertFalse(_eval_predicate(song, pred))
+
+
 class TestFieldCase(unittest.TestCase):
     def test_upper_match(self):
         song = {"title": "HELLO"}

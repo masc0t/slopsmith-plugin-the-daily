@@ -9,7 +9,6 @@
   "scripts": {
     "test": "npm run test:python && npm run test:e2e",
     "test:python": "python -m coverage run -m unittest discover tests && python -m coverage report --include=routes.py",
-    "test:e2e": "npx playwright test",
-    "test:map": "node tests/map_render_test.js"
+    "test:e2e": "npx playwright test"
   }
 }

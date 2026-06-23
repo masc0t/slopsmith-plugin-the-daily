@@ -218,6 +218,10 @@ def _eval_predicate(song: dict, predicate: dict) -> bool:
         field = predicate.get("field", "")
         n = predicate.get("n", 0)
         return len(song.get(field, "")) >= n
+    if op == "word_count":
+        field = predicate.get("field", "")
+        n = predicate.get("n", 0)
+        return len((song.get(field, "") or "").split()) == n
     if op == "field_case":
         field = predicate.get("field", "")
         test = predicate.get("test", "")
@@ -498,6 +502,17 @@ def _get_conn():
     if _conn is None:
         _conn = sqlite3.connect(_db_path, check_same_thread=False)
         _conn.execute("PRAGMA journal_mode=WAL")
+        # Cache tables that were re-keyed over time (e.g. pool_cache → pool_stamp
+        # PK, ADR 0005). Old installs predate the key column and CREATE IF NOT
+        # EXISTS won't migrate them. Drop stale ones so the CREATE below rebuilds
+        # them current — safe, they're caches repopulated on the next fetch.
+        for _tbl, _keycol in (("pool_cache", "pool_stamp"),):
+            try:
+                _cols = {r[1] for r in _conn.execute(f"PRAGMA table_info({_tbl})").fetchall()}
+                if _cols and _keycol not in _cols:
+                    _conn.execute(f"DROP TABLE {_tbl}")
+            except sqlite3.OperationalError:
+                pass
         _conn.executescript("""
             CREATE TABLE IF NOT EXISTS daily_setlists (
                 date       TEXT PRIMARY KEY,
@@ -571,6 +586,7 @@ def _get_conn():
             );
         """)
         _ensure_column(_conn, "daily_setlists", "map", "TEXT")
+        _ensure_column(_conn, "daily_setlists", "pool_stamp", "TEXT")
         _ensure_column(_conn, "daily_completions", "node_id", "TEXT")
         _ensure_column(_conn, "daily_completions", "install_id", "TEXT")
         _ensure_column(_conn, "daily_completions", "committed_lane", "TEXT")
@@ -2380,6 +2396,27 @@ def setup(app, context):
     _db_path = str(config_dir / "the_daily.db")
     meta_db = context["meta_db"]
     plugin_dir = Path(__file__).parent
+    get_dlc_dir = context["get_dlc_dir"]
+    extract_meta = context["extract_meta"]
+    _host_download = context["load_sibling"]("host_download")
+    _unlock_cache = context["load_sibling"]("unlock_cache")
+    _log = context.get("log")
+
+    _tex_dir = plugin_dir / "static" / "textures"
+
+    @app.get("/api/plugins/the_daily/tex/{name}")
+    def get_texture(name: str):
+        # Serve curated dungeon textures (COMTEX-derived PNGs). Strict:
+        # bare filename only, must resolve inside static/textures, .png only.
+        from fastapi.responses import FileResponse
+        from fastapi import HTTPException
+        if not re.fullmatch(r"[A-Za-z0-9_]+\.png", name or ""):
+            raise HTTPException(status_code=404, detail="not found")
+        target = (_tex_dir / name).resolve()
+        if _tex_dir.resolve() not in target.parents or not target.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(str(target), media_type="image/png",
+                            headers={"Cache-Control": "public, max-age=86400"})
 
     @app.get("/api/plugins/the_daily/today")
     def get_today(request: Request):
@@ -2702,6 +2739,210 @@ def setup(app, context):
             return {"error": "No setlist for this date yet"}, 404
         # Otherwise, no data for this date
         return {"error": "No setlist for this date yet"}, 404
+
+    def _auto_complete_node(conn, today, cf_id, node_id, install_id):
+        """Clear a Room without playing it — used for Reported Items so a
+        non-acquirable song never traps a choice-based path (ADR 0011)."""
+        with _lock:
+            if node_id:
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_node_commits (install_id, date, node_id, cf_id) VALUES (?, ?, ?, ?)",
+                    (install_id or "anonymous", today, node_id, cf_id))
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_completions (date, cf_id, node_id, install_id) VALUES (?, ?, ?, ?)",
+                    (today, cf_id, node_id, install_id))
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_completions (date, cf_id) VALUES (?, ?)",
+                    (today, cf_id))
+            conn.commit()
+
+    def _index_acquired(filepath):
+        """Index a freshly-downloaded PSARC into meta_db so has_locally flips
+        immediately — the auto-rescan half of the Manual Floor."""
+        try:
+            dlc = get_dlc_dir()
+            meta = extract_meta(Path(filepath))
+            st = os.stat(filepath)
+            try:
+                rel = os.path.relpath(filepath, str(dlc)).replace("\\", "/")
+            except Exception:
+                rel = os.path.basename(filepath)
+            meta_db.put(rel, st.st_mtime, st.st_size, meta)
+            return True
+        except Exception:
+            if _log:
+                _log.exception("the_daily: failed to index acquired file %s", filepath)
+            return False
+
+    @app.post("/api/plugins/the_daily/acquire")
+    def acquire_song(data: dict):
+        """Acquire a song's PSARC for a Room (ADR 0011).
+
+        resolve(cf_id) -> hit  -> download from Host URL
+                                    ok       -> index + contribute -> playable
+                                    reported -> report + auto-complete Room
+                                    needs_webview -> desktop webview must fetch
+                                    failed   -> Manual Floor
+                       -> reported -> auto-complete Room
+                       -> miss     -> Manual Floor (human Capture on CF)
+        """
+        cf_id = data.get("cf_id")
+        node_id = data.get("node_id")
+        install_id = _client_install_id(data=data)
+        if not cf_id:
+            return {"error": "cf_id required"}
+        cf_id = int(cf_id)
+        today = _get_today().isoformat()
+        conn = _get_conn()
+
+        row = conn.execute(
+            "SELECT songs FROM daily_setlists WHERE date = ?", (today,)).fetchone()
+        if not row:
+            return {"error": "No setlist for today"}
+        songs = json.loads(row[0]) if row[0] else []
+        song = next((s for s in songs if int(s.get("cf_id") or -1) == cf_id), None)
+        cf_url = (song or {}).get("cf_url") or \
+            f"https://ignition4.customsforge.com/cdlc/{cf_id}"
+
+        # Already installed? Nothing to do.
+        if song and _find_locally(meta_db, song):
+            return {"status": "have", "cf_id": cf_id}
+
+        dlc_dir = get_dlc_dir()
+        if not dlc_dir:
+            return {"error": "DLC directory not configured"}
+
+        cached = _unlock_cache.resolve(conn, cf_id, SUPABASE_URL, SUPABASE_ANON_KEY)
+
+        if cached["status"] == "reported":
+            _auto_complete_node(conn, today, cf_id, node_id, install_id)
+            return {"status": "reported", "auto_completed": True, "cf_id": cf_id}
+
+        if cached["status"] == "miss":
+            return {"status": "manual", "cf_id": cf_id, "cf_url": cf_url,
+                    "dlc_dir": str(dlc_dir)}
+
+        # hit — fetch from the Unlocked Host URL
+        host_url = cached["host_url"]
+        result = _host_download.acquire_from_host_url(host_url, str(dlc_dir))
+
+        if result["status"] == "ok":
+            filepath = os.path.join(str(dlc_dir), result["filename"])
+            indexed = _index_acquired(filepath)
+            sha = _unlock_cache.sha256_of(filepath)
+            _unlock_cache.contribute(conn, cf_id, host_url,
+                                     filename=result["filename"], sha256=sha,
+                                     sb_url=SUPABASE_URL, sb_key=SUPABASE_ANON_KEY)
+            return {"status": "acquired", "cf_id": cf_id,
+                    "filename": result["filename"],
+                    "provider": cached.get("provider"), "playable": indexed}
+
+        if result["status"] == "reported":
+            _unlock_cache.report(conn, cf_id, host_url,
+                                 sb_url=SUPABASE_URL, sb_key=SUPABASE_ANON_KEY)
+            _auto_complete_node(conn, today, cf_id, node_id, install_id)
+            return {"status": "reported", "auto_completed": True, "cf_id": cf_id}
+
+        if result["status"] == "needs_webview":
+            return {"status": "needs_webview", "cf_id": cf_id,
+                    "provider": result.get("provider"), "url": result.get("url"),
+                    "cf_url": cf_url, "dlc_dir": str(dlc_dir)}
+
+        # failed — recoverable; degrade to Manual Floor.
+        return {"status": "manual", "cf_id": cf_id, "cf_url": cf_url,
+                "dlc_dir": str(dlc_dir), "error": result.get("error")}
+
+    def _ensure_in_dlc(filepath, dlc_dir):
+        """If a captured file landed outside the DLC dir (e.g. the desktop saved
+        it to Downloads), move it in so the library scan can see it."""
+        try:
+            dlc = os.path.abspath(str(dlc_dir))
+            fp = os.path.abspath(filepath)
+            if os.path.commonpath([dlc, fp]) == dlc:
+                return fp
+            import shutil
+            dest = os.path.join(dlc, os.path.basename(fp))
+            shutil.move(fp, dest)
+            return dest
+        except Exception:
+            return filepath
+
+    @app.post("/api/plugins/the_daily/capture")
+    def capture_song(data: dict):
+        """Finalize a Capture (ADR 0011): a Host URL — and, from the desktop
+        webview, an already-downloaded file — becomes a validated PSARC in the
+        DLC dir plus an Unlock contribution that frees the song for everyone.
+
+        Desktop sends save_path (file already on disk from the webview Capture);
+        the browser/paste path sends just host_url and we fetch it server-side.
+        """
+        cf_id = data.get("cf_id")
+        node_id = data.get("node_id")
+        host_url = data.get("host_url")
+        save_path = data.get("save_path")
+        install_id = _client_install_id(data=data)
+        if not cf_id:
+            return {"error": "cf_id required"}
+        cf_id = int(cf_id)
+        if not host_url and not save_path:
+            return {"error": "host_url or save_path required"}
+        today = _get_today().isoformat()
+        conn = _get_conn()
+        dlc_dir = get_dlc_dir()
+        if not dlc_dir:
+            return {"error": "DLC directory not configured"}
+
+        # Resolve a local file: the desktop already saved one, else fetch the URL.
+        final_path = None
+        if save_path and os.path.isfile(save_path):
+            final_path = save_path
+        elif host_url:
+            result = _host_download.acquire_from_host_url(host_url, str(dlc_dir))
+            if result["status"] == "ok":
+                final_path = os.path.join(str(dlc_dir), result["filename"])
+            elif result["status"] == "reported":
+                _unlock_cache.report(conn, cf_id, host_url,
+                                     sb_url=SUPABASE_URL, sb_key=SUPABASE_ANON_KEY)
+                _auto_complete_node(conn, today, cf_id, node_id, install_id)
+                return {"status": "reported", "auto_completed": True, "cf_id": cf_id}
+            elif result["status"] == "needs_webview":
+                return {"status": "needs_webview", "cf_id": cf_id,
+                        "provider": result.get("provider"), "url": result.get("url")}
+            else:
+                return {"status": "manual", "cf_id": cf_id, "error": result.get("error")}
+        if not final_path or not os.path.isfile(final_path):
+            return {"status": "manual", "cf_id": cf_id, "error": "no file"}
+
+        # Validate it's a trustworthy PSARC; a non-PSARC (.zip, …) is a Reported
+        # Item — drop it and auto-complete the Room so the path isn't trapped.
+        try:
+            with open(final_path, "rb") as f:
+                head = f.read(8)
+        except OSError as e:
+            return {"status": "manual", "cf_id": cf_id, "error": str(e)}
+        verdict = _host_download._classify(os.path.basename(final_path), head)
+        if verdict["status"] != "ok":
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+            if host_url:
+                _unlock_cache.report(conn, cf_id, host_url,
+                                     sb_url=SUPABASE_URL, sb_key=SUPABASE_ANON_KEY)
+            _auto_complete_node(conn, today, cf_id, node_id, install_id)
+            return {"status": "reported", "auto_completed": True, "cf_id": cf_id}
+
+        # Land it in the DLC dir, index it (has_locally flips), Unlock for all.
+        final_path = _ensure_in_dlc(final_path, dlc_dir)
+        indexed = _index_acquired(final_path)
+        if host_url:
+            sha = _unlock_cache.sha256_of(final_path)
+            _unlock_cache.contribute(conn, cf_id, host_url,
+                                     filename=os.path.basename(final_path), sha256=sha,
+                                     sb_url=SUPABASE_URL, sb_key=SUPABASE_ANON_KEY)
+        return {"status": "acquired", "cf_id": cf_id,
+                "filename": os.path.basename(final_path), "playable": indexed}
 
     MIN_PLAY_DURATION = 30  # seconds required to mark song as complete
 
@@ -4115,8 +4356,25 @@ def setup(app, context):
                 (today, cf_id, node_id, install_id),
             )
             conn.commit()
-        
-        return {"ok": True, "cleared": True}
+
+        # Return the recomputed map state (+ inventory) so the client can unseal
+        # the room's exits in place — same shape /mark returns — instead of doing
+        # a full /today refetch and dungeon rebuild (which flashes the unseal off
+        # screen). Falls back gracefully: a missing map just omits the state keys.
+        resp = {"ok": True, "cleared": True}
+        row = conn.execute(
+            "SELECT map FROM daily_setlists WHERE date = ?", (today,)
+        ).fetchone()
+        map_data = json.loads(row[0]) if row and row[0] else None
+        if map_data:
+            state = _map_available_state(conn, today, map_data, install_id)
+            resp.update(state)
+            resp["inventory"] = _inventory_payload(conn, install_id)
+            resp["progress"] = {
+                "done": len(state["cleared_node_ids"]),
+                "total": len(map_data.get("nodes", [])),
+            }
+        return resp
 
     @app.get("/api/plugins/the_daily/mystery/{node_id}")
     def get_mystery_event(node_id: str, request: Request):

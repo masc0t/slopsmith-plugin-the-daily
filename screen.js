@@ -22,6 +22,7 @@ var _dsPlayingNodeId = null; // map node currently being played
 var _dsSkipNextInit = false;
 var _dsInitialized = false; // whether dsInit has run at least once
 var _dsBossJustCompleted = false; // triggers beat-1 dungeon celebration on next init
+var _dsRoomJustCleared = null;    // node id whose exits should unseal on the next dungeon build (song-cleared rooms)
 var _dsPendingBossStreak = 0; // streak number for boss-complete celebration
 var _dsHistoricalDate = null;   // non-null when playing a historical dungeon (the date string)
 var _dsTodaySnapshot = null;    // copy of _dsData saved before loading a historical day
@@ -40,6 +41,16 @@ const NODE_TYPE_ICONS = {
     "choice": "◇",
     "boss": "👑",
 };
+
+// Minimap node colors keyed by type. State (locked/available/cleared/current)
+// is conveyed separately via opacity + ring, so the dot's hue always tells you
+// *what* a room is — the STS convention — instead of overloading fill with state.
+const _DS_MAP_TYPE_COLORS = {
+    boss: '#e0484c', elite: '#e07a30', shop: '#9b59ff', rest: '#3fae8a',
+    treasure: '#e8c040', mystery: '#9aa0a8', choice: '#5a9bff',
+    event: '#7aa0c0', forced: '#c9b07a', song: '#c9b07a',
+};
+function _dsMapNodeColor(type) { return _DS_MAP_TYPE_COLORS[type] || '#c9b07a'; }
 
 function _dsSignKey(date) { return `ds_signed_${date}`; }
 function esc(str) {
@@ -138,26 +149,21 @@ function dsApiUrl(path) {
             const tryInit = async () => {
                 attempts++;
                 const parent = document.getElementById('plugin-the_daily');
-                let setlist = document.getElementById('ds-setlist');
-                // Try querySelector as fallback
-                if (!setlist) setlist = parent?.querySelector('#ds-setlist');
-                // If HTML missing, fetch and inject it
-                if (parent && !setlist && attempts <= 3) {
+                // The plugin's screen.html is now just a loading shell (#ds-loading);
+                // the 3D dungeon overlay takes over from there. Use #ds-loading as
+                // the "HTML is mounted" marker that gates dsInit().
+                let marker = document.getElementById('ds-loading');
+                if (!marker) marker = parent?.querySelector('#ds-loading');
+                // If HTML missing, fetch and inject it.
+                if (parent && !marker && attempts <= 3) {
                     try {
-                        console.log('[daily] fetching HTML...');
                         const resp = await fetch('/api/plugins/the_daily/screen.html');
                         const html = await resp.text();
-                        console.log('[daily] HTML length:', html.length, 'starts:', html.slice(0,50));
                         parent.innerHTML = html;
-                        setlist = document.getElementById('ds-setlist');
-                        if (!setlist) setlist = parent.querySelector('#ds-setlist');
-                        console.log('[daily] after inj, setlist:', setlist ? 'yes' : 'no', 'querySelector:', parent?.querySelector('#ds-setlist') ? 'yes' : 'no');
-                        console.log('[daily] parent children:', parent?.children?.length);
-                        console.log('[daily] parent.innerHTML first 200:', parent?.innerHTML?.slice(0,200));
+                        marker = document.getElementById('ds-loading') || parent.querySelector('#ds-loading');
                     } catch(e) { console.log('[daily] HTML fetch failed:', e); }
                 }
-                console.log('[daily] attempt:', attempts, 'setlist:', setlist ? 'yes' : 'no');
-                if (!_dsInitialized && setlist) {
+                if (!_dsInitialized && marker) {
                     _dsInitialized = true;
                     dsInit();
                 } else if (attempts < 20) {
@@ -191,6 +197,10 @@ if (typeof window !== 'undefined' && window.slopsmith) {
         } else if (_dsReturnAfterPlayback) {
             _dsReturnAfterPlayback = false;
             showScreen('plugin-the_daily');
+            // Rebuild the 3D dungeon in place rather than leaving the legacy 2D
+            // map showing. start() lands the player back in the room they just
+            // cleared and plays the unseal beat (_dsRoomJustCleared).
+            if (dsDungeonEnabled()) await dsResumeDungeon();
         }
     });
 }
@@ -214,13 +224,11 @@ async function dsInit() {
         if (_dsData.error) {
             console.log('[daily] got error:', _dsData.error);
             if (_dsData.error === 'offline') {
-                if (dsDungeonEnabled()) { await dsDungeonEnterError('offline'); }
-                else { dsRenderError('offline'); }
+                await dsDungeonEnterError('offline');
                 return;
             }
             if (_dsData.error === 'update_required') {
-                if (dsDungeonEnabled()) { await dsDungeonEnterError('update_required', _dsData.min_version); }
-                else { dsRenderError('update_required', _dsData.min_version); }
+                await dsDungeonEnterError('update_required', _dsData.min_version);
                 return;
             }
             dsShowError(_dsData.error);
@@ -240,211 +248,21 @@ async function dsInit() {
             dateInput.min = '2026-04-22';
             dateInput.max = new Date().toISOString().slice(0, 10);
         }
-        // Do not auto-load leaderboard on init to avoid auto-redirect; require explicit user action
-        if (dsDungeonEnabled()) {
-            await dsDungeonEnter(_dsData);
-            if (_dsBossJustCompleted && _dsHub && typeof _dsHub.triggerBossCelebration === 'function') {
-                _dsHub.triggerBossCelebration(_dsPendingBossStreak || 0);
-                _dsBossJustCompleted = false;
-            }
+        // The Daily is a 3D dungeon experience; there is no longer a 2D fallback.
+        if (_dsBossJustCompleted) {
+            // Daily complete: drop the player straight into the Wall of Fame
+            // room, where the celebration plays and they sign — no hub detour.
+            const streak = _dsPendingBossStreak || 0;
+            _dsBossJustCompleted = false;
+            await dsEnterWof(_dsData, { celebrate: true, streak });
         } else {
-            dsRender();
-            if (_dsData.is_complete) {
-                dsShow('complete');
-                dsRenderComplete(true);
-            } else {
-                dsShow('setlist');
-            }
+            await dsDungeonEnter(_dsData);
         }
         // Refresh tokens after loading setlist
         dsRefreshTokens();
     } catch (e) {
         dsShowError('Failed to load daily setlist.');
     }
-}
-
-function dsRenderError(errorType, minVersion) {
-    const container = document.getElementById('ds-setlist-view');
-    if (!container) return;
-    
-    if (errorType === 'offline') {
-        container.innerHTML = `
-            <div class="flex flex-col items-center justify-center py-16 text-center">
-                <div class="text-4xl mb-4">📡</div>
-                <h2 class="text-xl font-bold text-gray-200 mb-2">No internet connection</h2>
-                <p class="text-gray-400 mb-6 max-w-md">The Daily requires an active connection to load today's setlist. Try again later.</p>
-                <button onclick="dsInit()" class="bg-accent-500 hover:bg-accent-600 text-white px-6 py-2 rounded-lg font-medium transition-colors">
-                    Retry
-                </button>
-            </div>
-        `;
-    } else if (errorType === 'update_required') {
-        container.innerHTML = `
-            <div class="flex flex-col items-center justify-center py-16 text-center">
-                <div class="text-4xl mb-4">⬆️</div>
-                <h2 class="text-xl font-bold text-gray-200 mb-2">Update Required</h2>
-                <p class="text-gray-400 mb-6 max-w-md">A plugin update is required to play today's Daily. Update The Daily plugin in Slopsmith settings.</p>
-                ${minVersion ? `<p class="text-gray-500 text-sm mb-6">Required version: ${esc(minVersion)}</p>` : ''}
-            </div>
-        `;
-    }
-}
-
-// ── Render setlist view ───────────────────────────────────────────────────────
-function dsRender() {
-    console.log('[daily] dsRender called');
-    const d = _dsData;
-    const mod = d.modifier;
-    
-    console.log('[daily] setlist view', document.getElementById('ds-setlist'));
-    console.log('[daily] songs container', document.getElementById('ds-songs'));
-    console.log('[daily] map data', !!d.map);
-
-    document.getElementById('ds-modifier-icon').textContent = mod.icon;
-    document.getElementById('ds-modifier-label').textContent = mod.label;
-    document.getElementById('ds-seed').textContent = d.seed || '';
-    document.getElementById('ds-modifier-desc').textContent = mod.description;
-    document.getElementById('ds-day-name').textContent = d.day_name;
-    document.getElementById('ds-day-number').textContent = `#${d.day_number}`;
-    // Show historical badge if applicable
-    const dateStr = new Date(d.date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const histBadge = d.is_historical ? ' <span class="ds-hist-badge" aria-label="Historical day">(Historical)</span>' : '';
-    document.getElementById('ds-date').innerHTML = dateStr + histBadge;
-
-    dsRenderDebugToggle(d);
-
-    // Start/update countdown and fetch stats
-    dsStartCountdown();
-    dsLoadStats();
-    const container = document.getElementById('ds-songs');
-    const extras = document.getElementById('ds-lane-extras');
-    
-    // Map mode is now mandatory; if map is missing, show an error.
-    if (d.map) {
-        container.innerHTML = dsMapView(d);
-        if (extras) extras.classList.remove('hidden');
-        dsLoadLanePopularity();
-    } else {
-        dsShowError('Legacy flat-list mode is deprecated. Map data is required.');
-    }
-
-    // Show rescan bar when any song is missing locally
-    const rescanBar = document.getElementById('ds-rescan-bar');
-    if (rescanBar) {
-        const anyMissing = d.songs.some(s => !s.has_locally);
-        rescanBar.classList.toggle('hidden', !anyMissing);
-    }
-}
-
-function dsRenderDebugToggle(d) {
-    const btnContainer = document.getElementById('ds-setlist');
-    if (!btnContainer) return;
-    if (!d.debug_no_save) return;
-    let btn = document.getElementById('ds-debug-map-toggle');
-    if (!btn) {
-        btn = document.createElement('button');
-        btn.id = 'ds-debug-map-toggle';
-        btn.className = 'mt-3 px-3 py-1.5 rounded-lg border border-yellow-700/40 bg-yellow-900/10 text-xs text-yellow-300 hover:bg-yellow-900/20 transition';
-        btnContainer.appendChild(btn);
-    }
-    btn.textContent = d.debug_no_save ? 'Exit Map Debug' : 'Map Debug (no save)';
-    btn.onclick = () => dsDebugMap(!d.debug_no_save);
-}
-
-async function dsLoadLanePopularity() {
-    if (!_dsData?.map) return;
-    const els = [
-        document.getElementById('ds-lane-popularity'),
-        document.getElementById('ds-complete-lane-popularity')
-    ].filter(el => el);
-    if (els.length === 0) return;
-    try {
-        const resp = await fetch(`/api/plugins/the_daily/leaderboard?date=${encodeURIComponent(_dsData.date)}`, { cache: 'no-store' });
-        const data = await resp.json();
-        const bits = (data.lane_popularity || []).map(p => `${p.percent}% ${dsLaneLabel(p.lane)}`);
-        const text = bits.length ? bits.join(' · ') : 'No lane picks signed yet';
-        els.forEach(el => el.textContent = text);
-    } catch (e) {
-        els.forEach(el => el.textContent = 'Lane popularity unavailable');
-    }
-}
-
-function dsMapView(d) {
-    const map = d.map;
-    const songMap = Object.fromEntries((d.songs || []).map(s => [s.cf_id, s]));
-    const available = new Set(d.available_node_ids || []);
-    const cleared = new Set(d.cleared_node_ids || []);
-    const locked = new Set(d.locked_node_ids || []);
-    const rows = {};
-    (map.nodes || []).forEach(n => { (rows[n.row] ||= []).push(n); });
-    const maxRow = Math.max(...Object.keys(rows).map(Number));
-    const maxCol = Math.max(0, ...map.nodes.map(n => n.col || 0));
-    const w = 640;
-    const h = Math.max(300, (maxRow + 1) * 86);
-    const pos = {};
-    map.nodes.forEach(n => {
-        pos[n.id] = {
-            x: 70 + ((n.col || 0) * ((w - 140) / Math.max(1, maxCol))),
-            y: 44 + ((n.row || 0) * ((h - 88) / Math.max(1, maxRow))),
-        };
-    });
-    const edges = map.nodes.flatMap(n => (n.edges || []).map(to => ({ from: n.id, to })));
-    const rerolls = d.inventory?.counts?.boss_reroll || 0;
-    const inventory = `<div class="bg-dark-700/40 border border-gray-800/40 rounded-xl px-4 py-3 mb-4 space-y-2">
-        <div class="flex items-center justify-between gap-3"><span class="text-xs text-gray-400">Daily path</span>
-        <button onclick="dsUseBossReroll()" ${(!rerolls || d.boss_revealed || d.used_reroll) ? 'disabled' : ''} class="px-3 py-1.5 rounded-lg border border-purple-700/40 bg-purple-900/20 text-xs text-purple-200 disabled:opacity-40 disabled:cursor-not-allowed">🎲 Boss Re-roll ×${rerolls}</button>
-        </div>${d.debug_no_save ? '<div class="text-xs text-yellow-400 font-semibold">DEBUG MAP · no DB writes, no completion/streak changes <button onclick="dsDebugMap(false)" class="ml-2 underline">exit</button></div>' : ''}
-    </div>`;
-    const svgEdges = edges.map(e => `<line x1="${pos[e.from].x}" y1="${pos[e.from].y}" x2="${pos[e.to].x}" y2="${pos[e.to].y}" stroke="rgba(148,163,184,.22)" stroke-width="2" />`).join('');
-    const typeColorFor = (typ) => {
-        switch (typ) {
-            case 'forced': return '#93c5fd';
-            case 'elite': return '#f6d365';
-            case 'rest': return '#94a3b8';
-            case 'shop': return '#c4b5fd';
-            case 'mystery': return '#f8a14b';
-            case 'treasure': return '#fcd34d';
-            case 'boss': return '#f87171';
-            default: return '#374151';
-        }
-    };
-    // Group nodes by lane, preserving declaration order from map.lanes
-    const laneKeys = Object.keys(map.lanes || {});
-    const nodesByLane = {};
-    map.nodes.forEach(n => {
-        const lane = n.lane || 'standard';
-        (nodesByLane[lane] ||= []).push(n);
-    });
-    // Lanes not declared explicitly still get rendered
-    map.nodes.forEach(n => { const l = n.lane || 'standard'; if (!laneKeys.includes(l)) laneKeys.push(l); });
-    const svgLanes = laneKeys.map(lane => {
-        const laneNodes = nodesByLane[lane] || [];
-        const nodesSvg = laneNodes.map(n => {
-            const state = cleared.has(n.id) ? 'cleared' : locked.has(n.id) ? 'locked' : available.has(n.id) ? 'available' : 'future';
-            const fill = state === 'cleared' ? '#14532d' : state === 'available' ? '#1d4ed8' : state === 'locked' ? '#111827' : '#1f2937';
-            const stroke = (state === 'cleared') ? '#22c55e' : (state === 'available' ? '#60a5fa' : typeColorFor(n.type));
-            const icon = dsNodeIcon(n);
-            const interactive = state === 'available' || state === 'cleared' || d.debug_no_save;
-            const role = interactive ? 'role="button"' : '';
-            const tab = interactive ? 'tabindex="0"' : '';
-            const type = n.type || n.id;
-            const song = songMap[n.cf_id];
-            const songInfo = (interactive && state !== 'future' && song) ? `${esc(song.title)} by ${esc(song.artist)} · ` : '';
-            const aria = interactive ? `aria-label="${songInfo}${type} node · ${state}"` : `aria-label="${type} node"`;
-            const click = interactive ? `onclick="dsOpenNode('${n.id}')" style="cursor:pointer"` : '';
-            const actLabel = n.act ? `<text class="ds-svg-act" x="${pos[n.id].x}" y="${pos[n.id].y - 32}" text-anchor="middle" font-size="10" fill="#94a3b8">${esc(n.act)}</text>` : '';
-            return `${actLabel}<g ${role} ${tab} ${aria} ${click} class="ds-svg-node-group" data-node-id="${n.id}"><circle cx="${pos[n.id].x}" cy="${pos[n.id].y}" r="24" fill="${fill}" stroke="${stroke}" stroke-width="3" />
-            <text x="${pos[n.id].x}" y="${pos[n.id].y + 6}" text-anchor="middle" fill="white" font-size="18">${icon}</text></g>`;
-        }).join('');
-        return `<g class="ds-svg-lane-group lane-${lane}" data-lane="${lane}">${nodesSvg}</g>`;
-    }).join('');
-    return `${inventory}<div class="bg-dark-800/60 border border-gray-800 rounded-2xl p-3 overflow-x-auto mb-4"><svg viewBox="0 0 ${w} ${h}" class="w-full min-w-[520px]">${svgEdges}${svgLanes}</svg></div><div id="ds-map-panel" class="space-y-3" aria-live="polite">${dsMapHint(d)}</div>`;
-}
-
-function dsMapHint(d) {
-    const available = d.available_node_ids || [];
-    if (available.length === 0) return '<div class="text-sm text-gray-500 text-center py-4">No available nodes.</div>';
-    return `<div class="text-sm text-gray-400 text-center py-4">Pick an available glowing node to continue.</div>`;
 }
 
 function dsLaneLabel(id) {
@@ -509,7 +327,7 @@ async function dsRescanLibrary(externalBtn) {
                         } else if (_dsHub && typeof _dsHub.refresh === 'function') {
                             _dsHub.refresh();
                         } else {
-                            dsRender();
+                            dsInit();
                         }
                     } else {
                         dsInit();
@@ -529,56 +347,6 @@ async function dsRescanLibrary(externalBtn) {
     }, 1000);
 }
 
-function dsSongCard(song, index, blindside) {
-    const num = `<span class="text-xs text-gray-600 w-6 text-center flex-shrink-0">${index + 1}</span>`;
-    const title = blindside && !song.done ? '<span aria-label="Title hidden (Blindside modifier)">???</span>' : esc(song.title);
-    const artist = esc(song.artist);
-    const tuning = song.tuning ? `<span class="text-xs text-gray-600 ml-2">${esc(song.tuning)}</span>` : '';
-
-    let border = 'border-gray-800/30';
-    let opacity = '';
-    let action = '';
-
-    if (song.done) {
-        border = 'border-green-800/30';
-        opacity = 'opacity-60';
-        action = `<span class="text-green-500 text-lg flex-shrink-0">✓</span>`;
-        if (song.has_locally) {
-            action += `<button onclick='dsPlay(${song.cf_id},"${esc(song.local_filename)}")'
-                class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition flex-shrink-0">Replay</button>`;
-        }
-    } else if (song.has_locally) {
-        border = 'border-accent/30';
-        action = `<button onclick='dsPlay(${song.cf_id},"${esc(song.local_filename)}")'
-            class="bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-xs font-semibold text-white transition flex-shrink-0">Play</button>`;
-    } else {
-        action = `<a href="${esc(song.cf_url)}" target="_blank" rel="noopener"
-            class="px-4 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-xl text-xs text-gray-300 transition flex-shrink-0 whitespace-nowrap">
-            Get on CF ↗</a>`;
-    }
-
-    const duration = song.duration ? `<span class="text-xs text-gray-600">${dsFmtDuration(song.duration)}</span>` : '';
-
-    return `
-        <div class="flex items-center gap-3 bg-dark-700/40 border ${border} rounded-xl p-4 ${opacity} transition">
-            ${num}
-            <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2 flex-wrap">
-                    <span class="text-sm font-medium text-white">${title}</span>
-                    ${tuning}
-                </div>
-                <div class="flex items-center gap-2 mt-0.5">
-                    <span class="text-xs text-gray-500">${artist}</span>
-                    ${duration}
-                    ${!song.has_locally && !song.done ? '<span class="text-xs text-yellow-600">· Download &amp; rescan to play</span>' : ''}
-                </div>
-            </div>
-            <div class="flex items-center gap-2">
-                ${action}
-            </div>
-        </div>`;
-}
-
 function dsFmtDuration(secs) {
     if (typeof secs === 'string') return secs;
     const m = Math.floor(secs / 60);
@@ -587,69 +355,6 @@ function dsFmtDuration(secs) {
 }
 
 // Countdown to next daily at midnight
-let _dsCountdownInterval = null;
-
-function dsStartCountdown() {
-    // Clear any existing interval
-    if (_dsCountdownInterval) {
-        clearInterval(_dsCountdownInterval);
-        _dsCountdownInterval = null;
-    }
-
-    const updateCountdown = () => {
-        const now = new Date();
-        const nextDaily = new Date(now);
-        nextDaily.setHours(24, 0, 0, 0);  // Next midnight
-
-        const diffMs = nextDaily - now;
-        const diffSecs = Math.floor(diffMs / 1000);
-
-        if (diffSecs <= 0) {
-            // Refresh to get new daily
-            dsInit();
-            return;
-        }
-
-        const hours = Math.floor(diffSecs / 3600);
-        const mins = Math.floor((diffSecs % 3600) / 60);
-        const secs = diffSecs % 60;
-
-        const countdownEl = document.getElementById('ds-countdown');
-        const countdownElComplete = document.getElementById('ds-complete-countdown');
-
-        // Update both locations
-        [countdownEl, countdownElComplete].forEach(el => {
-            if (el) {
-                el.style.display = 'inline';
-                el.textContent = `Next: ${hours}h ${mins}m ${secs}s`;
-            }
-        });
-    };
-
-    updateCountdown();
-    _dsCountdownInterval = setInterval(updateCountdown, 1000);
-}
-
-// Load and display stats
-async function dsLoadStats() {
-    try {
-        const resp = await fetch('/api/plugins/the_daily/stats');
-        const data = await resp.json();
-        const statsEl = document.getElementById('ds-stats');
-        const statsElComplete = document.getElementById('ds-complete-stats');
-        const display = `🔥${data.streak} · 📅${data.total_days} · 🎵${data.total_played}`;
-        if (statsEl) {
-            statsEl.textContent = display;
-        }
-        if (statsElComplete) {
-            statsElComplete.textContent = display;
-        }
-    } catch (e) {
-        console.error('Failed to load stats:', e);
-    }
-}
-
-// ── Play a song ───────────────────────────────────────────────────────────────
 function dsOpenNode(nodeId) {
     if (!_dsData?.map) return;
     const panel = document.getElementById('ds-map-panel');
@@ -699,7 +404,7 @@ function dsMapSongOption(node, song, label, canPlay) {
         ? `<button onclick='dsPlayMapNode("${esc(node.id)}",${song.cf_id},"${esc(song.local_filename)}")' class="bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-xs font-semibold text-white transition">Play</button>`
         : !local
             ? `<div class="flex items-center gap-2">
-                <a href="${esc(song.cf_url || '#')}" target="_blank" rel="noopener" class="px-4 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-xl text-xs text-gray-300 transition whitespace-nowrap">Get on CF ↗</a>
+                <button onclick='dsAcquire(${song.cf_id},"${esc(node.id)}","${esc(song.cf_url || '')}",this)' class="px-4 py-2 bg-accent hover:bg-accent-light rounded-xl text-xs font-semibold text-white transition whitespace-nowrap">Get song</button>
                 <button onclick="dsRescanLibrary(this)" class="px-3 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-xl text-xs text-gray-400 transition" title="Rescan library for this song">⟳</button>
                </div>`
             : `<span class="text-xs text-gray-500">Locked</span>`;
@@ -713,46 +418,6 @@ function dsStableIndex(text, length) {
     let h = 0;
     for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
     return Math.abs(h) % length;
-}
-
-async function dsUseBossReroll() {
-    if (!_dsData?.map) return;
-    try {
-        const resp = await fetch('/api/plugins/the_daily/use-item', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                install_id: dsInstallId(),
-                item_id: 'boss_reroll',
-                payload: {},
-                debug_no_save: !!_dsData.debug_no_save,
-                cleared_node_ids: _dsData.cleared_node_ids || [],
-                committed_node_ids: _dsData.committed_node_ids || [],
-            }),
-        });
-        const text = await resp.text();
-        const data = text ? JSON.parse(text) : {};
-        if (!resp.ok || data.error) {
-            const panel = document.getElementById('ds-map-panel');
-            if (panel) panel.innerHTML = `<div class="text-sm text-yellow-400 text-center py-3">${esc(data.error || 'Could not use item.')}</div>`;
-            return;
-        }
-        _dsData.inventory = data.inventory;
-        _dsData.used_reroll = true;
-        const boss = _dsData.map.nodes.find(n => n.id === _dsData.map.boss);
-        if (boss) boss.cf_id = data.boss_cf_id;
-        if (data.song && !_dsData.songs.some(s => s.cf_id === data.song.cf_id)) {
-            _dsData.songs.push(data.song);
-        }
-        if (_dsData.debug_no_save) {
-            dsRender();
-        } else {
-            await dsInit();
-        }
-    } catch (e) {
-        const panel = document.getElementById('ds-map-panel');
-        if (panel) panel.innerHTML = '<div class="text-sm text-red-400 text-center py-3">Network error using item.</div>';
-    }
 }
 
 async function dsPlayMapNode(nodeId, cfId, filename) {
@@ -783,6 +448,167 @@ async function dsPlay(cfId, filename) {
     _dsPlayingCfId = cfId;         // Track which song is playing
     _dsPlayingNodeId = nodeId;
     playSong(encodeURIComponent(filename));
+}
+
+// Refresh the day's data in place without tearing down the dungeon/hub
+// (reuses the post-rescan pattern). Used after an Acquisition lands.
+async function dsRefreshInPlace() {
+    try {
+        const r = await fetch(dsApiUrl('/api/plugins/the_daily/today'));
+        const txt = await r.text();
+        const fresh = txt ? JSON.parse(txt) : null;
+        if (fresh && _dsData && !fresh.error) {
+            Object.assign(_dsData, fresh);
+            if (_dsDungeon && typeof _dsDungeon.refresh === 'function') _dsDungeon.refresh();
+            else if (_dsHub && typeof _dsHub.refresh === 'function') _dsHub.refresh();
+            else dsInit();
+        } else {
+            dsInit();
+        }
+    } catch (e) { dsInit(); }
+}
+
+// Acquire a song for a Room (ADR 0011). /acquire resolves the Unlock cache;
+// on a miss/needs-webview it hands off to the desktop webview Capture (the
+// human clicks download in-app, we capture the Host URL + file), then /capture
+// finalizes + Unlocks it for everyone. Falls back to opening CustomsForge in
+// the browser when the desktop bridge isn't present (Docker).
+async function dsAcquire(cfId, nodeId, cfUrl, btn) {
+    const setBusy = (t) => { if (btn) { if (!btn.dataset.label) btn.dataset.label = btn.textContent; btn.disabled = true; btn.textContent = t; } };
+    const clearBusy = () => { if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || 'Get song'; } };
+    setBusy('Getting…');
+    try {
+        const resp = await fetch('/api/plugins/the_daily/acquire', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ install_id: dsInstallId(), cf_id: cfId, node_id: nodeId || null }),
+        });
+        const txt = await resp.text();
+        const r = txt ? JSON.parse(txt) : {};
+
+        if (r.status === 'acquired' || r.status === 'have') { dsAnnounce('Song ready'); await dsRefreshInPlace(); return; }
+        if (r.status === 'reported') { dsAnnounce('Song unavailable — room cleared'); await dsRefreshInPlace(); return; }
+
+        // manual / miss / needs_webview — a human Capture is required.
+        const desktop = window.slopsmithDesktop && window.slopsmithDesktop.capture;
+        const url = cfUrl || r.cf_url;
+        if (desktop && typeof desktop.songDownload === 'function') {
+            setBusy('Download in CF window…');
+            let cap;
+            try { cap = await desktop.songDownload(url, r.dlc_dir); }
+            catch (e) { cap = { ok: false, error: String(e) }; }
+            if (cap && cap.ok) {
+                setBusy('Installing…');
+                const cr = await fetch('/api/plugins/the_daily/capture', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ install_id: dsInstallId(), cf_id: cfId, node_id: nodeId || null, host_url: cap.hostUrl, save_path: cap.savePath }),
+                });
+                const ctxt = await cr.text();
+                const cres = ctxt ? JSON.parse(ctxt) : {};
+                if (cres.status === 'reported') dsAnnounce('Song unavailable — room cleared');
+                else if (cres.status === 'acquired') dsAnnounce('Song ready');
+                else dsAnnounce('Could not install song');
+                await dsRefreshInPlace();
+                return;
+            }
+            // Capture produced no file (the host page didn't auto-download, or
+            // the user cancelled). If the webview reached a known file host, let
+            // the server resolve that page — MediaFire/Drive/Dropbox pages that
+            // need a click in a browser still resolve headlessly server-side
+            // (e.g. MediaFire's legacy /download/<key> page that never fires the
+            // download event the webview waits on).
+            if (cap && cap.hostUrl) {
+                if (await dsCaptureHostUrl(cfId, nodeId, cap.hostUrl, btn)) return;
+                await dsPromptCaptureLink(cfId, nodeId, btn);  // reached a host but the fetch failed
+                clearBusy();
+                return;
+            }
+            // No host reached. Don't nag on a deliberate cancel; offer the paste
+            // path only when the capture actually errored.
+            if (cap && !cap.cancelled) await dsPromptCaptureLink(cfId, nodeId, btn);
+            clearBusy();
+            return;
+        }
+        // Browser/Docker: no capture bridge — open the source page, then let the
+        // user paste the direct host link they reach so the server can fetch it.
+        if (url) window.open(url, '_blank', 'noopener');
+        await dsPromptCaptureLink(cfId, nodeId, btn);
+        clearBusy();
+    } catch (e) {
+        dsAnnounce('Acquire failed');
+        clearBusy();
+    }
+}
+
+// Hand a direct file-host link to the server, which fetches + validates it and
+// Unlocks the song for everyone (ADR 0011 /capture). Returns true if the song
+// landed (acquired) or was conclusively rejected (reported); false if the caller
+// should keep offering options. The server resolver handles Dropbox / Google
+// Drive / MediaFire (incl. the /download/<key>, /folder/, and app. variants).
+async function dsCaptureHostUrl(cfId, nodeId, host_url, btn) {
+    if (!host_url) return false;
+    const prev = btn && btn.textContent;
+    if (btn) { btn.disabled = true; btn.textContent = 'Fetching…'; }
+    try {
+        const cr = await fetch('/api/plugins/the_daily/capture', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ install_id: dsInstallId(), cf_id: cfId, node_id: nodeId || null, host_url }),
+        });
+        const ctxt = await cr.text();
+        const cres = ctxt ? JSON.parse(ctxt) : {};
+        if (cres.status === 'acquired') { dsAnnounce('Song ready'); await dsRefreshInPlace(); return true; }
+        if (cres.status === 'reported') { dsAnnounce('That link isn\'t a playable CDLC'); await dsRefreshInPlace(); return true; }
+        dsAnnounce(cres.error ? ('Could not fetch: ' + cres.error) : 'Could not fetch that link');
+        if (btn && prev) btn.textContent = prev;
+        return false;
+    } catch (e) {
+        dsAnnounce('Capture failed');
+        if (btn && prev) btn.textContent = prev;
+        return false;
+    }
+}
+
+// Ask the user to paste a direct host link, then capture it. window.prompt is
+// blocked in the Electron desktop app, so this uses a small DOM modal that works
+// over both the canvas dungeon and the DOM encounter panels.
+async function dsPromptCaptureLink(cfId, nodeId, btn) {
+    const host_url = await dsAskHostLink();
+    if (!host_url) return false;
+    return dsCaptureHostUrl(cfId, nodeId, host_url, btn);
+}
+
+function dsAskHostLink() {
+    return new Promise((resolve) => {
+        const ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;font-family:monospace;';
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#0b0b0d;border:1px solid #333;border-radius:12px;padding:20px;max-width:460px;width:90%;color:#cfd3da;';
+        box.innerHTML =
+            '<div style="font-size:0.95rem;color:#e8c040;margin-bottom:8px;">Paste the download link</div>' +
+            '<div style="font-size:0.8rem;color:#8a8f98;margin-bottom:12px;line-height:1.4;">' +
+            'The page opened but didn’t download automatically. Copy the file link ' +
+            '(MediaFire / Dropbox / Google Drive / etc.) and paste it here — we’ll ' +
+            'fetch and install it, and unlock it for everyone.</div>' +
+            '<input id="ds-host-input" type="text" placeholder="https://www.mediafire.com/…" autocomplete="off" ' +
+            'style="width:100%;box-sizing:border-box;background:#16161a;border:1px solid #333;border-radius:8px;color:#fff;padding:10px;font-family:monospace;font-size:0.85rem;margin-bottom:14px;">' +
+            '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
+            '<button id="ds-host-cancel" style="background:#1a1a1e;border:1px solid #333;border-radius:8px;color:#aaa;padding:8px 14px;cursor:pointer;">Cancel</button>' +
+            '<button id="ds-host-ok" style="background:#2f6fc2;border:none;border-radius:8px;color:#fff;padding:8px 14px;cursor:pointer;font-weight:bold;">Fetch</button>' +
+            '</div>';
+        ov.appendChild(box);
+        document.body.appendChild(ov);
+        const input = box.querySelector('#ds-host-input');
+        const done = (val) => { ov.remove(); resolve(val); };
+        box.querySelector('#ds-host-cancel').onclick = () => done(null);
+        box.querySelector('#ds-host-ok').onclick = () => done((input.value || '').trim() || null);
+        ov.addEventListener('mousedown', (e) => { if (e.target === ov) done(null); });
+        // Stop dungeon WASD/window key handlers from eating the typing.
+        input.addEventListener('keydown', (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') done((input.value || '').trim() || null);
+            else if (e.key === 'Escape') done(null);
+        });
+        setTimeout(() => input.focus(), 30);
+    });
 }
 
 // Mark song completion (called when song:ended fires)
@@ -824,7 +650,15 @@ async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
                         if (typeof result.boss_revealed !== 'undefined') _dsData.boss_revealed = result.boss_revealed;
                         if (result.inventory) _dsData.inventory = result.inventory;
                         _dsData.is_complete = result.is_complete;
-                        dsRender();
+                        // Replay the door-unseal beat when the rebuilt dungeon lands the
+                        // player back in the room they just song-cleared (boss has its own
+                        // celebration, so it's excluded).
+                        if (nodeId && !result.is_complete && (result.cleared_node_ids || []).includes(nodeId)) {
+                            _dsRoomJustCleared = nodeId;
+                        }
+                        // The 3D scene is rebuilt on return (see song:ended →
+                        // dsResumeDungeon), which lands the player back in the
+                        // cleared room.
                         dsRefreshTokens(); // Refresh token count after song completion
 
                     if (result.is_complete && _dsData.map) {
@@ -836,13 +670,6 @@ async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
                             _dsPendingBossStreak = sData.streak || 0;
                         } catch (e) { _dsPendingBossStreak = 0; }
                         dsAnnounce('Daily complete! Well done!');
-                    } else if (result.is_complete && _dsConfettiDoneFor !== _dsData.date) {
-                        dsAnnounce('Daily complete! Well done!');
-                        setTimeout(() => {
-                            if (_dsDungeon) dsDungeonExit();
-                            dsShow('complete');
-                            dsRenderComplete(true);
-                        }, 800);
                     }
                 }
             }
@@ -852,738 +679,29 @@ async function dsMarkSong(cfId, durationPlayed = 0, nodeId = null) {
     }
 }
 
-// ── Complete view ─────────────────────────────────────────────────────────────
-async function dsRenderComplete(fireConfetti = false) {
-    if (!_dsData) return;
-    document.getElementById('ds-complete-name').textContent = _dsData.day_name;
-
-    // Load stats for display
-    dsLoadStats();
-
-    // Add modifier info if available
-    const mod = _dsData.modifier || {};
-    const modInfo = document.getElementById('ds-complete-mod');
-    if (modInfo) {
-        modInfo.textContent = mod.label ? `${mod.icon || ''} ${mod.label}` : '';
-    }
-
-    // Replace day number with modifier description
-    const dayNumInfo = document.getElementById('ds-complete-daynum');
-    if (dayNumInfo) {
-        dayNumInfo.textContent = mod.description || '';
-    }
-
-    // Add seed for reference
-    const seedInfo = document.getElementById('ds-complete-seed');
-    if (seedInfo) {
-        seedInfo.textContent = _dsData.seed ? `Code: ${_dsData.seed}` : '';
-    }
-
-    const streakResp = await fetch('/api/plugins/the_daily/streak');
-    const streakText = await streakResp.text();
-    const { streak } = streakText ? JSON.parse(streakText) : { streak: 0 };
-    const streakEl = document.getElementById('ds-complete-streak');
-    if (streak > 1) {
-        streakEl.textContent = `🔥 ${streak}-day streak`;
-    } else {
-        streakEl.textContent = '';
-    }
-
-    // Initialize tab and navigation state (only on fresh load)
-    if (!_dsLbDate) {
-        _dsLbDate = _dsData.date;
-    }
-    // Only reset WOF loaded flag on first enter, preserve tab state when navigating
-    // _dsActiveTab is preserved globally
-    _dsWofLoaded = false;
-    dsSwitchTab(_dsActiveTab);
-    dsUpdateNavButtons();
-
-    // Render today's complete setlist on the completion screen
-    dsRenderCompleteSetlist();
-
-    const signContainer = document.getElementById('ds-sign-container');
-    if (signContainer) {
-        const todayIso = new Date().toISOString().slice(0, 10);
-        // Only show signing UI if viewing today's leaderboard and haven't signed yet
-        const isToday = (_dsLbDate === todayIso || _dsLbDate === _dsData.date) && !(_dsData.is_historical);
-        const signed = localStorage.getItem(_dsSignKey(_dsData.date));
-        
-        if (isToday && !signed && !_dsData.debug_no_save) {
-            signContainer.classList.remove('hidden');
-            const nameInput = document.getElementById('ds-sign-name');
-            if (nameInput) {
-                nameInput.value = localStorage.getItem('ds_last_name') || '';
-            }
-        } else {
-            signContainer.classList.add('hidden');
-        }
-    }
-
-    if (fireConfetti && _dsConfettiDoneFor !== _dsData.date) {
-        _dsConfettiDoneFor = _dsData.date;
-        dsRunConfetti();
-    }
-}
-
-// Load a specific day's setlist by date (YYYY-MM-DD) for Day Complete view
-async function dsLoadSetlistForDate(dateStr) {
-    try {
-        const resp = await fetch(`/api/plugins/the_daily/setlist/${dateStr}`);
-        if (!resp.ok) {
-            if (resp.status === 404) {
-                dsShowError('No setlist for this date yet.');
-                // prepare for a potential retry on historical days
-                _dsLastHistoricalRetryDate = dateStr;
-                // inject a Retry button if not already present
-                const errRoot = document.getElementById('ds-songs');
-                if (errRoot && !document.getElementById('ds-hist-retry')) {
-                    const btn = document.createElement('button');
-                    btn.id = 'ds-hist-retry';
-                    btn.textContent = 'Retry';
-                    btn.className = 'px-3 py-1.5 rounded-xl bg-dark-600 hover:bg-dark-500 border border-gray-700 text-xs text-gray-300';
-                    btn.style.marginTop = '6px';
-                    btn.onclick = dsRetryLastHistorical;
-                    errRoot.appendChild(btn);
-                }
-            } else {
-                dsShowError('Failed to load setlist for this date.');
-            }
-            return;
-        }
-const data = await resp.json();
-        if (data && !data.error) {
-            _dsData = data;
-            dsRender();
-            dsShow('complete');
-            dsRenderComplete();
-            // clear any previous historical retry state on success
-            _dsLastHistoricalRetryDate = null;
-            const existing = document.getElementById('ds-hist-retry');
-            if (existing) existing.remove();
-            if (!document.getElementById('ds-confetti')) {
-                // no-op; keep existing confetti init path
-            }
-        } else {
-            dsShowError(data.error || 'Unable to load setlist.');
-            // allow retry if available
-            if (dateStr && _dsLastHistoricalRetryDate === dateStr && !document.getElementById('ds-hist-retry')) {
-                const errRoot = document.getElementById('ds-songs');
-                if (errRoot) {
-                    const btn = document.createElement('button');
-                    btn.id = 'ds-hist-retry';
-                    btn.textContent = 'Retry';
-                    btn.className = 'px-3 py-1.5 rounded-xl bg-dark-600 hover:bg-dark-500 border border-gray-700 text-xs text-gray-300';
-                    btn.style.marginTop = '6px';
-                    btn.onclick = dsRetryLastHistorical;
-                    errRoot.appendChild(btn);
-                }
-            }
-        }
-    } catch (e) {
-        console.error('DEBUG dsLoadSetlistForDate Error:', e.message, e.stack);
-        dsShowError('Network error while loading historical setlist. Please try again.');
-        // show retry option on network failure as well
-        if (!_dsLastHistoricalRetryDate) {
-            _dsLastHistoricalRetryDate = dateStr;
-            const errRoot = document.getElementById('ds-songs');
-            if (errRoot && !document.getElementById('ds-hist-retry')) {
-                const btn = document.createElement('button');
-                btn.id = 'ds-hist-retry';
-                btn.textContent = 'Retry';
-                btn.className = 'px-3 py-1.5 rounded-xl bg-dark-600 hover:bg-dark-500 border border-gray-700 text-xs text-gray-300';
-                btn.style.marginTop = '6px';
-                btn.onclick = dsRetryLastHistorical;
-                errRoot.appendChild(btn);
-            }
-        }
-    }
-}
-
-function dsRetryLastHistorical() {
-    if (_dsLastHistoricalRetryDate) {
-        dsLoadSetlistForDate(_dsLastHistoricalRetryDate);
-    }
-}
-
-// Render the complete setlist on the Day Complete screen, enabling replay
-function dsRenderCompleteSetlist() {
-    const container = document.getElementById('ds-complete-setlist');
-    const extras = document.getElementById('ds-complete-lane-extras');
-    if (!container || !_dsData) return;
-    const songs = _dsData.songs || [];
-    if (_dsData.map) {
-        container.innerHTML = dsMapView(_dsData);
-        if (extras) extras.classList.remove('hidden');
-        dsLoadLanePopularity();
-        return;
-    }
-    if (extras) extras.classList.add('hidden');
-    if (songs.length === 0) {
-        container.innerHTML = '<div class="text-sm text-gray-400">No songs in today\'s setlist.</div>';
-        return;
-    }
-    // Reuse existing song card renderer for consistency and replay capability
-    container.innerHTML = songs.map((s, i) => dsSongCard(s, i, false)).join('');
-}
-
-// ── Rating selector ───────────────────────────────────────────────────────────
-function dsSelectRating(val) {
-    _dsRating = (_dsRating === val) ? null : val;
-    [-1, 1, 2].forEach(v => {
-        const btn = document.getElementById(`ds-rating-${v}`);
-        if (!btn) return;
-        const selected = _dsRating === v;
-        btn.classList.toggle('ring-2', selected);
-        btn.classList.toggle('ring-accent', selected);
-        btn.classList.toggle('bg-accent/20', selected);
-        btn.setAttribute('aria-checked', selected ? 'true' : 'false');
-    });
-}
-
-//  Sign Leaderboard 
-async function dsSign() {
-    if (!_dsData || _dsSigning) return;
-    const nameEl = document.getElementById('ds-sign-name');
-    const msgEl = document.getElementById('ds-sign-message');
-    const errEl = document.getElementById('ds-sign-error');
-    const btn = document.getElementById('ds-btn-sign');
-
-    const name = (nameEl.value || '').trim();
-    if (!name) {
-        errEl.textContent = 'Please enter your name.';
-        errEl.classList.remove('hidden');
-        return;
-    }
-    const message = msgEl ? (msgEl.value || '').trim() : '';
-
-    errEl.classList.add('hidden');
-    _dsSigning = true;
-    btn.disabled = true;
-    btn.textContent = 'Signing...';
-    btn.classList.add('opacity-50');
-
-    try {
-        const payload = {
-            display_name: name,
-            rating: _dsRating,
-            install_id: dsInstallId(),
-        };
-        if (message) payload.message = message;
-
-        const resp = await fetch('/api/plugins/the_daily/sign', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-
-        const text = await resp.text();
-        const data = text ? JSON.parse(text) : {};
-
-        if (!resp.ok || data.error) {
-            errEl.textContent = data.error || 'Failed to sign leaderboard.';
-            errEl.classList.remove('hidden');
-        } else {
-            // Success
-            localStorage.setItem('ds_last_name', name);
-            localStorage.setItem(_dsSignKey(_dsData.date), 'true');
-            
-            const signContainer = document.getElementById('ds-sign-container');
-            if (signContainer) signContainer.classList.add('hidden');
-            
-            // Reload the WOF tab to show the new entry
-            dsLoadWofForDate(_dsData.date);
-        }
-    } catch (e) {
-        errEl.textContent = 'Network error while signing.';
-        errEl.classList.remove('hidden');
-    } finally {
-        _dsSigning = false;
-        btn.disabled = false;
-        btn.textContent = 'Sign the Wall';
-        btn.classList.remove('opacity-50');
-    }
-}
-
-//  Leaderboard view 
-async function dsShowLeaderboard() {
-    dsShow('leaderboard');
-    // Load leaderboard for the currently selected date, or today by default
-    dsLoadLeaderboardForDate(_dsLbDate);
-}
-
-function dsShowSetlist() {
-    dsShow(_dsData?.is_complete ? 'complete' : 'setlist');
-    dsRefreshTokens();
-}
-
-// ── Tab switching for merged complete view ────────────────────────────────
-function dsSwitchTab(tab) {
-    _dsActiveTab = tab;
-    const todayTab = document.getElementById('ds-tab-today');
-    const wofTab = document.getElementById('ds-tab-wof');
-    const todayContent = document.getElementById('ds-today-content');
-    const wofContent = document.getElementById('ds-wof-content');
-
-    if (tab === 'today') {
-        if (todayTab) {
-            todayTab.classList.add('bg-accent/20', 'text-accent', 'border-accent/50');
-            todayTab.classList.remove('bg-dark-700', 'text-gray-400', 'border-gray-700');
-            todayTab.setAttribute('aria-selected', 'true');
-        }
-        if (wofTab) {
-            wofTab.classList.remove('bg-accent/20', 'text-accent', 'border-accent/50');
-            wofTab.classList.add('bg-dark-700', 'text-gray-400', 'border-gray-700');
-            wofTab.setAttribute('aria-selected', 'false');
-        }
-        if (todayContent) todayContent.classList.remove('hidden');
-        if (wofContent) wofContent.classList.add('hidden');
-    } else {
-        if (todayTab) {
-            todayTab.classList.remove('bg-accent/20', 'text-accent', 'border-accent/50');
-            todayTab.classList.add('bg-dark-700', 'text-gray-400', 'border-gray-700');
-            todayTab.setAttribute('aria-selected', 'false');
-        }
-        if (wofTab) {
-            wofTab.classList.add('bg-accent/20', 'text-accent', 'border-accent/50');
-            wofTab.classList.remove('bg-dark-700', 'text-gray-400', 'border-gray-700');
-            wofTab.setAttribute('aria-selected', 'true');
-        }
-        if (todayContent) todayContent.classList.add('hidden');
-        if (wofContent) wofContent.classList.remove('hidden');
-
-        // Load wall of fame data if not yet loaded
-        if (!_dsWofLoaded) {
-            _dsWofLoaded = true;
-            dsLoadWofForDate(_dsLbDate || _dsData?.date);
-        }
-    }
-}
-
-// Unified date change handler for both tabs
-function dsDateChanged(val) {
-    _dsLbDate = val;
-    // Always load setlist data to update the header info
-    dsLoadSetlistForDate(val);
-    if (_dsActiveTab === 'wof') {
-        dsLoadWofForDate(val);
-    }
-}
-
-// ── View switching ────────────────────────────────────────────────────────────
+// The only DOM view that survives outside the 3D overlay is the loading
+// spinner; everything else is a diegetic dungeon room.
 function dsShow(view) {
-    _dsInCompleteView = (view === 'complete');
-    ['loading', 'setlist', 'complete', 'leaderboard', 'passport', 'shop'].forEach(v => {
-        const el = document.getElementById(`ds-${v}`);
-        if (!el) return;
-        el.classList.toggle('hidden', v !== view);
-    });
-    // Hide token counter in shop view (it shows its own)
-    const tokenCounter = document.getElementById('ds-token-counter');
-    if (tokenCounter && view !== 'shop') {
-        // Only show token counter if we have loaded inventory
-        if (view === 'setlist' || view === 'complete') {
-            tokenCounter.classList.remove('hidden');
-        }
-    }
+    const el = document.getElementById('ds-loading');
+    if (el) el.classList.toggle('hidden', view !== 'loading');
 }
 
+// Fatal errors surface in the dungeon overlay (the 2D fallback screens are gone).
 function dsShowError(msg) {
-    dsShow('setlist');
-    let songsEl = document.getElementById('ds-songs');
-    // Ensure setlist view is visible before accessing children
-    const setlistView = document.getElementById('ds-setlist');
-    if (setlistView && setlistView.classList.contains('hidden')) {
-        setlistView.classList.remove('hidden');
+    let overlay = document.getElementById('ds-dungeon-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'ds-dungeon-overlay';
+        document.body.appendChild(overlay);
     }
-    if (songsEl) {
-        songsEl.innerHTML = `<p class="text-red-400 text-sm py-8 text-center">${esc(msg)}</p>`;
-    } else {
-        // Fallback: create container if missing
-        if (setlistView) {
-            songsEl = document.createElement('div');
-            songsEl.id = 'ds-songs';
-            songsEl.className = 'space-y-3';
-            songsEl.innerHTML = `<p class="text-red-400 text-sm py-8 text-center">${esc(msg)}</p>`;
-            setlistView.appendChild(songsEl);
-        }
-    }
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;';
+    overlay.style.display = 'flex';
+    _dsShowDungeonFatal(overlay, 'Something went wrong', esc(msg));
 }
 
 // ── Confetti ──────────────────────────────────────────────────────────────────
-function dsRunConfetti() {
-    const canvas = document.getElementById('ds-confetti');
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    let cssW = window.innerWidth;
-    let cssH = window.innerHeight;
-
-    function sizeCanvas() {
-        cssW = window.innerWidth;
-        cssH = window.innerHeight;
-        canvas.width = cssW * dpr;
-        canvas.height = cssH * dpr;
-        canvas.style.width = cssW + 'px';
-        canvas.style.height = cssH + 'px';
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    }
-    sizeCanvas();
-    canvas.classList.remove('hidden');
-
-    const onResize = () => sizeCanvas();
-    window.addEventListener('resize', onResize);
-
-    const colors = ['#4080e0', '#60a0ff', '#e05050', '#e0a050', '#50c080', '#c050e0', '#e8c040'];
-    const particles = Array.from({ length: 80 }, () => ({
-        x: Math.random() * cssW,
-        y: -10 - Math.random() * 200,
-        w: 8 + Math.random() * 10,
-        h: 5 + Math.random() * 6,
-        color: colors[Math.floor(Math.random() * colors.length)],
-        vx: (Math.random() - 0.5) * 3,
-        vy: 2 + Math.random() * 4,
-        rot: Math.random() * Math.PI * 2,
-        vrot: (Math.random() - 0.5) * 0.15,
-        alpha: 1,
-    }));
-
-    const start = performance.now();
-    const duration = 3000;
-
-    function frame(now) {
-        const elapsed = now - start;
-        const progress = elapsed / duration;
-        ctx.clearRect(0, 0, cssW, cssH);
-
-        let alive = false;
-        for (const p of particles) {
-            p.x += p.vx;
-            p.y += p.vy;
-            p.vy += 0.08;
-            p.rot += p.vrot;
-            if (progress > 0.6) p.alpha = Math.max(0, 1 - (progress - 0.6) / 0.4);
-
-            if (p.y >= cssH + 20) continue;
-            alive = true;
-
-            ctx.save();
-            ctx.globalAlpha = p.alpha;
-            ctx.translate(p.x, p.y);
-            ctx.rotate(p.rot);
-            ctx.fillStyle = p.color;
-            ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
-            ctx.restore();
-        }
-
-        if (alive && elapsed < duration + 500) {
-            requestAnimationFrame(frame);
-        } else {
-            ctx.clearRect(0, 0, cssW, cssH);
-            window.removeEventListener('resize', onResize);
-            canvas.classList.add('hidden');
-        }
-    }
-    requestAnimationFrame(frame);
-}
-
-// Wall of Fame (merged into complete view)
-async function dsLoadWofForDate(dateStr) {
-    const todayIso = new Date().toISOString().slice(0, 10);
-    const target = dateStr || _dsLbDate || todayIso;
-    try {
-        const resp = await fetch(`/api/plugins/the_daily/leaderboard?date=${encodeURIComponent(target)}`, { cache: 'no-store' });
-        const text = await resp.text();
-        const data = text ? JSON.parse(text) : {};
-        dsRenderWof(data);
-    } catch (e) {
-        dsRenderWof({ date: target, available: false, entries: [], total_entries: 0, last_updated: null, day_name: '' });
-    }
-}
-
-function dsRenderWof(data) {
-    // Entry rendering only - header info shown above in navigation
-
-    // Errors / no data
-    const errEl = document.getElementById('ds-lb-error');
-    if (data.available === false) {
-        if (errEl) {
-            errEl.textContent = 'No data yet for this day. Try another day.';
-            errEl.classList.remove('hidden');
-        }
-        const container = document.getElementById('ds-lb-entries');
-        if (container) container.innerHTML = '';
-        const countEl = document.getElementById('ds-lb-count');
-        if (countEl) countEl.textContent = 'No entries';
-        return;
-    } else if (errEl) {
-        errEl.classList.add('hidden');
-    }
-
-    // Render entries
-    const container = document.getElementById('ds-lb-entries');
-    const entries = data.entries || [];
-    if (container) {
-        const popularity = (data.lane_popularity || []).map(p => `${esc(dsLaneLabel(p.lane))} ${p.percent}%`).join(' · ');
-        const popularityHtml = popularity ? `<div class="text-xs text-gray-400 bg-dark-700/40 border border-gray-800 rounded-xl px-4 py-2 mb-3">Lane popularity: ${popularity}</div>` : '';
-        if (entries.length === 0) {
-            container.innerHTML = popularityHtml + '<div class="text-gray-500 text-sm py-4 text-center">No entries for this day.</div>';
-        } else {
-            const ratingIcon = { '-1': '👎', '1': '👍', '2': '🔥' };
-            const rarestCount = Math.min(...(data.lane_popularity || []).map(p => p.count).concat([Infinity]));
-            const rarestLanes = new Set((data.lane_popularity || []).filter(p => p.count === rarestCount).map(p => p.lane));
-            container.innerHTML = popularityHtml + entries.map((e, idx) => {
-                const time = e.completed_at ? new Date(e.completed_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '';
-                const name = esc(e.display_name || 'Unknown');
-                const streak = (e.streak && e.streak > 1) ? `<span class="text-orange-400 text-xs">🔥 ${e.streak}-day streak</span>` : '';
-                const rating = (e.rating != null) ? `<span class="text-lg ml-2">${ratingIcon[e.rating] || ''}</span>` : '';
-                const message = (e.message) ? `<div class="text-xs text-gray-400 italic mt-0.5">${esc(e.message)}</div>` : '';
-                const badges = `${e.used_reroll ? '🎲' : ''}${e.lane_taken === 'sprint' ? ' ⚡' : ''}${e.lane_taken === 'marathon' ? ' 🌙' : ''}${rarestLanes.has(e.lane_taken) ? ' 🏴' : ''}`.trim();
-                const pathTrace = Array.isArray(e.path) && e.path.length ? dsPathTraceSvg(e.path) : '';
-                return `
-                    <div class="flex items-start gap-3 bg-dark-700/40 border border-gray-800/30 rounded-xl px-4 py-3">
-                        <span class="text-xs text-gray-600 w-6 text-center mt-1">${idx + 1}</span>
-                        <div class="flex-1 min-w-0">
-                            <div class="flex items-center flex-wrap gap-2">
-                                <span class="text-sm font-medium text-white">${name}</span>
-                                ${streak}
-                                ${rating}
-                                ${badges ? `<span class="text-xs">${badges}</span>` : ''}
-                            </div>
-                            ${message}
-                            ${pathTrace}
-                        </div>
-                        <span class="text-xs text-gray-500 flex-shrink-0 mt-0.5">${time}</span>
-                    </div>`;
-            }).join('');
-        }
-    }
-
-    const countEl = document.getElementById('ds-lb-count');
-    if (countEl) {
-        const n = entries.length;
-        countEl.textContent = n === 1 ? '1 signer completed today' : `${n} signers completed today`;
-    }
-}
-
-function dsPathTraceSvg(path) {
-    const n = path.length;
-    if (!n) return '';
-    const w = Math.max(70, n * 18);
-    const circles = path.map((_, i) => `<circle cx="${10 + i * 18}" cy="10" r="4" fill="#60a5fa" />`).join('');
-    const lines = path.slice(1).map((_, i) => `<line x1="${10 + i * 18}" y1="10" x2="${28 + i * 18}" y2="10" stroke="#475569" stroke-width="2" />`).join('');
-    return `<svg width="${w}" height="20" viewBox="0 0 ${w} 20" class="mt-1" aria-label="Path trace">${lines}${circles}</svg>`;
-}
-
-// Unified navigation and button state
-function dsUpdateNavButtons() {
-    const curDateStr = _dsLbDate || _dsData?.date || new Date().toISOString().slice(0, 10);
-    const prevBtn = document.getElementById('ds-prev-day');
-    const nextBtn = document.getElementById('ds-next-day');
-    if (prevBtn) prevBtn.disabled = curDateStr <= '2026-04-22';
-    if (nextBtn) nextBtn.disabled = curDateStr >= new Date().toISOString().slice(0, 10);
-    // Also update the date picker
-    const dateInput = document.getElementById('ds-lb-date');
-    if (dateInput) dateInput.value = curDateStr;
-}
-
-function dsDatePrev() {
-    const base = _dsLbDate || _dsData?.date || new Date().toISOString().slice(0, 10);
-    const d = new Date(base + 'T12:00:00');
-    d.setDate(d.getDate() - 1);
-    if (d.toISOString().slice(0, 10) < '2026-04-22') return;
-    const newDate = d.toISOString().slice(0, 10);
-    _dsLbDate = newDate;
-    dsUpdateNavButtons();
-    // Always load setlist data to update the header info
-    dsLoadSetlistForDate(newDate);
-    if (_dsActiveTab === 'wof') {
-        dsLoadWofForDate(newDate);
-    }
-}
-
-function dsDateNext() {
-    const base = _dsLbDate || _dsData?.date || new Date().toISOString().slice(0, 10);
-    const d = new Date(base + 'T12:00:00');
-    d.setDate(d.getDate() + 1);
-    if (d.toISOString().slice(0, 10) > new Date().toISOString().slice(0, 10)) return;
-    const newDate = d.toISOString().slice(0, 10);
-    _dsLbDate = newDate;
-    dsUpdateNavButtons();
-    // Always load setlist data to update the header info
-    dsLoadSetlistForDate(newDate);
-    if (_dsActiveTab === 'wof') {
-        dsLoadWofForDate(newDate);
-    }
-}
-
-// Legacy aliases for compatibility
-function dsLbPrev() { dsDatePrev(); }
-function dsLbNext() { dsDateNext(); }
-function dsLbDateChanged(val) { dsDateChanged(val); }
-
-// Navigate to previous day from Day Complete view
-function dsGoPrevDay() { dsDatePrev(); }
-
-// Navigate to next day from Day Complete view
-function dsGoNextDay() { dsDateNext(); }
-
-// Keyboard navigation: Left/Right arrows navigate historical days when in complete view;
-// Enter/Space activates focused map node
-window.addEventListener('keydown', (e) => {
-    if (_dsDungeon) return;
-    if (e.key === 'Enter' || e.key === ' ') {
-        const svg = document.querySelector('[role="button"][tabindex="0"]');
-        if (svg && svg.dataset?.nodeId) {
-            dsOpenNode(svg.dataset.nodeId);
-            e.preventDefault();
-        }
-    }
-    if (typeof _dsInCompleteView !== 'undefined' && _dsInCompleteView) {
-        if (e.key === 'ArrowLeft') {
-            dsDatePrev();
-            e.preventDefault();
-        } else if (e.key === 'ArrowRight') {
-            dsDateNext();
-            e.preventDefault();
-        }
-    }
-});
-
-// ── Passport view ───────────────────────────────────────────────────────────────
-const LANE_GLYPHS = {
-    sprint: '🏃', marathon: '🐢', drop: '⬇', flat: '➡',
-    standard: '🎸', mixed: '🔀',
-};
-
-function dsLaneGlyph(lane) {
-    if (!lane) return '·';
-    if (lane.startsWith('decade_')) return lane.replace('decade_', "'").replace(/s$/, '');
-    return LANE_GLYPHS[lane] || '?';
-}
-
-async function dsLoadPassport() {
-    const r = await fetch(dsApiUrl('/api/plugins/the_daily/passport'), { headers: { 'X-Install-Id': dsInstallId() } });
-    const text = await r.text();
-    const data = text ? JSON.parse(text) : {};
-    if (data.error) {
-        document.getElementById('ds-passport-totals').innerHTML = `<p class="text-red-400 text-sm">${esc(data.error)}</p>`;
-        return;
-    }
-    dsRenderPassportTotals(data.totals);
-    dsRenderPassportGrid(data.days);
-    dsRenderPassportStamps(data.stamps_earned, data.stamps_progress);
-}
-
-function dsShowPassport() {
-    document.getElementById('ds-passport').classList.remove('hidden');
-    document.getElementById('ds-setlist').classList.add('hidden');
-    document.getElementById('ds-complete').classList.add('hidden');
-    document.getElementById('ds-loading').classList.add('hidden');
-    dsLoadPassport();
-}
-
-function dsRenderPassportTotals(totals) {
-    const t = document.getElementById('ds-passport-totals');
-    t.innerHTML = `
-      <div class="bg-dark-700 rounded-2xl p-3 text-center">
-        <div class="text-2xl font-bold text-white">${totals.total_dailies}</div>
-        <div class="text-xs text-gray-500">Dailies played</div>
-      </div>
-      <div class="bg-dark-700 rounded-2xl p-3 text-center">
-        <div class="text-2xl font-bold text-white">${totals.longest_streak}</div>
-        <div class="text-xs text-gray-500">Longest streak</div>
-      </div>
-      <div class="bg-dark-700 rounded-2xl p-3 text-center">
-        <div class="text-2xl font-bold text-white">${totals.current_streak}</div>
-        <div class="text-xs text-gray-500">Current streak</div>
-      </div>
-      <div class="bg-dark-700 rounded-2xl p-3 text-center">
-        <div class="text-2xl font-bold text-yellow-400">🪙 ${totals.lifetime_tokens_earned}</div>
-        <div class="text-xs text-gray-500">Lifetime tokens</div>
-      </div>`;
-}
-
-function dsRenderPassportGrid(days) {
-    const grid = document.getElementById('ds-passport-grid');
-    if (!days || !days.length) {
-        grid.innerHTML = '<div class="text-gray-500 text-sm">No dailies yet — come back tomorrow!</div>';
-        return;
-    }
-    const byMonth = {};
-    days.forEach(d => {
-        const ym = d.date.slice(0, 7);
-        (byMonth[ym] = byMonth[ym] || []).push(d);
-    });
-    const months = Object.keys(byMonth).sort();
-    grid.innerHTML = months.map(ym => {
-        const [y, m] = ym.split('-').map(Number);
-        return `<div>
-          <div class="text-xs uppercase text-gray-500 mb-1">${ym}</div>
-          <div class="grid grid-cols-7 gap-1">
-            ${byMonth[ym].map(d => `
-              <div class="passport-cell month-${m} aspect-square rounded-lg flex flex-col items-center justify-center cursor-pointer hover:ring-2 hover:ring-accent"
-                   title="${esc(d.day_name || '')} · ${esc(d.modifier || '')} · streak ${d.streak_at}"
-                   onclick="dsShowPassportDayDetail('${esc(d.date)}')">
-                <div class="text-lg">${dsLaneGlyph(d.lane)}</div>
-                <div class="text-xs text-gray-400">${d.date.slice(8)}${d.boss_done ? ' ✓' : ''}</div>
-              </div>
-            `).join('')}
-          </div>
-        </div>`;
-    }).join('');
-}
-
-function dsShowPassportDayDetail(date) {
-    const day = document.querySelector(`.passport-cell[onclick*="${date}"]`);
-    if (day) {
-        alert(day.getAttribute('title'));
-    }
-}
-
-function dsRenderStamp(id, earnedDate, locked) {
-    const icon = locked ? '🔒' : '⭐';
-    const title = id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    const dateAttr = earnedDate ? `<div class="text-xs text-gray-400">${earnedDate}</div>` : '';
-    return `<div class="flex flex-col items-center p-2 rounded ${locked ? 'opacity-50 bg-gray-100' : 'bg-yellow-50'}">
-        <div class="text-2xl">${icon}</div>
-        <div class="text-xs font-medium">${title}</div>
-        ${dateAttr}
-    </div>`;
-}
-
-function dsRenderPassportStamps(earned, progress) {
-    const shelf = document.getElementById('ds-passport-stamps');
-    const earnedHtml = (earned || []).map(s => dsRenderStamp(s.id, s.earned_date, false)).join('');
-    const lockedHtml = (progress || []).map(p => `
-      <div class="relative">
-        ${dsRenderStamp(p.id, null, true)}
-        <div class="absolute -bottom-1 left-0 right-0 text-center text-xs text-gray-500">
-          ${p.current} / ${p.target}
-        </div>
-      </div>`).join('');
-    shelf.innerHTML = earnedHtml + lockedHtml;
-}
-
-// Expose passport functions globally
-window.dsShowPassport = dsShowPassport;
-window.dsLoadPassport = dsLoadPassport;
-window.dsShowPassportDayDetail = dsShowPassportDayDetail;
-
-// ── Shop functions ───────────────────────────────────────────────────────────────
 let _dsShopFilter = 'all';
 let _dsCurrentNodeId = null; // track node_id when opened from map
-
-function dsShowShop(nodeId = null) {
-    _dsCurrentNodeId = nodeId;
-    document.getElementById('ds-shop').classList.remove('hidden');
-    document.getElementById('ds-setlist').classList.add('hidden');
-    document.getElementById('ds-complete').classList.add('hidden');
-    document.getElementById('ds-passport').classList.add('hidden');
-    document.getElementById('ds-loading').classList.add('hidden');
-    dsLoadShop(nodeId);
-    // Show token counter when shop is open
-    document.getElementById('ds-token-counter').classList.remove('hidden');
-}
 
 async function dsRefreshTokens() {
     try {
@@ -1643,6 +761,12 @@ function dsRenderShopItem(item, forNode = false) {
 }
 
 async function dsLoadShop(nodeId = null) {
+    // The full-screen 2D shop is gone; in a dungeon shop encounter the offer
+    // lives in #ds-map-panel, so repaint that via dsOpenShopNode instead.
+    if (!document.getElementById('ds-shop-items')) {
+        if (nodeId && document.getElementById('ds-map-panel')) dsOpenShopNode(nodeId);
+        return;
+    }
     try {
         const url = nodeId
             ? `/api/plugins/the_daily/shop?node_id=${encodeURIComponent(nodeId)}`
@@ -1685,18 +809,6 @@ async function dsBuyItem(itemId, nodeId = null) {
     } catch (e) {
         alert('Failed to purchase item.');
     }
-}
-
-function dsShopFilter(filter) {
-    _dsShopFilter = filter;
-    document.querySelectorAll('.ds-shop-tab').forEach(btn => {
-        const isSelected = btn.dataset.tab === filter;
-        btn.classList.toggle('bg-accent/20', isSelected);
-        btn.classList.toggle('text-accent', isSelected);
-        btn.classList.toggle('bg-dark-700', !isSelected);
-        btn.classList.toggle('text-gray-400', !isSelected);
-    });
-    dsLoadShop(_dsCurrentNodeId);
 }
 
 function dsCanRefund(item) {
@@ -1768,13 +880,35 @@ function dsApplyEquipped(equipped) {
 
 async function dsClearNode(nodeId) {
     try {
-        await fetch(dsApiUrl(`/api/plugins/the_daily/nodes/${encodeURIComponent(nodeId)}/clear`), {
+        const resp = await fetch(dsApiUrl(`/api/plugins/the_daily/nodes/${encodeURIComponent(nodeId)}/clear`), {
             method: 'POST',
             headers: { 'X-Install-Id': dsInstallId() }
         });
+        const text = await resp.text();
+        const result = text ? JSON.parse(text) : null;
+        // Fast path: if we're in the live dungeon and just cleared the room we're
+        // standing in, merge the fresh state and animate the exits unsealing in
+        // place — no teardown/rebuild. clearCurrentRoom returns false if the node
+        // isn't the current room, in which case we fall back to a full refresh.
+        if (result && result.cleared_node_ids) {
+            if (_dsData) {
+                ['cleared_node_ids', 'available_node_ids', 'locked_node_ids', 'committed_node_ids'].forEach(k => {
+                    if (result[k]) _dsData[k] = result[k];
+                });
+                if (typeof result.boss_revealed !== 'undefined') _dsData.boss_revealed = result.boss_revealed;
+                if (result.inventory) _dsData.inventory = result.inventory;
+                if (typeof result.is_complete !== 'undefined') _dsData.is_complete = result.is_complete;
+                if (result.progress) _dsData.progress = result.progress;
+            }
+            if (_dsDungeon && typeof _dsDungeon.clearCurrentRoom === 'function'
+                && _dsDungeon.clearCurrentRoom(nodeId, result)) {
+                return;
+            }
+        }
         await dsInit();
     } catch (e) {
         console.error('Failed to clear node:', e);
+        try { await dsInit(); } catch (_) {}
     }
 }
 
@@ -1953,12 +1087,10 @@ async function dsUseLaneReroll(nodeId) {
 }
 
 // ── Expose shop globals ──────────────────────────────────────────────────
-window.dsShowShop = dsShowShop;
 window.dsRefreshTokens = dsRefreshTokens;
 window.dsAnimateTokenDelta = dsAnimateTokenDelta;
 window.dsLoadShop = dsLoadShop;
 window.dsBuyItem = dsBuyItem;
-window.dsShopFilter = dsShopFilter;
 window.dsRefundItem = dsRefundItem;
 window.dsEquip = dsEquip;
 window.dsEquipToggle = dsEquipToggle;
@@ -1970,7 +1102,6 @@ window.dsClearNode = dsClearNode;
 window.dsBankProgress = dsBankProgress;
 window.dsChooseTreasure = dsChooseTreasure;
 window.dsRenderShopItem = dsRenderShopItem;
-window.dsUseBossReroll = dsUseBossReroll;
 window.dsUseLaneReroll = dsUseLaneReroll;
 window._dsShopFilter = _dsShopFilter;
 
@@ -1987,8 +1118,434 @@ var _dsHub = null;
 var _dsErrorScene = null;
 var _dsActiveMenuKey = null;
 
-// Persisted ambient-volume / sfx-volume helpers used by the shared _dsAudio
-// system and by the Options panel slider.
+// ── Shared procedural stone texture ─────────────────────────────────────────
+// One parametric canvas-texture generator, formerly copy-pasted into every
+// scene builder (7× the plain mono variant) plus 6 themed near-clones inside
+// the dungeon. `_dsStoneTexture` is the primitive; `_dsStoneBasic` reproduces
+// the mono-tinted brick wall used by every builder. Themed dungeon variants
+// (elite/boss/treasure/rest/mystery/shop) call the primitive with their own
+// brick-colour + accent passes.
+//
+// opts: { bg:        CSS colour for the background fill,
+//         brick:     () => CSS colour, called once per brick,
+//         accents:   optional (ctx, sz) => void, drawn after bricks,
+//         noise:     per-pixel jitter half-amplitude (default 4; 0 disables),
+//         ru, rv:    texture repeat }
+function _dsStoneTexture(THREE, opts) {
+    const sz = 64;
+    const tc = document.createElement('canvas');
+    tc.width = tc.height = sz;
+    const ctx = tc.getContext('2d');
+    ctx.fillStyle = opts.bg;
+    ctx.fillRect(0, 0, sz, sz);
+    const bw = 16, bh = 8;
+    for (let y = 0; y < sz; y += bh) {
+        const shift = (Math.floor(y / bh) % 2) * (bw / 2);
+        for (let xb = 0; xb <= sz + bw; xb += bw) {
+            const x = (xb + shift) % sz;
+            ctx.fillStyle = opts.brick();
+            ctx.fillRect(x, y, bw - 2, bh - 2);
+        }
+    }
+    if (opts.accents) opts.accents(ctx, sz);
+    const amp = opts.noise == null ? 4 : opts.noise;
+    if (amp > 0) {
+        const id = ctx.getImageData(0, 0, sz, sz);
+        for (let i = 0; i < id.data.length; i += 4) {
+            const n = Math.floor(Math.random() * (amp * 2) - amp);
+            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
+            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
+            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
+        }
+        ctx.putImageData(id, 0, 0);
+    }
+    const t = new THREE.CanvasTexture(tc);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(opts.ru, opts.rv);
+    t.minFilter = t.magFilter = THREE.NearestFilter;
+    return t;
+}
+
+function _dsStoneBasic(THREE, r, g, b, ru, rv, noise) {
+    return _dsStoneTexture(THREE, {
+        bg: `rgb(${r},${g},${b})`,
+        brick: () => {
+            const v = r + Math.floor(Math.random() * 18 - 9);
+            return `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
+        },
+        noise: noise,
+        ru: ru, rv: rv,
+    });
+}
+
+// ── Real dungeon textures (COMTEX pack, served from static/textures) ─────────
+// Materials are built synchronously with a procedural CanvasTexture so the
+// scene renders instantly; the real PNG is loaded async and swapped onto the
+// material's .map once decoded. On any failure the procedural fallback stays.
+let _dsTexLoader = null;
+let _dsMaxAniso = 0;             // hardware max anisotropy, set when a renderer is created
+const _dsTexCache = new Map();   // url -> THREE.Texture (shared, never disposed)
+function _dsApplyRealTex(THREE, mat, name, ru, rv, tint) {
+    try {
+        if (!_dsTexLoader) _dsTexLoader = new THREE.TextureLoader();
+        const url = '/api/plugins/the_daily/tex/' + name;
+        const finish = (tex) => {
+            // Per-material clone so each surface owns its own repeat values.
+            const t = tex.clone();
+            t.wrapS = t.wrapT = THREE.RepeatWrapping;
+            t.repeat.set(ru, rv);
+            // Trilinear mipmaps + anisotropy kill the shimmer/blur on surfaces
+            // receding into the distance (esp. the granite floor at grazing
+            // angles); NearestFilter magnification keeps the up-close pixelated
+            // Quake look intact. generateMipmaps stays on (POT sources).
+            t.minFilter = THREE.LinearMipmapLinearFilter;
+            t.magFilter = THREE.NearestFilter;
+            t.generateMipmaps = true;
+            t.anisotropy = _dsMaxAniso || 8;
+            if (THREE.SRGBColorSpace) t.colorSpace = THREE.SRGBColorSpace;
+            t.needsUpdate = true;
+            const old = mat.map;
+            mat.map = t;
+            if (tint != null) mat.color.setHex(tint);   // tint multiplies the map
+            mat.needsUpdate = true;
+            if (old && old.dispose) old.dispose();       // free the procedural canvas tex
+        };
+        const cached = _dsTexCache.get(url);
+        if (cached) { finish(cached); return; }
+        _dsTexLoader.load(url, (tex) => {
+            _dsTexCache.set(url, tex);
+            finish(tex);
+        }, undefined, () => { /* keep procedural fallback on error */ });
+    } catch (_) { /* THREE missing / no loader — keep fallback */ }
+}
+
+// Guarantee every solid surface in a built room carries a real texture.
+// Walks the scene graph; any opaque Lambert/Standard/Phong material that
+// doesn't already have a .map gets one, chosen by its tint (warm→wood,
+// near-black/cool→metal, else stone) and tiled by the mesh's world size so
+// texel density stays roughly constant. The material's original color is
+// preserved as a multiply tint, so hand-tuned shading survives. Purely
+// emissive / additive / transparent FX (flames, glows, banners, glass,
+// daises, swirls) are skipped — texturing them would wreck the effect.
+function _dsTextureAllSurfaces(THREE, root, disposables) {
+    if (!THREE || !root || !root.traverse) return;
+    const TEX_WORLD = 1.6;   // ~one tile per 1.6 world units
+    root.traverse((obj) => {
+        if (!obj.isMesh || !obj.geometry || !obj.material) return;
+        if (Array.isArray(obj.material)) return;
+        const mat = obj.material;
+        if (!mat.color || mat.map) return;                       // no tint slot, or already textured
+        if ((mat.userData && mat.userData.noAutoTex) ||
+            (obj.userData && obj.userData.noAutoTex)) return;     // explicitly animated by reference
+        if (mat.transparent || mat.depthWrite === false) return; // glass / overlays / FX
+        if (mat.blending && mat.blending !== THREE.NormalBlending) return; // additive glows
+        if (mat.fog === false) return;                           // flame cores / light tips
+        const c = mat.color;
+        const lum = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+        let name;
+        if ((c.r - c.b) > 0.14 && c.r > 0.14 && c.r >= c.g) name = 'wood.png';   // saturated warm = timber
+        else if (lum < 0.11)                                 name = 'metal.png';  // near-black structure
+        else if (c.b >= c.r * 1.05 && lum < 0.33)            name = 'metal.png';  // cool dark = metal
+        else                                                 name = 'wall_stone.png';
+        let ru = 1, rv = 1;
+        try {
+            obj.geometry.computeBoundingBox();
+            const bb = obj.geometry.boundingBox;
+            const sx = (bb.max.x - bb.min.x) * Math.abs(obj.scale.x || 1);
+            const sy = (bb.max.y - bb.min.y) * Math.abs(obj.scale.y || 1);
+            const sz = (bb.max.z - bb.min.z) * Math.abs(obj.scale.z || 1);
+            const dims = [sx, sy, sz].sort((a, b) => b - a);
+            ru = Math.min(8, Math.max(1, Math.round(dims[0] / TEX_WORLD)));
+            rv = Math.min(8, Math.max(1, Math.round(dims[1] / TEX_WORLD)));
+        } catch (_) {}
+        const tint = c.getHex();
+        const clone = mat.clone();   // per-mesh so each gets its own repeat
+        obj.material = clone;
+        if (disposables) disposables.push(clone);   // free on room teardown
+        _dsApplyRealTex(THREE, clone, name, ru, rv, tint);
+    });
+}
+
+// ── Quake lightstyles ───────────────────────────────────────────────────────
+// Quake animates lights with strings sampled at 10 Hz where each letter is a
+// brightness: 'a' = 0 (dark) … 'm' = 1.0 (normal) … 'z' ≈ 2.0 (bright). The
+// choppy stepped sampling — not a smooth sine — is exactly what makes a torch
+// read as Quake. Strings are the canonical defaults from the Quake source
+// (`fire`/`flicker` shimmer upward and never go dark, the way real torches do;
+// `candle` drops to black for an eerie sputter).
+const _DS_LIGHTSTYLES = {
+    fire:    'mmnmmommnmmonqnmmommnonqnmmomnnmm',
+    flicker: 'mmnmmommommnonmmonqnmmo',
+    candle:  'mmmmmaaaaammmmmaaaaaabcdefgabcdefg',
+};
+// Sample a style at `tMs`, offset by `phase` index units, → multiplier in [0,2].
+// A short linear blend between the two nearest 10 Hz samples keeps it lively
+// without hard strobing on the bright steps.
+function _dsSampleLightstyle(name, tMs, phase) {
+    const s = _DS_LIGHTSTYLES[name] || 'm';
+    const f = tMs * 0.01 + (phase || 0);   // 10 Hz: +1 index every 100 ms
+    const i = Math.floor(f);
+    const a = (s.charCodeAt(((i % s.length) + s.length) % s.length) - 97) / 12;
+    const b = (s.charCodeAt((((i + 1) % s.length) + s.length) % s.length) - 97) / 12;
+    return a + (b - a) * (f - i);
+}
+
+// ── Shared render target ────────────────────────────────────────────────────
+// Every scene builder (hub, dungeon, and the diegetic rooms) renders the same
+// 90s-crawler way: a fixed low-resolution WebGL target upscaled with pixelated
+// CSS (the resolution is a design constant per ADR 0007, not a perf knob). This
+// factory is the single source of truth for that render-target + canvas setup —
+// the one place to touch when changing the upscale CSS or wiring diagnostics.
+// scene/camera/fog stay with each builder since their fov, clip planes, and fog
+// legitimately differ (the dungeon runs at Quake scale; the rooms don't).
+function _dsRenderTarget(THREE, renderW, renderH) {
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    // Cache hardware max anisotropy so real-texture surfaces stay sharp at depth.
+    try { _dsMaxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy() || 1); } catch (_) {}
+    // Scenes are authored against a 320×200 buffer for the retro aspect, but that
+    // is far too coarse to read in-world text/labels on a modern display. Render
+    // at an integer multiple of the authored size (same aspect → identical look,
+    // just sharp), sized to the viewport and capped for performance. The chunky
+    // procedural wall textures keep the retro feel regardless of buffer size.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const targetW = Math.min((window.innerWidth || 1280) * dpr, 2560);
+    const scale = Math.max(2, Math.min(8, Math.round(targetW / renderW)));
+    renderer.setSize(renderW * scale, renderH * scale, false);
+    renderer.setClearColor(0x000000);
+    const canvas = renderer.domElement;
+    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto;';
+    _dsInstallPostFx(THREE, renderer);
+    return { renderer, canvas };
+}
+
+// ── Palette-quantize + ordered-dither post pass ──────────────────────────────
+// The one render upgrade that *reinforces* the retro look instead of breaking
+// it: quantize the framebuffer to a coarse per-channel palette and hide the
+// banding with a 4×4 Bayer dither locked to output pixels. Applied uniformly to
+// every scene by wrapping the shared renderer's draw call, so the Hub, dungeon,
+// and diegetic rooms all share one cohesive VGA-ish grain. Tunable here only.
+const _DS_POSTFX_LEVELS = 16;     // quantization steps per channel (lower = chunkier)
+function _dsInstallPostFx(THREE, renderer) {
+    if (renderer.__dsPostFx) return;
+    // 4×4 Bayer matrix → a tiny RGBA DataTexture (value replicated per channel),
+    // sampled by output-pixel coords so the dither cell is a fixed 4px regardless
+    // of upscale. Uint8 keeps it WebGL1-safe (no float-texture extension needed).
+    const B = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+    const bytes = new Uint8Array(16 * 4);
+    for (let i = 0; i < 16; i++) {
+        const v = Math.round(((B[i] + 0.5) / 16) * 255);
+        bytes[i * 4] = bytes[i * 4 + 1] = bytes[i * 4 + 2] = v; bytes[i * 4 + 3] = 255;
+    }
+    const bayer = new THREE.DataTexture(bytes, 4, 4, THREE.RGBAFormat);
+    bayer.wrapS = bayer.wrapT = THREE.RepeatWrapping;
+    bayer.magFilter = bayer.minFilter = THREE.NearestFilter;
+    bayer.needsUpdate = true;
+
+    const sz = new THREE.Vector2();
+    renderer.getSize(sz);
+    const rt = new THREE.WebGLRenderTarget(Math.max(1, sz.x), Math.max(1, sz.y), {
+        minFilter: THREE.LinearFilter, magFilter: THREE.NearestFilter, depthBuffer: true,
+    });
+
+    const quadScene = new THREE.Scene();
+    const quadCam = new THREE.Camera();
+    const mat = new THREE.ShaderMaterial({
+        uniforms: { tDiffuse: { value: rt.texture }, tBayer: { value: bayer }, uLevels: { value: _DS_POSTFX_LEVELS } },
+        depthTest: false, depthWrite: false,
+        vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+        fragmentShader: [
+            'precision highp float;',
+            'uniform sampler2D tDiffuse; uniform sampler2D tBayer; uniform float uLevels;',
+            'varying vec2 vUv;',
+            'void main(){',
+            '  vec3 c = texture2D(tDiffuse, vUv).rgb;',
+            '  c = pow(clamp(c, 0.0, 1.0), vec3(0.4545));',      // linear → sRGB (the inserted RT bypassed auto-encode)
+            // Mild cinematic grade + vignette, applied before the dither so the
+            // quantizer spreads any gradient banding. Kept subtle so the coarse
+            // VGA palette still reads as the dominant look.
+            '  c = mix(c, c * c * (3.0 - 2.0 * c), 0.12);',      // gentle S-curve contrast
+            '  c += vec3(0.015, 0.006, -0.006) * (1.0 - c);',    // warm the shadows a touch
+            '  vec2 vc = vUv - 0.5;',
+            '  float vig = smoothstep(0.85, 0.35, length(vc));', // 1 center → ~0.2 corners
+            '  c *= mix(0.76, 1.0, vig);',                       // darken corners to focus the view
+            '  float th = texture2D(tBayer, gl_FragCoord.xy / 4.0).r - 0.5;',
+            '  float n = uLevels - 1.0;',
+            '  c += th / uLevels;',                               // spread the quantization error
+            '  c = floor(c * n + 0.5) / n;',                      // snap to the palette
+            '  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);',
+            '}',
+        ].join('\n'),
+    });
+    quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
+
+    const realRender = renderer.render.bind(renderer);
+    let inPost = false;
+    renderer.render = function (scene, camera) {
+        if (inPost || scene === quadScene) { realRender(scene, camera); return; }
+        renderer.getSize(sz);
+        if (rt.width !== sz.x || rt.height !== sz.y) rt.setSize(Math.max(1, sz.x), Math.max(1, sz.y));
+        inPost = true;
+        try {
+            renderer.setRenderTarget(rt);
+            realRender(scene, camera);
+            // Snapshot the SCENE's draw stats here — the quad pass below resets
+            // renderer.info (autoReset), so a post-render read would only ever see
+            // the 2-triangle fullscreen quad. Diagnostics read __dsSceneInfo.
+            const ri = renderer.info.render;
+            renderer.__dsSceneInfo = { triangles: ri.triangles, calls: ri.calls };
+            renderer.setRenderTarget(null);
+            realRender(quadScene, quadCam);
+        } finally { inPost = false; }
+    };
+    renderer.__dsPostFx = { rt, mat, bayer, dispose() { rt.dispose(); mat.dispose(); bayer.dispose(); } };
+}
+
+// ── Quake first-person controller ───────────────────────────────────────────
+// The reusable physics kernel ported from mrdoob/three-quake (in_web.js +
+// pmove.js), lifted out of the dungeon builder so it can be tested in isolation
+// and reused by any first-person scene. It owns the view-angle state, WASD
+// intent, Pointer-Lock mouselook math, Quake ground physics (PM_Friction +
+// PM_Accelerate), and the V_CalcBob / V_CalcRoll view feel. It does NOT own
+// collision — the caller integrates `vel` against its own geometry each frame
+// and zeroes a component on a wall hit. `eye` is the camera eye height in the
+// caller's world units (Quake scale in the dungeon's case).
+//
+// Per-frame contract:  applyLook() → { wx, wz, wishspeed } = wishDir() →
+//   accelerate(dt, wx, wz, wishspeed) → caller integrates+collides → set
+//   camera.position.y = eye + viewBobRoll(dt) → caller does camera.rotation.set
+//   using qc.pitch / qc.yaw / qc.viewRoll.
+function _dsQuakeController(camera, opts) {
+    const eye = (opts && opts.eye) || 0;
+    const DEG2RAD = Math.PI / 180;
+    // Authentic Quake: angle delta = mouse * sensitivity(3) * m_yaw/m_pitch(0.022).
+    const LOOK_SENS = 0.022 * 3 * DEG2RAD;
+    const PITCH_MAX = 80 * DEG2RAD;            // Quake clamps pitch to ~±80°
+    // Literal Quake values — the world is sized to Quake units, so these are used
+    // 1:1, not scaled. sv_maxspeed 320, sv_accelerate 10, sv_friction 4,
+    // sv_stopspeed 100. Run: walk at cl_forwardspeed(200); +speed × cl_movespeedkey(2).
+    const MOVE_MAXSPEED = 320, MOVE_ACCEL = 10, MOVE_FRICTION = 4;
+    const MOVE_STOPSPEED = 100;
+    const MOVE_WALKSPEED = 200, RUN_MULT = 2.0;
+    // View bob — V_CalcBob: cl_bob 0.02, cl_bobcycle 0.6, cl_bobup 0.5.
+    const CL_BOB = 0.02, CL_BOBCYCLE = 0.6, CL_BOBUP = 0.5;
+    // View roll — V_CalcRoll: cl_rollangle 2°, cl_rollspeed 200.
+    const CL_ROLLANGLE = 2.0, CL_ROLLSPEED = 200;
+
+    camera.rotation.order = 'YXZ';
+
+    return {
+        yaw: 0, pitch: 0,                       // radians; yaw 0 faces -z
+        vel: { x: 0, z: 0 },                    // floor-plane velocity (units/sec)
+        keys: { f: false, b: false, l: false, r: false, run: false },
+        mxAccum: 0, myAccum: 0,                 // unconsumed Pointer-Lock deltas
+        bobTime: 0, viewRoll: 0,                // V_CalcBob accumulator; current roll (rad)
+
+        reset() {
+            this.yaw = 0; this.pitch = 0; this.vel.x = 0; this.vel.z = 0;
+            this.mxAccum = 0; this.myAccum = 0; this.bobTime = 0; this.viewRoll = 0;
+            this.keys.f = this.keys.b = this.keys.l = this.keys.r = this.keys.run = false;
+            camera.position.set(0, eye, 0);
+            camera.rotation.set(0, 0, 0);
+        },
+
+        clearKeys() {
+            this.keys.f = this.keys.b = this.keys.l = this.keys.r = this.keys.run = false;
+        },
+
+        // Accumulate raw Pointer-Lock movement; applied (and cleared) by applyLook.
+        addMouse(dx, dy) { this.mxAccum += dx || 0; this.myAccum += dy || 0; },
+
+        // Apply accumulated mouse deltas to view angles (Quake), then clear them.
+        applyLook() {
+            if (this.mxAccum === 0 && this.myAccum === 0) return;
+            this.yaw   -= this.mxAccum * LOOK_SENS;
+            this.pitch -= this.myAccum * LOOK_SENS;
+            if (this.pitch >  PITCH_MAX) this.pitch =  PITCH_MAX;
+            if (this.pitch < -PITCH_MAX) this.pitch = -PITCH_MAX;
+            this.mxAccum = 0; this.myAccum = 0;
+        },
+
+        // Map a keydown/keyup to a movement intent. Returns true if handled.
+        setMoveKey(e, down) {
+            switch (e.key) {
+                case 'w': case 'W': case 'ArrowUp':    this.keys.f = down; return true;
+                case 's': case 'S': case 'ArrowDown':  this.keys.b = down; return true;
+                case 'a': case 'A': case 'ArrowLeft':  this.keys.l = down; return true;
+                case 'd': case 'D': case 'ArrowRight': this.keys.r = down; return true;
+                case 'Shift': this.keys.run = down; return true;   // +speed (run)
+            }
+            return false;
+        },
+
+        // Normalized wish-direction + wish-speed from the current keys + yaw.
+        wishDir() {
+            const fwd = (this.keys.f ? 1 : 0) - (this.keys.b ? 1 : 0);
+            const strafe = (this.keys.r ? 1 : 0) - (this.keys.l ? 1 : 0);
+            const sinY = Math.sin(this.yaw), cosY = Math.cos(this.yaw);
+            // forward = (-sinY, -cosY); right = (cosY, -sinY)
+            let wx = -sinY * fwd + cosY * strafe;
+            let wz = -cosY * fwd - sinY * strafe;
+            const wlen = Math.hypot(wx, wz);
+            let wishspeed = 0;
+            if (wlen > 0) {
+                wx /= wlen; wz /= wlen;
+                wishspeed = Math.min(this.keys.run ? MOVE_WALKSPEED * RUN_MULT : MOVE_WALKSPEED, MOVE_MAXSPEED);
+            }
+            return { wx, wz, wishspeed };
+        },
+
+        // PM_Friction then PM_Accelerate on `vel` for this wish vector.
+        accelerate(dt, wx, wz, wishspeed) {
+            const speed = Math.hypot(this.vel.x, this.vel.z);
+            if (speed > 0.0001) {
+                const control = speed < MOVE_STOPSPEED ? MOVE_STOPSPEED : speed;
+                const newspeed = Math.max(0, speed - control * MOVE_FRICTION * dt) / speed;
+                this.vel.x *= newspeed; this.vel.z *= newspeed;
+            } else { this.vel.x = 0; this.vel.z = 0; }
+            if (wishspeed > 0) {
+                const add = wishspeed - (this.vel.x * wx + this.vel.z * wz);
+                if (add > 0) {
+                    const accel = Math.min(MOVE_ACCEL * dt * wishspeed, add);
+                    this.vel.x += accel * wx; this.vel.z += accel * wz;
+                }
+            }
+        },
+
+        // Advance the bob cycle + roll for this frame; returns the bob offset to
+        // add to eye height. Call after collision so `vel` reflects wall hits.
+        viewBobRoll(dt) {
+            // V_CalcBob: cycle phase advances with real time (asymmetric via
+            // cl_bobup), amplitude = speed × cl_bob, clamped.
+            this.bobTime += dt;
+            let cycle = (this.bobTime - Math.floor(this.bobTime / CL_BOBCYCLE) * CL_BOBCYCLE) / CL_BOBCYCLE;
+            if (cycle < CL_BOBUP) cycle = Math.PI * cycle / CL_BOBUP;
+            else cycle = Math.PI + Math.PI * (cycle - CL_BOBUP) / (1 - CL_BOBUP);
+            const gs = Math.hypot(this.vel.x, this.vel.z);
+            let bob = gs * CL_BOB;
+            bob = bob * 0.3 + bob * 0.7 * Math.sin(cycle);
+            bob = Math.max(-7, Math.min(4, bob));
+            // V_CalcRoll: bank into lateral velocity.
+            const sinY = Math.sin(this.yaw), cosY = Math.cos(this.yaw);
+            let side = this.vel.x * cosY + this.vel.z * (-sinY);   // dot(velocity, right)
+            const sign = side < 0 ? -1 : 1;
+            side = Math.abs(side);
+            const rollDeg = (side < CL_ROLLSPEED ? side * CL_ROLLANGLE / CL_ROLLSPEED : CL_ROLLANGLE) * sign;
+            this.viewRoll = -rollDeg * DEG2RAD;   // negative: camera banks toward the strafe
+            return bob;
+        },
+    };
+}
+
+// Shared first-person rig for the static side rooms (Wall of Fame, Archive,
+// Hall of Records, Shop). Gives each the same Quake WASD + mouselook + box
+// collision the Hub and Dungeon have, so every room is walkable rather than
+// on-rails. The caller owns its scene/loop and just:
+//   - calls walk.step(dt) inside its idle phase (after which it sets
+//     camera.rotation from qc), and
+//   - supplies callbacks: canMove(), interact(raycaster)->bool, onExit(), onEscape().
+// Walking out the back of the room (toward +z, the entry the player arrived
+// through) triggers onExit once; Escape calls onEscape. Returns { qc, step,
+// detach, isLocked }.
 function _dsAmbientVol() {
     const v = localStorage.getItem('ds_dun_ambient_vol');
     if (v == null) return 0.7;
@@ -2257,6 +1814,45 @@ var _dsAudio = null;
         } catch(e) {}
     }
 
+    // Quake-style menu blips. Short, dry, retro — a tight square "tick" on
+    // move and a deeper two-step "chunk" on select. Gated behind sfx volume.
+    function playMenuMove() {
+        if (!ctx || !ambiActive) return;
+        try {
+            var t = ctx.currentTime;
+            var vol = 0.10 * _dsSfxVol();
+            var osc = ctx.createOscillator();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(540, t);
+            osc.frequency.exponentialRampToValueAtTime(680, t + 0.03);
+            var g = ctx.createGain();
+            g.gain.setValueAtTime(vol, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+            osc.connect(g); g.connect(sfxMaster);
+            osc.start(t); osc.stop(t + 0.07);
+        } catch(e) {}
+    }
+
+    function playMenuSelect() {
+        if (!ctx || !ambiActive) return;
+        try {
+            var t = ctx.currentTime;
+            var vol = 0.16 * _dsSfxVol();
+            // Down-step thunk: bright tick then a low confirming square.
+            [[760, 0, 0.04, 'square'], [180, 0.05, 0.18, 'square']].forEach(function(p) {
+                var osc = ctx.createOscillator();
+                osc.type = p[3];
+                osc.frequency.setValueAtTime(p[0], t + p[1]);
+                osc.frequency.exponentialRampToValueAtTime(p[0] * 0.6, t + p[1] + p[2]);
+                var g = ctx.createGain();
+                g.gain.setValueAtTime(vol, t + p[1]);
+                g.gain.exponentialRampToValueAtTime(0.001, t + p[1] + p[2]);
+                osc.connect(g); g.connect(sfxMaster);
+                osc.start(t + p[1]); osc.stop(t + p[1] + p[2] + 0.02);
+            });
+        } catch(e) {}
+    }
+
     function setAmbientVol(v) {
         if (!ctx || !ambiMaster) return;
         try { ambiMaster.gain.cancelScheduledValues(ctx.currentTime); ambiMaster.gain.setTargetAtTime(v, ctx.currentTime, 0.05); } catch(e) {}
@@ -2284,6 +1880,8 @@ var _dsAudio = null;
         playFootstep: playFootstep,
         playDoorOpen: playDoorOpen,
         playBossClear: playBossClear,
+        playMenuMove: playMenuMove,
+        playMenuSelect: playMenuSelect,
         setAmbientVol: setAmbientVol,
         setSfxVol: setSfxVol,
         stop: stop,
@@ -2303,7 +1901,61 @@ function _dsCloseMenu() {
     if (panel && panel.parentNode) panel.parentNode.removeChild(panel);
 }
 
+// ── Quake-styled menu chrome ──────────────────────────────────────────────────
+// One-time <style> injection: the carved-bronze logo gradient, the iconic
+// animated flame cursor (bob + flicker), the torch-glow vignette, and the
+// item bevel. Shared by the hero main menu and every sub-menu so the whole
+// dungeon UI reads as one gothic, torch-lit world rather than a web dialog.
+function _dsInjectMenuCSS() {
+    if (document.getElementById('ds-quake-menu-css')) return;
+    const st = document.createElement('style');
+    st.id = 'ds-quake-menu-css';
+    st.textContent = `
+    .ds-q-panel{font-family:'Times New Roman',Georgia,serif;color:#b89055;
+        background:radial-gradient(120% 90% at 50% 0%,#2a1206 0%,#150a04 38%,#070402 78%,#000 100%);}
+    .ds-q-title{font-weight:700;text-transform:uppercase;line-height:.92;
+        letter-spacing:.06em;
+        background:linear-gradient(180deg,#ffe9a8 0%,#e8b04a 34%,#9a5a16 70%,#5a3008 100%);
+        -webkit-background-clip:text;background-clip:text;color:transparent;
+        -webkit-text-fill-color:transparent;
+        filter:drop-shadow(0 2px 0 #1a0c03) drop-shadow(0 0 14px rgba(232,160,64,.35));}
+    .ds-q-kicker{font-family:'Times New Roman',Georgia,serif;text-transform:uppercase;
+        font-weight:700;letter-spacing:.55em;color:#7a4a1c;
+        text-shadow:0 1px 0 #000;}
+    .ds-q-sub{font-family:'Courier New',monospace;text-transform:uppercase;
+        letter-spacing:.22em;color:#8a6a3a;text-shadow:0 1px 2px #000;}
+    .ds-q-item{position:relative;background:none;border:none;cursor:pointer;
+        font-family:'Times New Roman',Georgia,serif;font-weight:700;
+        text-transform:uppercase;letter-spacing:.18em;color:#9c7642;
+        padding:6px 14px 6px 40px;text-align:left;display:block;width:100%;
+        min-height:44px;line-height:1.1;
+        transition:color .08s ease,text-shadow .08s ease,transform .08s ease;
+        text-shadow:0 1px 0 #000;outline:none;}
+    .ds-q-item:disabled{color:#4a3a26;cursor:default;text-shadow:none;}
+    .ds-q-item.sel{color:#ffd24a;transform:translateX(2px);
+        text-shadow:0 0 10px rgba(255,200,70,.6),0 1px 0 #2a1402;}
+    .ds-q-item .ds-q-cursor{position:absolute;left:8px;top:50%;
+        transform:translateY(-50%);opacity:0;color:#ffcb45;font-size:1.05em;
+        text-shadow:0 0 8px #ff8c1a,0 0 16px #d4600a;
+        animation:dsCursorBob .5s steps(2,jump-none) infinite,dsCursorFlick .12s steps(2) infinite;}
+    .ds-q-item.sel .ds-q-cursor{opacity:1;}
+    @keyframes dsCursorBob{0%{margin-left:0;}100%{margin-left:5px;}}
+    @keyframes dsCursorFlick{0%{opacity:1;}100%{opacity:.72;}}
+    .ds-q-footer{font-family:'Courier New',monospace;color:#5a4326;
+        letter-spacing:.18em;text-shadow:0 1px 0 #000;}
+    .ds-reticle{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+        width:4px;height:4px;background:rgba(255,255,255,0.55);border-radius:50%;
+        z-index:7;pointer-events:none;opacity:0;transition:opacity .15s ease;}
+    .ds-reticle.ds-reticle-on{opacity:1;}
+    `;
+    document.head.appendChild(st);
+}
+
+function _dsMenuMove() { try { if (_dsAudio) _dsAudio.playMenuMove(); } catch(e) {} }
+function _dsMenuSelect() { try { if (_dsAudio) _dsAudio.playMenuSelect(); } catch(e) {} }
+
 function _dsRenderMenu(container, opts) {
+    _dsInjectMenuCSS();
     if (_dsActiveMenuKey) {
         window.removeEventListener('keydown', _dsActiveMenuKey, true);
         _dsActiveMenuKey = null;
@@ -2314,7 +1966,8 @@ function _dsRenderMenu(container, opts) {
         panel.id = 'ds-dungeon-menu';
         container.appendChild(panel);
     }
-    panel.style.cssText = 'position:absolute;inset:0;z-index:8;background:rgba(0,0,0,0.92);display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:monospace;color:#a3a3a3;padding:24px;';
+    panel.className = 'ds-q-panel';
+    panel.style.cssText = 'position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:max(24px,env(safe-area-inset-top)) 24px max(24px,env(safe-area-inset-bottom));';
 
     const items = opts.items || [];
     let sel = items.findIndex(it => !it.disabled);
@@ -2323,34 +1976,32 @@ function _dsRenderMenu(container, opts) {
     const render = () => {
         const itemsHtml = items.map((it, i) => {
             const cur = i === sel;
-            const dim = it.disabled ? 0.3 : 1;
-            const color = cur ? '#e8c040' : '#aaa';
-            return `<button data-mi="${i}"${it.disabled ? ' disabled' : ''} style="background:none;border:none;color:${color};font-family:monospace;font-size:1.05rem;letter-spacing:.2em;padding:8px 12px;cursor:${it.disabled ? 'default' : 'pointer'};text-align:left;display:block;opacity:${dim};">${cur ? '▶ ' : '  '}${esc(it.label)}</button>`;
+            return `<button data-mi="${i}"${it.disabled ? ' disabled' : ''} class="ds-q-item${cur ? ' sel' : ''}" style="font-size:1.05rem;"><span class="ds-q-cursor" aria-hidden="true">&#9656;</span>${esc(it.label)}</button>`;
         }).join('');
 
         panel.innerHTML = `
-            <div style="color:#60a5fa;font-size:1.6rem;letter-spacing:.3em;margin-bottom:6px;text-align:center;">${esc(opts.title || '')}</div>
-            ${opts.subtitle ? `<div style="color:#666;font-size:0.72rem;letter-spacing:.18em;margin-bottom:32px;text-align:center;max-width:480px;">${esc(opts.subtitle)}</div>` : '<div style="margin-bottom:32px;"></div>'}
+            <div class="ds-q-title" style="font-size:clamp(1.4rem,5vw,2rem);letter-spacing:.14em;margin-bottom:6px;text-align:center;">${esc(opts.title || '')}</div>
+            ${opts.subtitle ? `<div class="ds-q-sub" style="font-size:0.72rem;margin-bottom:30px;text-align:center;max-width:480px;">${esc(opts.subtitle)}</div>` : '<div style="margin-bottom:30px;"></div>'}
             ${opts.body ? `<div style="margin-bottom:24px;">${opts.body}</div>` : ''}
-            <div style="display:flex;flex-direction:column;gap:4px;min-width:240px;">${itemsHtml}</div>
+            <div style="display:flex;flex-direction:column;gap:2px;min-width:min(260px,90vw);">${itemsHtml}</div>
         `;
         if (typeof opts.afterRender === 'function') opts.afterRender(panel);
         panel.querySelectorAll('button[data-mi]').forEach(b => {
             const i = parseInt(b.dataset.mi, 10);
-            b.addEventListener('mouseenter', () => { if (!items[i].disabled) { sel = i; render(); } });
-            b.addEventListener('click', () => { if (!items[i].disabled) items[i].action(); });
+            b.addEventListener('mouseenter', () => { if (!items[i].disabled && sel !== i) { sel = i; _dsMenuMove(); render(); } });
+            b.addEventListener('click', () => { if (!items[i].disabled) { _dsMenuSelect(); items[i].action(); } });
         });
     };
 
     const onKey = (e) => {
         if (e.key === 'ArrowDown' || e.key === 's') {
             for (let i = 0; i < items.length; i++) { sel = (sel + 1) % items.length; if (!items[sel].disabled) break; }
-            render(); e.preventDefault(); e.stopPropagation();
+            _dsMenuMove(); render(); e.preventDefault(); e.stopPropagation();
         } else if (e.key === 'ArrowUp' || e.key === 'w') {
             for (let i = 0; i < items.length; i++) { sel = (sel - 1 + items.length) % items.length; if (!items[sel].disabled) break; }
-            render(); e.preventDefault(); e.stopPropagation();
+            _dsMenuMove(); render(); e.preventDefault(); e.stopPropagation();
         } else if (e.key === 'Enter' || e.key === ' ') {
-            if (!items[sel].disabled) items[sel].action();
+            if (!items[sel].disabled) { _dsMenuSelect(); items[sel].action(); }
             e.preventDefault(); e.stopPropagation();
         } else if (e.key === 'Escape' && typeof opts.onCancel === 'function') {
             opts.onCancel();
@@ -2363,20 +2014,166 @@ function _dsRenderMenu(container, opts) {
 }
 
 // ── Specific menus ───────────────────────────────────────────────────────────
-function _dsShowTitleMenu(overlay, d) {
-    const hasProgress = !!localStorage.getItem('ds_dun_node_' + d.date);
-    const subtitle = `${d.day_name || ''}${d.modifier?.label ? ' · ' + d.modifier.label : ''}`;
-    _dsRenderMenu(overlay, {
-        title: 'THE DAILY',
-        subtitle,
-        items: [
-            { label: hasProgress ? 'CONTINUE RUN' : 'NEW RUN', action: () => _dsStartRun(overlay, d) },
-            { label: 'RESTART RUN', action: () => _dsConfirmRestart(overlay, d, () => _dsShowTitleMenu(overlay, d)) },
-            { label: 'OPTIONS', action: () => _dsShowOptionsMenu(overlay, () => _dsShowTitleMenu(overlay, d)) },
-            { label: 'EXIT', action: () => { _dsCloseMenu(); dsDungeonExit(); dsRender(); dsShow('setlist'); } },
-        ],
-    });
+// The Quake-1-styled main menu — the dungeon's front door. A torch-lit ember
+// backdrop, a carved-bronze "THE DAILY" wordmark, the animated flame cursor,
+// and the classic vertical option list. ENTER walks the player into the Hub
+// (the 3D lobby), exactly as dsDungeonEnter used to do directly.
+function _dsShowMainMenu(overlay, d) {
+    _dsInjectMenuCSS();
+    if (_dsActiveMenuKey) { window.removeEventListener('keydown', _dsActiveMenuKey, true); _dsActiveMenuKey = null; }
+    if (_dsAudio) { _dsAudio.init(); _dsAudio.setRoomMotif('hub'); }
+
+    let panel = document.getElementById('ds-dungeon-menu');
+    if (!panel) { panel = document.createElement('div'); panel.id = 'ds-dungeon-menu'; overlay.appendChild(panel); }
+    panel.className = 'ds-q-panel';
+    panel.style.cssText = 'position:absolute;inset:0;z-index:8;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:max(28px,env(safe-area-inset-top)) 24px max(28px,env(safe-area-inset-bottom));';
+
+    const hasProgress = !!localStorage.getItem('ds_dun_node_' + d.date) || !!localStorage.getItem('ds_dun_pos_' + d.date);
+    const enterHub = () => {
+        _dsCloseMenu();
+        if (_dsDungeon) { _dsDungeon.destroy(); _dsDungeon = null; }
+        if (_dsHub) { _dsHub.destroy(); _dsHub = null; }
+        overlay.innerHTML = '';
+        if (_dsAudio) { _dsAudio.init(); _dsAudio.setRoomMotif('hub'); }
+        try {
+            _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
+            _dsHub.start();
+        } catch (e) {
+            console.error('[daily] hub scene failed to build:', e);
+            _dsHub = null;
+            _dsShowDungeonFatal(overlay, 'Dungeon failed to load',
+                'Something went wrong building the 3D scene' + (e && e.message ? ' (' + e.message + ').' : '.') + ' Try reloading Slopsmith.');
+        }
+    };
+
+    const items = [
+        { label: hasProgress ? 'CONTINUE' : 'DESCEND', action: enterHub },
+    ];
+    if (hasProgress) {
+        items.push({ label: 'RESTART RUN', action: () => _dsConfirmRestart(overlay, d, () => _dsShowMainMenu(overlay, d)) });
+    }
+    items.push({ label: 'OPTIONS', action: () => _dsShowOptionsMenu(overlay, () => _dsShowMainMenu(overlay, d)) });
+    // QUIT leaves the Daily entirely and returns to the host library — the
+    // legacy 2D map is not a valid destination in dungeon mode.
+    items.push({ label: 'QUIT', action: () => { _dsCloseMenu(); dsDungeonExit(); try { window.showScreen('home'); } catch (e) {} } });
+
+    let sel = 0;
+    const subtitle = `${d.day_name || ''}${d.modifier?.label ? ' • ' + d.modifier.label : ''}`;
+
+    panel.innerHTML = `
+        <canvas id="ds-mm-bg" style="position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;"></canvas>
+        <div style="position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;width:100%;max-width:560px;">
+            <div class="ds-q-kicker" style="font-size:clamp(.6rem,2.4vw,.82rem);margin-bottom:6px;">The</div>
+            <div class="ds-q-title" style="font-size:clamp(3.2rem,15vw,6.4rem);margin-bottom:8px;">DAILY</div>
+            <div class="ds-q-sub" style="font-size:clamp(.6rem,2.6vw,.78rem);text-align:center;margin-bottom:clamp(24px,6vh,48px);max-width:90%;">${esc(subtitle)}</div>
+            <div id="ds-mm-items" role="menu" aria-label="Main menu" style="display:flex;flex-direction:column;gap:2px;width:min(280px,82vw);"></div>
+        </div>
+        <div class="ds-q-footer" style="position:absolute;left:max(16px,env(safe-area-inset-left));bottom:max(12px,env(safe-area-inset-bottom));z-index:1;font-size:.6rem;">&#8593;&#8595; SELECT &#8226; ENTER CONFIRM</div>
+        <div class="ds-q-footer" style="position:absolute;right:max(16px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));z-index:1;font-size:.6rem;">DAY #${esc(String(d.day_number || ''))}</div>
+    `;
+
+    const itemsWrap = panel.querySelector('#ds-mm-items');
+    const renderItems = () => {
+        itemsWrap.innerHTML = items.map((it, i) =>
+            `<button data-mi="${i}" role="menuitem" tabindex="${i === sel ? 0 : -1}" class="ds-q-item${i === sel ? ' sel' : ''}" style="font-size:clamp(1.05rem,4vw,1.3rem);"><span class="ds-q-cursor" aria-hidden="true">&#9656;</span>${esc(it.label)}</button>`
+        ).join('');
+        itemsWrap.querySelectorAll('button[data-mi]').forEach(b => {
+            const i = parseInt(b.dataset.mi, 10);
+            b.addEventListener('mouseenter', () => { if (sel !== i) { sel = i; _dsMenuMove(); renderItems(); } });
+            b.addEventListener('click', () => { _dsMenuSelect(); items[i].action(); });
+        });
+        const cur = itemsWrap.querySelector('.ds-q-item.sel');
+        if (cur) { try { cur.focus({ preventScroll: true }); } catch (e) {} }
+    };
+    renderItems();
+
+    const onKey = (e) => {
+        if (e.key === 'ArrowDown' || e.key === 's') {
+            sel = (sel + 1) % items.length; _dsMenuMove(); renderItems(); e.preventDefault(); e.stopPropagation();
+        } else if (e.key === 'ArrowUp' || e.key === 'w') {
+            sel = (sel - 1 + items.length) % items.length; _dsMenuMove(); renderItems(); e.preventDefault(); e.stopPropagation();
+        } else if (e.key === 'Enter' || e.key === ' ') {
+            _dsMenuSelect(); items[sel].action(); e.preventDefault(); e.stopPropagation();
+        }
+    };
+    window.addEventListener('keydown', onKey, true);
+    _dsActiveMenuKey = onKey;
+
+    _dsMainMenuFx(panel.querySelector('#ds-mm-bg'), panel);
 }
+
+// Torch-lit ember backdrop for the main menu. Embers drift up through a warm
+// glow; a flickering top torch-light pulses the scene. Self-terminates when
+// the panel leaves the DOM (so _dsCloseMenu's node removal stops the loop) and
+// honours prefers-reduced-motion by drawing a single static frame.
+function _dsMainMenuFx(canvas, panel) {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let W = 0, H = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let embers = [];
+    const resize = () => {
+        const r = canvas.getBoundingClientRect();
+        W = Math.max(1, r.width); H = Math.max(1, r.height);
+        canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const target = Math.round(W * H / 26000);
+        while (embers.length < target) embers.push(mkEmber(true));
+        if (embers.length > target) embers.length = target;
+    };
+    function mkEmber(spawnAnywhere) {
+        return {
+            x: Math.random() * W,
+            y: spawnAnywhere ? Math.random() * H : H + 8,
+            r: 0.6 + Math.random() * 1.8,
+            vy: 8 + Math.random() * 22,
+            vx: (Math.random() - 0.5) * 10,
+            life: 0, max: 4 + Math.random() * 5,
+            hue: 24 + Math.random() * 16,
+        };
+    }
+    const ro = (typeof ResizeObserver !== 'undefined') ? new ResizeObserver(resize) : null;
+    if (ro) ro.observe(canvas); else window.addEventListener('resize', resize);
+    resize();
+
+    let last = performance.now();
+    const drawFrame = (now) => {
+        const dt = Math.min(0.05, (now - last) / 1000); last = now;
+        ctx.clearRect(0, 0, W, H);
+        // Flickering torch glow from the top.
+        const flick = reduce ? 0.85 : 0.7 + Math.random() * 0.3;
+        const g = ctx.createRadialGradient(W * 0.5, -H * 0.15, 0, W * 0.5, -H * 0.15, H * 1.05);
+        g.addColorStop(0, `rgba(255,150,50,${0.22 * flick})`);
+        g.addColorStop(0.4, `rgba(180,80,20,${0.10 * flick})`);
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+        // Embers.
+        ctx.globalCompositeOperation = 'lighter';
+        for (const e of embers) {
+            e.life += dt; e.y -= e.vy * dt; e.x += e.vx * dt + Math.sin(e.life * 2) * 0.3;
+            const a = Math.max(0, 1 - e.life / e.max) * (0.5 + Math.random() * 0.5);
+            ctx.beginPath();
+            ctx.fillStyle = `hsla(${e.hue},100%,60%,${a})`;
+            ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2); ctx.fill();
+            if (e.y < -10 || e.life > e.max) Object.assign(e, mkEmber(false));
+        }
+        ctx.globalCompositeOperation = 'source-over';
+        // Bottom vignette to seat the menu.
+        const vg = ctx.createLinearGradient(0, H * 0.55, 0, H);
+        vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+        ctx.fillStyle = vg; ctx.fillRect(0, H * 0.55, W, H * 0.45);
+
+        if (!panel.isConnected) { if (ro) ro.disconnect(); else window.removeEventListener('resize', resize); return; }
+        if (reduce) return; // single static frame
+        requestAnimationFrame(drawFrame);
+    };
+    requestAnimationFrame(drawFrame);
+}
+
+// Back-compat shim: older call sites referenced the bare title menu. Route
+// them through the new Quake main menu.
+function _dsShowTitleMenu(overlay, d) { _dsShowMainMenu(overlay, d); }
 
 function _dsShowPauseMenu(d) {
     const overlay = document.getElementById('ds-dungeon-overlay');
@@ -2450,44 +2247,123 @@ async function _dsDoRestart(overlay, d) {
     _dsStartRun(overlay, d);
 }
 
+// Quake-style options screen. Up/Down (or W/S) moves between rows; Left/Right
+// (or A/D) adjusts the selected slider in 5% steps; Enter selects BACK; Escape
+// backs out. The whole screen is keyboard-driven (matching Quake's options),
+// and the slider tracks also accept mouse click + drag.
 function _dsShowOptionsMenu(overlay, onBack) {
-    const ambVol = _dsAmbientVol();
-    const sfxVol = _dsSfxVol();
-    _dsRenderMenu(overlay, {
-        title: 'OPTIONS',
-        body: `<div style="display:flex;flex-direction:column;gap:10px;width:320px;">
-                  <div style="font-size:0.72rem;letter-spacing:.18em;color:#888;">AMBIENT VOLUME</div>
-                  <input id="ds-opt-vol" type="range" min="0" max="100" value="${Math.round(ambVol*100)}" style="width:100%;accent-color:#60a5fa;">
-                  <div id="ds-opt-vol-val" style="font-size:0.85rem;color:#3a78c9;text-align:right;letter-spacing:.1em;">${Math.round(ambVol*100)}%</div>
-                  <div style="font-size:0.72rem;letter-spacing:.18em;color:#888;margin-top:4px;">SFX VOLUME</div>
-                  <input id="ds-opt-sfx" type="range" min="0" max="100" value="${Math.round(sfxVol*100)}" style="width:100%;accent-color:#60a5fa;">
-                  <div id="ds-opt-sfx-val" style="font-size:0.85rem;color:#3a78c9;text-align:right;letter-spacing:.1em;">${Math.round(sfxVol*100)}%</div>
-               </div>`,
-        items: [{ label: 'BACK', action: onBack }],
-        afterRender: (panel) => {
-            const volSlider = panel.querySelector('#ds-opt-vol');
-            const volVal    = panel.querySelector('#ds-opt-vol-val');
-            if (volSlider) {
-                volSlider.addEventListener('input', () => {
-                    const v = parseInt(volSlider.value, 10) / 100;
-                    _dsSetAmbientVol(v);
-                    if (volVal) volVal.textContent = `${volSlider.value}%`;
-                });
-                volSlider.addEventListener('keydown', (e) => e.stopPropagation());
-            }
-            const sfxSlider = panel.querySelector('#ds-opt-sfx');
-            const sfxVal    = panel.querySelector('#ds-opt-sfx-val');
-            if (sfxSlider) {
-                sfxSlider.addEventListener('input', () => {
-                    const v = parseInt(sfxSlider.value, 10) / 100;
-                    _dsSetSfxVol(v);
-                    if (sfxVal) sfxVal.textContent = `${sfxSlider.value}%`;
-                });
-                sfxSlider.addEventListener('keydown', (e) => e.stopPropagation());
-            }
-        },
-        onCancel: onBack,
-    });
+    _dsInjectMenuCSS();
+    if (_dsActiveMenuKey) { window.removeEventListener('keydown', _dsActiveMenuKey, true); _dsActiveMenuKey = null; }
+
+    let panel = document.getElementById('ds-dungeon-menu');
+    if (!panel) { panel = document.createElement('div'); panel.id = 'ds-dungeon-menu'; overlay.appendChild(panel); }
+    panel.className = 'ds-q-panel';
+    panel.style.cssText = 'position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:max(24px,env(safe-area-inset-top)) 24px max(24px,env(safe-area-inset-bottom));';
+
+    const STEP = 0.05;
+    const rows = [
+        { kind: 'slider', label: 'AMBIENT', aria: 'Ambient volume', get: _dsAmbientVol, set: _dsSetAmbientVol },
+        { kind: 'slider', label: 'SFX', aria: 'SFX volume', get: _dsSfxVol, set: _dsSetSfxVol },
+        { kind: 'action', label: 'BACK', action: onBack },
+    ];
+    let sel = 0;
+
+    panel.innerHTML = `
+        <div class="ds-q-title" style="font-size:clamp(1.6rem,6vw,2.4rem);letter-spacing:.16em;margin-bottom:34px;text-align:center;">OPTIONS</div>
+        <div id="ds-opt-rows" role="menu" aria-label="Options" style="display:flex;flex-direction:column;gap:8px;width:min(360px,88vw);"></div>
+    `;
+    const wrap = panel.querySelector('#ds-opt-rows');
+
+    const rowHtml = (r, i) => {
+        const cls = `ds-q-item${i === sel ? ' sel' : ''}`;
+        if (r.kind === 'slider') {
+            const pct = Math.round(r.get() * 100);
+            return `<div data-row="${i}" class="${cls}" role="slider" tabindex="${i === sel ? 0 : -1}"
+                        aria-label="${esc(r.aria || r.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"
+                        style="display:flex;align-items:center;gap:10px;font-size:.85rem;letter-spacing:.14em;cursor:pointer;">
+                    <span class="ds-q-cursor" aria-hidden="true">&#9656;</span>
+                    <span style="flex:0 0 5em;white-space:nowrap;">${esc(r.label)}</span>
+                    <span class="ds-opt-track" data-track="${i}" style="position:relative;flex:1;height:10px;background:#1c1108;border:1px solid #3a2510;border-radius:5px;overflow:hidden;cursor:pointer;">
+                        <span class="ds-opt-fill" style="position:absolute;left:0;top:0;bottom:0;width:${pct}%;background:linear-gradient(180deg,#ffd24a,#9a5a16);"></span>
+                    </span>
+                    <span class="ds-opt-val" style="flex:0 0 2.8em;text-align:right;color:#e8b04a;">${pct}%</span>
+                </div>`;
+        }
+        return `<button data-row="${i}" role="menuitem" tabindex="${i === sel ? 0 : -1}" class="${cls}" style="font-size:1.05rem;margin-top:14px;"><span class="ds-q-cursor" aria-hidden="true">&#9656;</span>${esc(r.label)}</button>`;
+    };
+
+    const setSlider = (i, v, sound) => {
+        const r = rows[i];
+        v = Math.max(0, Math.min(1, Math.round(v / STEP) * STEP));
+        r.set(v);
+        const pct = Math.round(v * 100);
+        const el = wrap.querySelector(`[data-row="${i}"]`);
+        if (el) {
+            el.setAttribute('aria-valuenow', pct);
+            const fill = el.querySelector('.ds-opt-fill'); if (fill) fill.style.width = pct + '%';
+            const val = el.querySelector('.ds-opt-val'); if (val) val.textContent = pct + '%';
+        }
+        if (sound) _dsMenuMove();
+    };
+
+    const focusRow = () => {
+        wrap.querySelectorAll('[data-row]').forEach((el) => {
+            const i = parseInt(el.dataset.row, 10);
+            el.classList.toggle('sel', i === sel);
+            el.setAttribute('tabindex', i === sel ? '0' : '-1');
+        });
+        const cur = wrap.querySelector('[data-row].sel');
+        if (cur) { try { cur.focus({ preventScroll: true }); } catch (e) {} }
+    };
+
+    const render = () => {
+        wrap.innerHTML = rows.map(rowHtml).join('');
+        wrap.querySelectorAll('[data-row]').forEach((el) => {
+            const i = parseInt(el.dataset.row, 10);
+            el.addEventListener('mouseenter', () => { if (sel !== i) { sel = i; _dsMenuMove(); focusRow(); } });
+        });
+        wrap.querySelectorAll('button[data-row]').forEach((b) => {
+            const i = parseInt(b.dataset.row, 10);
+            b.addEventListener('click', () => { _dsMenuSelect(); rows[i].action(); });
+        });
+        wrap.querySelectorAll('.ds-opt-track').forEach((track) => {
+            const i = parseInt(track.dataset.track, 10);
+            const setFromX = (clientX) => {
+                const rect = track.getBoundingClientRect();
+                setSlider(i, (clientX - rect.left) / rect.width, false);
+            };
+            track.addEventListener('pointerdown', (e) => {
+                sel = i; focusRow();
+                track.setPointerCapture(e.pointerId);
+                setFromX(e.clientX); e.preventDefault();
+            });
+            track.addEventListener('pointermove', (e) => {
+                if (track.hasPointerCapture(e.pointerId)) setFromX(e.clientX);
+            });
+        });
+    };
+
+    const onKey = (e) => {
+        const k = e.key;
+        if (k === 'ArrowDown' || k === 's') {
+            sel = (sel + 1) % rows.length; _dsMenuMove(); focusRow();
+        } else if (k === 'ArrowUp' || k === 'w') {
+            sel = (sel - 1 + rows.length) % rows.length; _dsMenuMove(); focusRow();
+        } else if ((k === 'ArrowLeft' || k === 'a') && rows[sel].kind === 'slider') {
+            setSlider(sel, rows[sel].get() - STEP, true);
+        } else if ((k === 'ArrowRight' || k === 'd') && rows[sel].kind === 'slider') {
+            setSlider(sel, rows[sel].get() + STEP, true);
+        } else if (k === 'Enter' || k === ' ') {
+            if (rows[sel].kind === 'action') { _dsMenuSelect(); rows[sel].action(); }
+        } else if (k === 'Escape') {
+            onBack();
+        } else { return; }
+        e.preventDefault(); e.stopPropagation();
+    };
+    window.addEventListener('keydown', onKey, true);
+    _dsActiveMenuKey = onKey;
+    render();
+    focusRow();
 }
 
 function _dsStartRun(overlay, d) {
@@ -2511,10 +2387,22 @@ async function _dsLoadHistoricalDungeon(dateStr, overlayEl) {
         _dsTodaySnapshot = _dsData;
         _dsHistoricalDate = dateStr;
         _dsData = data;
-        if (_dsArchiveRoom) {
-            _dsArchiveRoom.destroy();
-            _dsArchiveRoom = null;
+        // /setlist/{date} returns the map but not per-player node progress
+        // (available/committed/cleared are absent), so without this the dungeon
+        // sees zero available entrances and skips the lane picker. Treat an
+        // Archive run as a fresh replay: seed the row-0 entrances as available.
+        if (!data.available_node_ids || !data.available_node_ids.length) {
+            const row0 = ((data.map && data.map.nodes) || []).filter(n => (n.row || 0) === 0).map(n => n.id);
+            data.available_node_ids = row0;
+            data.committed_node_ids = [];
+            data.cleared_node_ids = [];
+            data.locked_node_ids = data.locked_node_ids || [];
         }
+        // The Archive calendar lives in the Hub now, so tear the Hub down before
+        // starting the historical run (otherwise its rAF loop + input listeners
+        // keep running alongside the dungeon and the run never cleanly starts).
+        if (_dsHub) { _dsHub.destroy(); _dsHub = null; }
+        if (_dsArchiveRoom) { _dsArchiveRoom.destroy(); _dsArchiveRoom = null; }
         overlayEl.innerHTML = '';
         _dsStartRun(overlayEl, data);
         return true;
@@ -2529,15 +2417,17 @@ async function _dsLoadHistoricalDungeon(dateStr, overlayEl) {
 // to populate the canvas; `surface.refresh()` re-runs it (e.g. when data changes).
 // If `raycasterObjects` is passed, the mesh is pushed onto it for future hit-testing.
 function _dsCreateDiegeticSurface(THREE, opts) {
-    const { scene, position, rotation, size, draw, raycasterObjects } = opts;
+    const { scene, position, rotation, size, draw, raycasterObjects, resolution, linearFilter } = opts;
     const [pw, ph] = size;
+    const rw = (resolution && resolution[0]) || 256;
+    const rh = (resolution && resolution[1]) || 180;
     const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 180;
+    canvas.width = rw;
+    canvas.height = rh;
     const ctx = canvas.getContext('2d');
 
     const texture = new THREE.CanvasTexture(canvas);
-    texture.minFilter = texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = texture.magFilter = linearFilter ? THREE.LinearFilter : THREE.NearestFilter;
 
     const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
     const geometry = new THREE.PlaneGeometry(pw, ph);
@@ -2549,8 +2439,8 @@ function _dsCreateDiegeticSurface(THREE, opts) {
     if (raycasterObjects) raycasterObjects.push(mesh);
 
     function refresh() {
-        ctx.clearRect(0, 0, 256, 180);
-        draw(ctx, 256, 180);
+        ctx.clearRect(0, 0, rw, rh);
+        draw(ctx, rw, rh);
         texture.needsUpdate = true;
     }
     refresh();
@@ -2579,6 +2469,7 @@ function _dsBuildPassage(THREE, opts) {
         color: sealed ? 0x000000 : 0x1d4ed8,
         emissive: sealed ? 0x000000 : 0x0a1840,
     });
+    fillMat.userData.noAutoTex = true;   // seal/unseal toggles this by reference
     const fill = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), fillMat);
     fill.position.set(0, 0, 0.02);
     group.add(fill);
@@ -2688,6 +2579,169 @@ function _dsPlayThud() {
     } catch(e) {}
 }
 
+// Creative "vault antechamber" dressing for the Hub: stone pillars + ceiling
+// beams give it architecture; a glowing ritual dais with flanking braziers and
+// an animated energy rift make the TODAY descent portal the hero; drifting
+// embers and hanging banners add atmosphere. Purely decorative — no collision
+// or interaction changes. Returns { tick(now, dt), dispose() }.
+function _dsDressHub(THREE, scene, dims) {
+    const { HW, HH, HL, HY, doorZ } = dims;
+    const floorY = HY - HH / 2, ceilY = HY + HH / 2;
+    const group = new THREE.Group(); scene.add(group);
+    const mats = [], geos = [], texs = [], tickers = [];
+    const keepGeo = (g) => { geos.push(g); return g; };
+    const keepMat = (m) => { mats.push(m); return m; };
+
+    // small canvas-texture helper
+    const canvasTex = (size, paint) => {
+        const c = document.createElement('canvas'); c.width = c.height = size;
+        paint(c.getContext('2d'), size);
+        const t = new THREE.CanvasTexture(c); t.minFilter = t.magFilter = THREE.LinearFilter; texs.push(t); return t;
+    };
+
+    // ── Architecture: pillars (2 per side wall, clear of the z −2.5/−7 stations)
+    const stoneCol = keepMat(new THREE.MeshLambertMaterial({ map: _dsStoneBasic(THREE, 48, 40, 30, 1, 2) }));
+    const beamMat = keepMat(new THREE.MeshLambertMaterial({ color: 0x110b06 }));
+    const pillarGeo = keepGeo(new THREE.CylinderGeometry(0.2, 0.27, HH - 0.3, 10));
+    const blockGeo = keepGeo(new THREE.BoxGeometry(0.6, 0.22, 0.6));
+    [-1, 1].forEach((side) => {
+        [-0.6, -9.4].forEach((pz) => {
+            const px = side * (HW / 2 - 0.33);
+            const col = new THREE.Mesh(pillarGeo, stoneCol); col.position.set(px, HY, pz); group.add(col);
+            const base = new THREE.Mesh(blockGeo, stoneCol); base.position.set(px, floorY + 0.11, pz); group.add(base);
+            const cap = new THREE.Mesh(blockGeo, stoneCol); cap.position.set(px, ceilY - 0.11, pz); group.add(cap);
+        });
+    });
+    // Ceiling beams across the width
+    const beamGeo = keepGeo(new THREE.BoxGeometry(HW, 0.22, 0.24));
+    [-1.5, -5.5, -9.5].forEach((bz) => { const b = new THREE.Mesh(beamGeo, beamMat); b.position.set(0, ceilY - 0.12, bz); group.add(b); });
+
+    // ── Ritual dais ring on the floor before the portal (pulsing) ──
+    const daisMat = keepMat(new THREE.MeshBasicMaterial({ color: 0x3a72c8, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+    const dais = new THREE.Mesh(keepGeo(new THREE.RingGeometry(0.95, 1.4, 44)), daisMat);
+    dais.rotation.x = -Math.PI / 2; dais.position.set(0, floorY + 0.02, doorZ + 1.7); group.add(dais);
+    tickers.push((now) => { daisMat.opacity = 0.32 + Math.sin(now * 0.004) * 0.2; });
+
+    // ── Energy rift over the TODAY passage (hero) ──
+    const swirlTex = canvasTex(128, (ctx, s) => {
+        const cx = s / 2;
+        const g = ctx.createRadialGradient(cx, cx, 2, cx, cx, cx);
+        g.addColorStop(0, 'rgba(180,220,255,0.95)'); g.addColorStop(0.35, 'rgba(70,140,255,0.55)');
+        g.addColorStop(0.7, 'rgba(30,70,200,0.22)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cx, cx, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(200,230,255,0.7)'; ctx.lineWidth = 2;
+        for (let a = 0; a < 5; a++) {
+            ctx.beginPath();
+            for (let r = 4; r < cx; r += 2) { const th = a * 1.256 + r * 0.13; const x = cx + Math.cos(th) * r, y = cx + Math.sin(th) * r; r === 4 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+            ctx.globalAlpha = 0.4; ctx.stroke(); ctx.globalAlpha = 1;
+        }
+    });
+    const riftMat = keepMat(new THREE.MeshBasicMaterial({ map: swirlTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.85 }));
+    const rift = new THREE.Mesh(keepGeo(new THREE.PlaneGeometry(1.55, 1.55)), riftMat);
+    rift.position.set(0, HY + 0.1, doorZ + 0.07); group.add(rift);
+    const riftLight = new THREE.PointLight(0x5a9bff, 1.4, 6); riftLight.position.set(0, HY, doorZ + 0.9); group.add(riftLight);
+    tickers.push((now) => { rift.rotation.z += 0.006; riftMat.opacity = 0.65 + Math.sin(now * 0.005) * 0.2; riftLight.intensity = 1.2 + Math.sin(now * 0.006) * 0.5; });
+
+    // ── Braziers flanking the dais ──
+    const flameTex = canvasTex(64, (ctx, s) => {
+        const g = ctx.createRadialGradient(s / 2, s * 0.62, 2, s / 2, s * 0.55, s * 0.5);
+        g.addColorStop(0, 'rgba(255,240,180,0.95)'); g.addColorStop(0.4, 'rgba(255,150,40,0.8)');
+        g.addColorStop(0.8, 'rgba(180,50,10,0.25)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(s / 2, s * 0.55, s * 0.28, s * 0.45, 0, 0, Math.PI * 2); ctx.fill();
+    });
+    const trimMat = keepMat(new THREE.MeshLambertMaterial({ color: 0x6a5226, emissive: 0x1c1305 }));
+    const stemGeo = keepGeo(new THREE.CylinderGeometry(0.06, 0.1, 0.8, 8));
+    const bowlGeo = keepGeo(new THREE.CylinderGeometry(0.24, 0.1, 0.16, 12));
+    const flameGeo = keepGeo(new THREE.PlaneGeometry(0.46, 0.62));
+    [-1.7, 1.7].forEach((bx) => {
+        const stem = new THREE.Mesh(stemGeo, stoneCol); stem.position.set(bx, floorY + 0.4, doorZ + 2.0); group.add(stem);
+        const bowl = new THREE.Mesh(bowlGeo, trimMat); bowl.position.set(bx, floorY + 0.85, doorZ + 2.0); group.add(bowl);
+        const flameMat = keepMat(new THREE.MeshBasicMaterial({ map: flameTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+        const flame = new THREE.Mesh(flameGeo, flameMat); flame.position.set(bx, floorY + 1.12, doorZ + 2.0); group.add(flame);
+        const light = new THREE.PointLight(0xff8a30, 2.0, 5); light.position.set(bx, floorY + 1.2, doorZ + 2.0); group.add(light);
+        tickers.push((now) => { const f = 0.82 + Math.sin(now * 0.018 + bx * 3) * 0.1 + Math.random() * 0.08; flame.scale.set(0.92 + (f - 0.82), f, 1); flameMat.opacity = 0.85 * f; light.intensity = 1.8 * f; });
+    });
+
+    // ── Hanging banners flanking the portal ──
+    const bannerTex = canvasTex(64, (ctx, s) => {
+        ctx.fillStyle = '#16243f'; ctx.fillRect(0, 0, s, s);
+        ctx.strokeStyle = '#caa14a'; ctx.lineWidth = 3; ctx.strokeRect(4, 4, s - 8, s - 8);
+        ctx.fillStyle = '#e8c040'; ctx.beginPath();
+        ctx.moveTo(s / 2, 14); ctx.lineTo(s - 16, s / 2); ctx.lineTo(s / 2, s - 14); ctx.lineTo(16, s / 2); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#16243f'; ctx.beginPath(); ctx.arc(s / 2, s / 2, 7, 0, Math.PI * 2); ctx.fill();
+    });
+    const bannerMat = keepMat(new THREE.MeshLambertMaterial({ map: bannerTex, transparent: true, emissive: 0x0a1424, emissiveMap: bannerTex }));
+    const bannerGeo = keepGeo(new THREE.PlaneGeometry(0.62, 1.7));
+    [-2.5, 2.5].forEach((bx) => { const bn = new THREE.Mesh(bannerGeo, bannerMat); bn.position.set(bx, HY + 0.35, doorZ + 0.06); group.add(bn); });
+
+    // ── Showcase display cases around each wall station ──
+    // Ornate framing for the four tablets: stone backing + accent trim border
+    // with corner studs, a pediment cap and base shelf, and two flanking sconce
+    // flames — turning each tablet into a lit reliquary display. The interactive
+    // canvas surface itself is built in the Hub's station blocks; this only
+    // dresses around it (group placed at the surface centre + rotation).
+    function addShowcase({ x, y, z, rotY, w, h, accent }) {
+        const g = new THREE.Group(); g.position.set(x, y, z); g.rotation.y = rotY; group.add(g);
+        const back = new THREE.Mesh(keepGeo(new THREE.PlaneGeometry(w + 0.55, h + 0.7)), stoneCol);
+        back.position.set(0, 0, -0.03); g.add(back);
+        const tw = w + 0.2, th = h + 0.2;
+        const trimMat = keepMat(new THREE.MeshLambertMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.25 }));
+        const studMat = keepMat(new THREE.MeshLambertMaterial({ color: 0x8a6a30, emissive: 0x140e04 }));
+        const barTop = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(tw + 0.14, 0.08, 0.05)), trimMat); barTop.position.set(0, th / 2, 0.02); g.add(barTop);
+        const barBot = barTop.clone(); barBot.position.set(0, -th / 2, 0.02); g.add(barBot);
+        const barL = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(0.08, th, 0.05)), trimMat); barL.position.set(-tw / 2, 0, 0.02); g.add(barL);
+        const barR = barL.clone(); barR.position.set(tw / 2, 0, 0.02); g.add(barR);
+        const studGeo = keepGeo(new THREE.BoxGeometry(0.11, 0.11, 0.07));
+        [[-tw / 2, th / 2], [tw / 2, th / 2], [-tw / 2, -th / 2], [tw / 2, -th / 2]].forEach(([sx, sy]) => {
+            const s = new THREE.Mesh(studGeo, studMat); s.position.set(sx, sy, 0.04); g.add(s);
+        });
+        const ped = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(tw + 0.18, 0.15, 0.13)), stoneCol); ped.position.set(0, th / 2 + 0.15, 0.05); g.add(ped);
+        const pedTrim = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(tw + 0.18, 0.03, 0.14)), trimMat); pedTrim.position.set(0, th / 2 + 0.07, 0.06); g.add(pedTrim);
+        const shelf = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(tw + 0.26, 0.1, 0.2)), stoneCol); shelf.position.set(0, -th / 2 - 0.12, 0.09); g.add(shelf);
+        [-1, 1].forEach((side) => {
+            const sx = side * (tw / 2 + 0.16);
+            const bracket = new THREE.Mesh(keepGeo(new THREE.BoxGeometry(0.05, 0.05, 0.16)), studMat); bracket.position.set(sx, -0.12, 0.1); g.add(bracket);
+            const fMat = keepMat(new THREE.MeshBasicMaterial({ map: flameTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+            const flame = new THREE.Mesh(keepGeo(new THREE.PlaneGeometry(0.22, 0.3)), fMat); flame.position.set(sx, 0.04, 0.2); g.add(flame);
+            tickers.push((now) => { const f = 0.8 + Math.sin(now * 0.02 + sx * 5 + z) * 0.12 + Math.random() * 0.08; flame.scale.set(0.92, f, 1); fMat.opacity = 0.85 * f; });
+        });
+    }
+    const _scx = HW / 2 - 0.05;
+    addShowcase({ x: -_scx, y: 0.5, z: -2.5, rotY: Math.PI / 2,  w: 2.8, h: 2.2, accent: 0xc9a14a });
+    addShowcase({ x: -_scx, y: 0.5, z: -7.0, rotY: Math.PI / 2,  w: 2.8, h: 2.2, accent: 0xd8923a });
+    addShowcase({ x:  _scx, y: 0.5, z: -2.5, rotY: -Math.PI / 2, w: 2.8, h: 2.2, accent: 0xc9a14a });
+    addShowcase({ x:  _scx, y: 0.5, z: -7.0, rotY: -Math.PI / 2, w: 2.8, h: 2.2, accent: 0x9a6ad0 });
+
+    // ── Drifting embers (sparse Points field) ──
+    const N = 150;
+    const epos = new Float32Array(N * 3), evel = new Float32Array(N);
+    const rx = () => (Math.random() * 2 - 1) * (HW / 2 - 0.7);
+    const rz = () => doorZ + 0.7 + Math.random() * (HL - 1.6);
+    for (let i = 0; i < N; i++) { epos[i*3] = rx(); epos[i*3+1] = floorY + Math.random() * HH; epos[i*3+2] = rz(); evel[i] = 0.12 + Math.random() * 0.3; }
+    const eg = keepGeo(new THREE.BufferGeometry()); eg.setAttribute('position', new THREE.BufferAttribute(epos, 3));
+    const em = keepMat(new THREE.PointsMaterial({ color: 0xff9444, size: 0.05, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true }));
+    const embers = new THREE.Points(eg, em); group.add(embers);
+    tickers.push((now, dt) => {
+        const p = eg.attributes.position.array;
+        for (let i = 0; i < N; i++) {
+            p[i*3+1] += evel[i] * dt;
+            p[i*3] += Math.sin(now * 0.001 + i) * 0.0009;
+            if (p[i*3+1] > ceilY) { p[i*3] = rx(); p[i*3+1] = floorY; p[i*3+2] = rz(); }
+        }
+        eg.attributes.position.needsUpdate = true;
+    });
+
+    return {
+        tick: (now, dt) => { for (const t of tickers) t(now, dt || 0.016); },
+        dispose: () => {
+            scene.remove(group);
+            geos.forEach((g) => { try { g.dispose(); } catch (e) {} });
+            mats.forEach((m) => { try { m.dispose(); } catch (e) {} });
+            texs.forEach((t) => { try { t.dispose(); } catch (e) {} });
+        },
+    };
+}
+
 // ── Hub (ThreeJS first-person chamber — entry point for The Daily) ────────────
 function _dsBuildHub(THREE, overlay, d) {
     const RENDER_W = 320, RENDER_H = 200;
@@ -2699,11 +2753,7 @@ function _dsBuildHub(THREE, overlay, d) {
 
     const state = { phase: 'idle', moveTween: 0, rafId: null, moveStartZ: 0 };
 
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
+    const { renderer, canvas } = _dsRenderTarget(THREE, RENDER_W, RENDER_H);
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x000000, 10, 16);
@@ -2718,49 +2768,27 @@ function _dsBuildHub(THREE, overlay, d) {
     const torch2 = new THREE.PointLight(0xff6622, 1.8, 10);
     torch2.position.set(2.5, 1.2, -7);
     scene.add(torch2);
+    // TODAY descend-portal glow (back-centre).
     const passageGlow = new THREE.PointLight(0x1d4ed8, 2.5, 8);
     passageGlow.position.set(0, HY, -(HL - 2));
     scene.add(passageGlow);
-    const archiveGlow = new THREE.PointLight(0x1d4ed8, 2.0, 8);
-    archiveGlow.position.set(-2.3, HY, -(HL - 2));
-    scene.add(archiveGlow);
-    const passportGlow = new THREE.PointLight(0xd4a044, 2.0, 8);
-    passportGlow.position.set(-4.6, HY, -(HL - 2));
+    // Per-station accent lights along the side walls (positions match the
+    // station blocks below): PASSPORT/ARCHIVE left, WALL OF FAME/SHOP right.
+    const passportGlow = new THREE.PointLight(0xd4a044, 2.5, 7);
+    passportGlow.position.set(-3.8, 0.5, -2.5);
     scene.add(passportGlow);
-    const shopGlow = new THREE.PointLight(0x7c3aed, 2.0, 8);
-    shopGlow.position.set(4.6, HY, -(HL - 2));
+    const archiveGlow = new THREE.PointLight(0xffaa55, 2.5, 7);
+    archiveGlow.position.set(-3.8, 0.5, -7.0);
+    scene.add(archiveGlow);
+    const wofGlow = new THREE.PointLight(0xe8c040, 2.5, 7);
+    wofGlow.position.set(3.8, 0.5, -2.5);
+    scene.add(wofGlow);
+    const shopGlow = new THREE.PointLight(0x7c3aed, 2.5, 7);
+    shopGlow.position.set(3.8, 0.5, -7.0);
     scene.add(shopGlow);
 
     function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
+        return _dsStoneBasic(THREE, r, g, b, ru, rv);
     }
 
     const wallMat     = new THREE.MeshLambertMaterial({ map: stoneTexture(38, 32, 28, 3, 1) });
@@ -2768,6 +2796,11 @@ function _dsBuildHub(THREE, overlay, d) {
     const ceilMat     = new THREE.MeshLambertMaterial({ map: stoneTexture(18, 16, 14, 2, 4) });
     const backMat     = new THREE.MeshLambertMaterial({ map: stoneTexture(22, 18, 15, 2, 1) });
     const darkWallMat = new THREE.MeshLambertMaterial({ color: 0x040404 });
+    // Swap in real COMTEX stone once decoded (tinted down to stay dungeon-dark).
+    _dsApplyRealTex(THREE, wallMat,  'wall_stone.png',    4, 2, 0x6c655c);
+    _dsApplyRealTex(THREE, floorMat, 'floor_granite.png', 3, 6, 0x5a564f);
+    _dsApplyRealTex(THREE, ceilMat,  'floor_plate.png',   3, 6, 0x3a3732);
+    _dsApplyRealTex(THREE, backMat,  'wall_castle.png',   3, 2, 0x6c645a);
 
     const addPlane = (geo, mat, rx, ry, px, py, pz) => {
         const m = new THREE.Mesh(geo, mat);
@@ -2798,80 +2831,437 @@ function _dsBuildHub(THREE, overlay, d) {
     }
 
     buildPassage('today', 'TODAY', 0, false);
-    buildPassage('archive', 'ARCHIVE', -2.3, false);
-    // Beat 2: if boss was just completed, build WoF sealed; unsealing waits
-    // until the celebration overlay (triggerBossCelebration) is dismissed.
-    // The flag _dsBossJustCompleted is NOT consumed here — dsInit reads it to
-    // decide whether to call triggerBossCelebration. The local var captures
-    // the value at build time for the dismiss handler.
+    // ARCHIVE / WALL OF FAME / PASSPORT / SHOP are no longer passages to separate
+    // rooms — each is now an in-hub diegetic station (see the station blocks
+    // below), walkable with the Hub's Quake movement. Only TODAY (descend into
+    // the run) and the exit door remain as passages.
+    // _dsBossJustCompleted still drives the in-Hub boss celebration (see
+    // triggerBossCelebration); captured here for the dismiss handler.
     let wofUnsealPending = _dsBossJustCompleted;
-    buildPassage('wof', 'WALL OF FAME', 2.3, wofUnsealPending ? true : !d.is_complete);
-    buildPassage('passport', 'PASSPORT', -4.6, false);
-    buildPassage('shop', 'SHOP', 4.6, false);
 
-    // ── Exit door (diegetic exit back to Slopsmith host) ────────────────────
-    // Heavy iron door on the front wall between archive and today passages,
-    // positioned lower than passages to be clearly distinguishable.
-    const exitGroup = new THREE.Group();
-    const exitDoorX = -1.15, exitDoorY = HY - 0.5, exitDoorZ = doorZ + 0.03;
+    // ── In-hub interactive sections ──────────────────────────────────────────
+    // The former side rooms are being folded into the Hub as diegetic stations
+    // you walk up to and use in-world (click the surface; crosshair when locked).
+    // Each entry: { interact(raycaster)->bool, dispose() }.
+    const hubSections = [];
 
-    const exitFrameMat = new THREE.MeshLambertMaterial({ color: 0x0a0606 });
-    const exitFrame = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.3), exitFrameMat);
-    exitFrame.position.set(0, 0, 0.01);
-    exitGroup.add(exitFrame);
+    // Archive calendar station (replaces _dsBuildArchiveAntechamber). A wall
+    // tablet where the ARCHIVE passage used to be: < / > pick a past UTC day,
+    // CONFIRM descends into that day's dungeon.
+    {
+        const _CAL_EPOCH = new Date('2026-04-22T00:00:00Z');
+        const _calNow = new Date();
+        const _calTodayUTC = new Date(Date.UTC(_calNow.getUTCFullYear(), _calNow.getUTCMonth(), _calNow.getUTCDate()));
+        const _calYesterday = new Date(_calTodayUTC); _calYesterday.setUTCDate(_calYesterday.getUTCDate() - 1);
+        let _calSel = _calYesterday < _CAL_EPOCH ? new Date(_CAL_EPOCH) : _calYesterday;
+        const _calStr = (dd) => dd.toISOString().slice(0, 10);
+        const _calAdd = (dd, n) => { const r = new Date(dd); r.setUTCDate(r.getUTCDate() + n); return r; };
+        let _calMod = null;            // modifier label for the selected day ('' = none, null = loading)
+        const _calModCache = {};
+        let _calModReq = 0;
 
-    const exitFillMat = new THREE.MeshLambertMaterial({
-        color: 0x4a2a0a,
-        emissive: 0x1a0e00,
-    });
-    const exitFill = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.0), exitFillMat);
-    exitFill.position.set(0, 0, 0.02);
-    exitGroup.add(exitFill);
-    if (passageMeshes) passageMeshes.set(exitFill, 'exit');
-
-    // Iron cross bands
-    const bandMat = new THREE.MeshLambertMaterial({ color: 0x1a1a1a });
-    const hBand = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.06), bandMat);
-    hBand.position.set(0, 0, 0.03);
-    exitGroup.add(hBand);
-    const vBand = new THREE.Mesh(new THREE.PlaneGeometry(0.06, 0.7), bandMat);
-    vBand.position.set(0, 0, 0.03);
-    exitGroup.add(vBand);
-
-    // Rivets
-    const rivetMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
-    for (let rdx = -0.4; rdx <= 0.4; rdx += 0.8) {
-        for (let rdy = -0.35; rdy <= 0.35; rdy += 0.7) {
-            const rivet = new THREE.Mesh(new THREE.CircleGeometry(0.035, 5), rivetMat);
-            rivet.position.set(rdx, rdy, 0.04);
-            exitGroup.add(rivet);
+        const calSurface = _dsCreateDiegeticSurface(THREE, {
+            scene, raycasterObjects,
+            position: [-(HW / 2 - 0.05), 0.5, -7.0],
+            rotation: [0, Math.PI / 2, 0],
+            size: [2.8, 2.2],
+            resolution: [512, 360], linearFilter: true,
+            draw: (ctx, w, h) => {
+                const selStr = _calStr(_calSel);
+                const canPrev = _calSel > _CAL_EPOCH;
+                const canNext = _calSel < _calTodayUTC;
+                ctx.fillStyle = '#332414'; ctx.fillRect(0, 0, w, h);
+                const sd = ctx.getImageData(0, 0, w, h);
+                for (let i = 0; i < sd.data.length; i += 4) { const n = (Math.random() * 10 - 5) | 0; sd.data[i] += n; sd.data[i+1] += n; sd.data[i+2] += n; }
+                ctx.putImageData(sd, 0, 0);
+                ctx.strokeStyle = '#7a5630'; ctx.lineWidth = Math.max(4, h * 0.018); ctx.strokeRect(10, 10, w - 20, h - 20);
+                ctx.textAlign = 'center';
+                ctx.font = `bold ${Math.round(h * 0.12)}px monospace`; ctx.fillStyle = '#caa86a'; ctx.textBaseline = 'top';
+                ctx.fillText('ARCHIVE', w / 2, h * 0.07);
+                ctx.textBaseline = 'middle';
+                const midY = h * 0.46;
+                ctx.font = `bold ${Math.round(h * 0.22)}px monospace`;
+                ctx.fillStyle = canPrev ? '#e6bd64' : '#4a4030'; ctx.fillText('‹', w * 0.12, midY);
+                ctx.fillStyle = canNext ? '#e6bd64' : '#4a4030'; ctx.fillText('›', w * 0.88, midY);
+                ctx.font = `bold ${Math.round(h * 0.13)}px monospace`; ctx.fillStyle = '#ffd97a'; ctx.fillText(selStr, w / 2, midY);
+                // Modifier name for the selected day (… while loading).
+                const modTxt = _calMod === null ? '…' : (_calMod || '');
+                if (modTxt) { ctx.font = `bold ${Math.round(h * 0.058)}px monospace`; ctx.fillStyle = '#c9a060'; ctx.fillText(modTxt.toUpperCase().slice(0, 24), w / 2, h * 0.63); }
+                const bw = w * 0.52, bh = h * 0.15, bx = (w - bw) / 2, by = h * 0.79;
+                ctx.fillStyle = '#3c2c16'; ctx.fillRect(bx, by, bw, bh);
+                ctx.strokeStyle = '#caa86a'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, bh);
+                ctx.font = `bold ${Math.round(h * 0.085)}px monospace`; ctx.fillStyle = '#ffd97a'; ctx.fillText('CONFIRM', w / 2, by + bh / 2);
+            },
+        });
+        // Look up the selected day's modifier name (cached; stale responses ignored).
+        function fetchCalMod() {
+            const date = _calStr(_calSel);
+            if (Object.prototype.hasOwnProperty.call(_calModCache, date)) { _calMod = _calModCache[date]; calSurface.refresh(); return; }
+            _calMod = null; calSurface.refresh();
+            const req = ++_calModReq;
+            fetch(dsApiUrl('/api/plugins/the_daily/setlist/' + date))
+                .then((r) => r.text())
+                .then((t) => {
+                    const data = t ? JSON.parse(t) : null;
+                    const label = (data && !data.error && data.modifier && data.modifier.label) ? data.modifier.label : '';
+                    _calModCache[date] = label;
+                    if (req === _calModReq && !destroyed) { _calMod = label; calSurface.refresh(); }
+                })
+                .catch(() => { if (req === _calModReq && !destroyed) { _calMod = ''; calSurface.refresh(); } });
         }
+        fetchCalMod();
+        const calChange = (dir) => { const nx = _calAdd(_calSel, dir); if (nx < _CAL_EPOCH || nx > _calTodayUTC) return; _calSel = nx; calSurface.refresh(); fetchCalMod(); };
+        const calConfirm = () => {
+            if (state.phase !== 'idle') return;
+            state.phase = 'loading';
+            _dsLoadHistoricalDungeon(_calStr(_calSel), overlay).then((ok) => { if (!ok && !destroyed) state.phase = 'idle'; });
+        };
+        hubSections.push({
+            interact: (rc) => {
+                for (const hit of rc.intersectObjects([calSurface.mesh])) {
+                    if (hit.object === calSurface.mesh && hit.uv) {
+                        // CanvasTexture flipY inverts uv.y vs canvas-y: the
+                        // canvas-bottom CONFIRM button reads as high uy here.
+                        const ux = hit.uv.x, uy = 1 - hit.uv.y;
+                        if (uy >= 0.78) calConfirm();
+                        else if (uy > 0.22) { if (ux < 0.3) calChange(-1); else if (ux > 0.7) calChange(1); }
+                        return true;
+                    }
+                }
+                return false;
+            },
+            dispose: () => { calSurface.dispose(); },
+        });
     }
 
-    // EXIT label — engraved serif text
-    const exitLc = document.createElement('canvas');
-    exitLc.width = 128; exitLc.height = 48;
-    const exitLctx = exitLc.getContext('2d');
-    exitLctx.font = 'bold 18px serif';
-    exitLctx.textAlign = 'center';
-    exitLctx.textBaseline = 'middle';
-    exitLctx.fillStyle = '#885522';
-    exitLctx.fillText('EXIT', 64, 24);
-    exitLctx.strokeStyle = '#221100';
-    exitLctx.lineWidth = 1.5;
-    exitLctx.strokeText('EXIT', 64, 24);
-    const exitLTex = new THREE.CanvasTexture(exitLc);
-    exitLTex.minFilter = exitLTex.magFilter = THREE.NearestFilter;
-    const exitLMat = new THREE.MeshBasicMaterial({ map: exitLTex, transparent: true });
-    const exitLMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.35), exitLMat);
-    exitLMesh.position.set(0, -0.02, 0.04);
-    exitGroup.add(exitLMesh);
+    // Shop station (replaces _dsBuildShopRoom). A purple market tablet where the
+    // SHOP passage was: rows of items, click BUY. Tokens shown top-right.
+    {
+        const shopState = { items: [], tokens: 0, loading: true, error: null, buying: false };
+        const BUY_HITS = [];
+        function drawShop(ctx, w, h) {
+            ctx.fillStyle = '#190a28'; ctx.fillRect(0, 0, w, h);
+            const sd = ctx.getImageData(0, 0, w, h);
+            for (let i = 0; i < sd.data.length; i += 4) { const n = (Math.random() * 10 - 5) | 0; sd.data[i] += n; sd.data[i+1] += n; sd.data[i+2] += n; }
+            ctx.putImageData(sd, 0, 0);
+            ctx.strokeStyle = '#6a3a9a'; ctx.lineWidth = Math.max(4, h * 0.018); ctx.strokeRect(10, 10, w - 20, h - 20);
+            const pad = w * 0.05;
+            ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+            ctx.font = `bold ${Math.round(h * 0.085)}px monospace`; ctx.fillStyle = '#d8b050';
+            ctx.fillText('🏪 SHOP', pad, h * 0.09);
+            ctx.textAlign = 'right'; ctx.fillStyle = '#ffd24a';
+            ctx.fillText('🪙 ' + shopState.tokens, w - pad, h * 0.09);
+            ctx.strokeStyle = '#4a2a6a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(pad, h * 0.165); ctx.lineTo(w - pad, h * 0.165); ctx.stroke();
+            const big = (t, c) => { ctx.font = `bold ${Math.round(h * 0.07)}px monospace`; ctx.fillStyle = c; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(t, w / 2, h / 2); };
+            if (shopState.loading) { big('Loading…', '#9a8aaa'); return; }
+            if (shopState.error) { big(shopState.error, '#c66'); return; }
+            BUY_HITS.length = 0;
+            const top = h * 0.20, rowH = h * 0.122, btnW = w * 0.22, btnX = w - pad - btnW;
+            const maxRows = Math.floor((h * 0.96 - top) / rowH);
+            const n = Math.min(shopState.items.length, maxRows);
+            for (let i = 0; i < n; i++) {
+                const item = shopState.items[i]; const y0 = top + i * rowH;
+                if (i % 2 === 0) { ctx.fillStyle = 'rgba(70, 36, 96, 0.45)'; ctx.fillRect(pad - 4, y0, w - 2 * pad + 8, rowH - 4); }
+                ctx.textAlign = 'left';
+                ctx.font = `bold ${Math.round(h * 0.058)}px monospace`; ctx.textBaseline = 'alphabetic';
+                ctx.fillStyle = item.owned ? '#8a7a9a' : '#f0e6ff'; ctx.fillText(item.name.substring(0, 18), pad, y0 + rowH * 0.42);
+                ctx.font = `${Math.round(h * 0.04)}px monospace`; ctx.fillStyle = '#9a86b2'; ctx.fillText((item.description || item.type || '').substring(0, 26), pad, y0 + rowH * 0.78);
+                const cost = item.discounted_cost ?? item.cost;
+                ctx.font = `bold ${Math.round(h * 0.05)}px monospace`; ctx.textAlign = 'right'; ctx.fillStyle = '#ffd24a'; ctx.fillText('🪙' + cost, btnX - 8, y0 + rowH * 0.55);
+                const by = y0 + rowH * 0.14, bh = rowH * 0.66;
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                if (item.owned) {
+                    ctx.fillStyle = item.equipped ? '#22512a' : '#3a3a44'; ctx.fillRect(btnX, by, btnW, bh);
+                    ctx.strokeStyle = item.equipped ? '#5aa05a' : '#5a5a6a'; ctx.lineWidth = 1.5; ctx.strokeRect(btnX, by, btnW, bh);
+                    ctx.font = `bold ${Math.round(h * 0.042)}px monospace`; ctx.fillStyle = item.equipped ? '#9fe89f' : '#aaa';
+                    ctx.fillText(item.equipped ? 'EQUIPPED' : 'OWNED', btnX + btnW / 2, by + bh / 2);
+                } else if (!item.affordable) {
+                    ctx.fillStyle = '#3a1c1c'; ctx.fillRect(btnX, by, btnW, bh);
+                    ctx.strokeStyle = '#6a3434'; ctx.lineWidth = 1.5; ctx.strokeRect(btnX, by, btnW, bh);
+                    ctx.font = `bold ${Math.round(h * 0.04)}px monospace`; ctx.fillStyle = '#c66';
+                    ctx.fillText('NOT ENOUGH', btnX + btnW / 2, by + bh / 2);
+                } else {
+                    ctx.fillStyle = '#3a1f5e'; ctx.fillRect(btnX, by, btnW, bh);
+                    ctx.strokeStyle = '#8a4ad0'; ctx.lineWidth = 1.5; ctx.strokeRect(btnX, by, btnW, bh);
+                    ctx.font = `bold ${Math.round(h * 0.055)}px monospace`; ctx.fillStyle = '#d0a8ff'; ctx.fillText('BUY', btnX + btnW / 2, by + bh / 2);
+                    BUY_HITS.push({ itemId: item.id, x1: btnX / w, x2: (btnX + btnW) / w, y1: y0 / h, y2: (y0 + rowH) / h });
+                }
+            }
+        }
+        const shopSurface = _dsCreateDiegeticSurface(THREE, {
+            scene, raycasterObjects,
+            position: [HW / 2 - 0.05, 0.5, -7.0], rotation: [0, -Math.PI / 2, 0], size: [2.8, 2.2],
+            resolution: [512, 360], linearFilter: true, draw: drawShop,
+        });
+        function loadShop() {
+            shopState.loading = true; shopState.error = null; shopSurface.refresh();
+            fetch(dsApiUrl('/api/plugins/the_daily/shop'), { headers: { 'X-Install-Id': dsInstallId() } })
+                .then((r) => r.text())
+                .then((text) => { if (destroyed) return; const data = text ? JSON.parse(text) : {}; if (data.error) { shopState.error = data.error; shopState.loading = false; shopSurface.refresh(); return; } shopState.items = data.items || []; shopState.tokens = data.tokens || 0; shopState.loading = false; shopSurface.refresh(); })
+                .catch(() => { if (destroyed) return; shopState.loading = false; shopState.error = 'Network error'; shopSurface.refresh(); });
+        }
+        function buyItem(itemId) {
+            if (shopState.buying) return; shopState.buying = true; shopSurface.refresh();
+            fetch(dsApiUrl('/api/plugins/the_daily/shop/buy'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() }, body: JSON.stringify({ item_id: itemId }) })
+                .then((r) => r.text())
+                .then((text) => { if (destroyed) return; shopState.buying = false; const data = text ? JSON.parse(text) : {}; if (data.error) { shopState.error = data.error; shopSurface.refresh(); return; } loadShop(); })
+                .catch(() => { if (destroyed) return; shopState.buying = false; shopState.error = 'Network error'; shopSurface.refresh(); });
+        }
+        loadShop();
+        hubSections.push({
+            interact: (rc) => {
+                for (const hit of rc.intersectObjects([shopSurface.mesh])) {
+                    if (hit.object === shopSurface.mesh && hit.uv) {
+                        if (shopState.loading || shopState.buying) return true;
+                        // CanvasTexture flipY: BUY_HITS use canvas-y fractions, so invert uv.y.
+                        const cx = hit.uv.x, cy = 1 - hit.uv.y;
+                        for (const b of BUY_HITS) { if (cx >= b.x1 && cx <= b.x2 && cy >= b.y1 && cy <= b.y2) { buyItem(b.itemId); break; } }
+                        return true;
+                    }
+                }
+                return false;
+            },
+            dispose: () => { shopSurface.dispose(); },
+        });
+    }
 
-    exitGroup.position.set(exitDoorX, exitDoorY, exitDoorZ);
-    scene.add(exitGroup);
-    raycasterObjects.push(exitFill);
+    // Passport station (replaces _dsBuildHallOfRecords). Display-only tablet:
+    // lifetime totals + a month completion grid. Fed by /passport.
+    {
+        const pState = { data: null, loaded: false };
+        const ppSurface = _dsCreateDiegeticSurface(THREE, {
+            scene, raycasterObjects,
+            position: [-(HW / 2 - 0.05), 0.5, -2.5], rotation: [0, Math.PI / 2, 0], size: [2.8, 2.2],
+            resolution: [512, 360], linearFilter: true,
+            draw: (ctx, w, h) => {
+                ctx.fillStyle = '#282015'; ctx.fillRect(0, 0, w, h);
+                const sd = ctx.getImageData(0, 0, w, h);
+                for (let i = 0; i < sd.data.length; i += 4) { const n = (Math.random() * 10 - 5) | 0; sd.data[i] += n; sd.data[i+1] += n; sd.data[i+2] += n; }
+                ctx.putImageData(sd, 0, 0);
+                ctx.strokeStyle = '#7a5630'; ctx.lineWidth = Math.max(4, h * 0.018); ctx.strokeRect(10, 10, w - 20, h - 20);
+                const pad = w * 0.05;
+                ctx.font = `bold ${Math.round(h * 0.085)}px monospace`; ctx.fillStyle = '#e8c040'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+                ctx.fillText('PASSPORT', w / 2, h * 0.05);
+                if (!pState.loaded || !pState.data) { ctx.font = `bold ${Math.round(h * 0.07)}px monospace`; ctx.fillStyle = '#9a8a6a'; ctx.textBaseline = 'middle'; ctx.fillText('Loading…', w / 2, h / 2); return; }
+                const t = pState.data.totals || {};
+                const items = [['DAILIES', t.total_dailies || 0], ['STREAK', t.current_streak || 0], ['BEST', t.longest_streak || 0], ['TOKENS', t.lifetime_tokens_earned || 0]];
+                const cw = w / 2, top = h * 0.27, rh = h * 0.16;
+                items.forEach((it, i) => {
+                    const cx = (i % 2) * cw + cw / 2, cy = top + Math.floor(i / 2) * rh;
+                    ctx.font = `bold ${Math.round(h * 0.11)}px monospace`; ctx.fillStyle = '#ffd24a'; ctx.textBaseline = 'middle'; ctx.fillText(String(it[1]), cx, cy);
+                    ctx.font = `bold ${Math.round(h * 0.04)}px monospace`; ctx.fillStyle = '#a8905c'; ctx.fillText(it[0], cx, cy + h * 0.065);
+                });
+                ctx.strokeStyle = '#5a472a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(pad, h * 0.6); ctx.lineTo(w - pad, h * 0.6); ctx.stroke();
+                const days = pState.data.days || [];
+                const byMonth = {}; days.forEach((dd) => { const ym = dd.date.slice(0, 7); (byMonth[ym] = byMonth[ym] || []).push(dd); });
+                const months = Object.keys(byMonth).sort().slice(-2);
+                const cellSize = w * 0.048, gap = w * 0.008; let curY = h * 0.66;
+                ctx.textBaseline = 'top';
+                months.forEach((ym) => {
+                    ctx.font = `bold ${Math.round(h * 0.042)}px monospace`; ctx.fillStyle = '#a8905c'; ctx.textAlign = 'left'; ctx.fillText(ym, pad, curY); curY += h * 0.055;
+                    let col = 0;
+                    byMonth[ym].forEach((dd) => {
+                        if (col >= 14) { col = 0; curY += cellSize + gap; }
+                        const x = pad + col * (cellSize + gap); const done = dd.boss_done;
+                        ctx.fillStyle = done ? '#3a7a3a' : '#1c1810'; ctx.fillRect(x, curY, cellSize, cellSize);
+                        ctx.strokeStyle = done ? '#6aaa6a' : '#33301f'; ctx.lineWidth = 1; ctx.strokeRect(x, curY, cellSize, cellSize); col++;
+                    });
+                    curY += cellSize + gap + h * 0.02;
+                });
+            },
+        });
+        fetch(dsApiUrl('/api/plugins/the_daily/passport'), { headers: { 'X-Install-Id': dsInstallId() } })
+            .then((r) => r.text())
+            .then((text) => { if (destroyed) return; const data = text ? JSON.parse(text) : null; pState.data = (data && !data.error) ? data : null; pState.loaded = true; ppSurface.refresh(); })
+            .catch(() => { if (destroyed) return; pState.loaded = true; ppSurface.refresh(); });
+        hubSections.push({ interact: () => false, dispose: () => { ppSurface.dispose(); } });
+    }
 
-    const exitDoorDisposables = [exitFrameMat, exitFillMat, bandMat, rivetMat, exitLMat, exitLTex];
+    // Wall of Fame station (replaces _dsBuildWofRoom). Leaderboard stone tablet
+    // where the WOF passage was: scroll names with ▲/▼; click the board (once
+    // today's run is complete) to sign via a centered panel. Fed by /leaderboard
+    // + /sign. wofSignPanel is tracked so destroy() can tear it down.
+    let wofSignPanel = null;
+    {
+        const wofDate = d.date || new Date().toISOString().slice(0, 10);   // today (the signable wall)
+        const _WOF_EPOCH = '2026-04-22';
+        let _wofView = wofDate;                                             // date currently being viewed
+        const wofTablet = { loading: true, error: null, leaderboard: { entries: [] }, scrollOffset: 0 };
+        const ARROW_HIT = { up: { nx: 0.5, ny: 156/180, hw: 24/256, hh: 8/180 }, down: { nx: 0.5, ny: 172/180, hw: 24/256, hh: 8/180 } };
+        const DATE_HIT = { prev: { nx: 0.11, ny: 0.135, hw: 0.08, hh: 0.06 }, next: { nx: 0.89, ny: 0.135, hw: 0.08, hh: 0.06 } };
+        const isComplete = !!d.is_complete;
+        let signed = false;
+        try { signed = localStorage.getItem('ds_signed_' + wofDate) === 'true'; } catch (e) {}
+        const viewingToday = () => _wofView === wofDate;
+        const canSign = () => isComplete && viewingToday() && !signed;
+        const _wofAddDays = (ds, n) => { const dd = new Date(ds + 'T00:00:00Z'); dd.setUTCDate(dd.getUTCDate() + n); return dd.toISOString().slice(0, 10); };
+
+        function drawTablet(ctx, w, h, tState) {
+            ctx.fillStyle = '#2a2520'; ctx.fillRect(0, 0, w, h);
+            const sd = ctx.getImageData(0, 0, w, h);
+            for (let i = 0; i < sd.data.length; i += 4) { const n = (Math.random() * 12 - 6) | 0; sd.data[i] += n; sd.data[i+1] += n; sd.data[i+2] += n; }
+            ctx.putImageData(sd, 0, 0);
+            ctx.strokeStyle = '#6a5440'; ctx.lineWidth = Math.max(4, h * 0.018); ctx.strokeRect(10, 10, w - 20, h - 20);
+            ctx.font = `bold ${Math.round(h * 0.075)}px monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = '#e8c040';
+            ctx.fillText('WALL OF FAME', w / 2, h * 0.04);
+            // Date-history nav: ‹ date › to browse past walls.
+            ctx.textBaseline = 'middle';
+            const canPrev = _wofView > _WOF_EPOCH, canNext = _wofView < wofDate;
+            ctx.font = `bold ${Math.round(h * 0.07)}px monospace`;
+            ctx.fillStyle = canPrev ? '#caa86a' : '#463c28'; ctx.fillText('‹', w * 0.11, h * 0.135);
+            ctx.fillStyle = canNext ? '#caa86a' : '#463c28'; ctx.fillText('›', w * 0.89, h * 0.135);
+            ctx.font = `bold ${Math.round(h * 0.05)}px monospace`; ctx.fillStyle = '#d8c89a';
+            ctx.fillText(_wofView + (viewingToday() ? '  • TODAY' : ''), w / 2, h * 0.135);
+            ctx.textBaseline = 'top';
+            ctx.strokeStyle = '#4a3a2a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(w * 0.06, h * 0.2); ctx.lineTo(w * 0.94, h * 0.2); ctx.stroke();
+            const big = (t, c) => { ctx.font = `bold ${Math.round(h * 0.06)}px monospace`; ctx.fillStyle = c; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(t, w / 2, h * 0.48); };
+            const lb = tState.leaderboard; const entries = (lb && lb.entries) || [];
+            const rIcon = { '-1': '👎', '1': '👍', '2': '🔥' };
+            if (tState.loading) { big('Carving names…', '#9a8a6a'); }
+            else if (tState.error) { big(tState.error, '#c66'); }
+            else if (entries.length === 0) { big('No names carved yet', '#888'); }
+            else {
+                const scrollOff = tState.scrollOffset || 0;
+                const start = h * 0.235, rowH = h * 0.068, pad = w * 0.07;
+                ctx.textBaseline = 'middle';
+                for (let i = 0; i < 8; i++) {
+                    const idx = scrollOff + i; if (idx >= entries.length) break; const e = entries[idx]; const ey = start + i * rowH + rowH / 2;
+                    ctx.font = `bold ${Math.round(h * 0.046)}px monospace`; ctx.fillStyle = '#8a7458'; ctx.textAlign = 'right'; ctx.fillText(String(idx + 1) + '.', pad + w * 0.05, ey);
+                    ctx.textAlign = 'left'; ctx.font = `${Math.round(h * 0.05)}px monospace`; ctx.fillStyle = '#efe6d8'; ctx.fillText((e.display_name || 'Unknown').substring(0, 16), pad + w * 0.08, ey);
+                    if (e.streak && e.streak > 1) { ctx.textAlign = 'right'; ctx.fillStyle = '#d49050'; ctx.font = `${Math.round(h * 0.04)}px monospace`; ctx.fillText('🔥' + e.streak + 'd', w * 0.83, ey); }
+                    if (e.rating != null && rIcon[e.rating]) { ctx.textAlign = 'right'; ctx.font = `${Math.round(h * 0.05)}px serif`; ctx.fillText(rIcon[e.rating], w * 0.93, ey); }
+                }
+                const maxOff = Math.max(0, entries.length - 8);
+                if (entries.length > 8) {
+                    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = `bold ${Math.round(h * 0.06)}px monospace`;
+                    const au = ARROW_HIT.up, ad = ARROW_HIT.down;
+                    ctx.fillStyle = scrollOff > 0 ? '#e8c040' : '#3a3020'; ctx.fillText('▲', w * au.nx, h * au.ny);
+                    ctx.fillStyle = scrollOff < maxOff ? '#e8c040' : '#3a3020'; ctx.fillText('▼', w * ad.nx, h * ad.ny);
+                }
+            }
+            ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.font = `bold ${Math.round(h * 0.048)}px monospace`;
+            const sy = h - h * 0.03;
+            if (!viewingToday()) { ctx.fillStyle = '#7a6a48'; ctx.fillText('‹ › BROWSE PAST WALLS', w / 2, sy); }
+            else if (signed) { ctx.fillStyle = '#6a9a6a'; ctx.fillText('✓ SIGNED', w / 2, sy); }
+            else if (isComplete) { ctx.fillStyle = '#e8c040'; ctx.fillText('CLICK TO SIGN', w / 2, sy); }
+            else { ctx.fillStyle = '#6a5a3a'; ctx.fillText('FINISH TODAY TO SIGN', w / 2, sy); }
+        }
+
+        const tabletSurface = _dsCreateDiegeticSurface(THREE, {
+            scene, raycasterObjects,
+            position: [HW / 2 - 0.05, 0.5, -2.5], rotation: [0, -Math.PI / 2, 0], size: [2.8, 2.2],
+            resolution: [512, 360], linearFilter: true,
+            draw: (ctx, w, h) => drawTablet(ctx, w, h, wofTablet),
+        });
+        let _wofReq = 0;
+        function refetchLeaderboard() {
+            const req = ++_wofReq;
+            fetch('/api/plugins/the_daily/leaderboard?date=' + encodeURIComponent(_wofView), { cache: 'no-store' })
+                .then((r) => r.text())
+                .then((text) => { if (destroyed || req !== _wofReq) return; wofTablet.leaderboard = text ? JSON.parse(text) : { entries: [] }; wofTablet.loading = false; wofTablet.error = null; tabletSurface.refresh(); })
+                .catch(() => { if (destroyed || req !== _wofReq) return; wofTablet.loading = false; wofTablet.error = 'Supabase unreachable'; tabletSurface.refresh(); });
+        }
+        function wofChangeDate(dir) {
+            const nx = _wofAddDays(_wofView, dir);
+            if (nx < _WOF_EPOCH || nx > wofDate) return;
+            _wofView = nx; wofTablet.scrollOffset = 0; wofTablet.loading = true; wofTablet.error = null; tabletSurface.refresh(); refetchLeaderboard();
+        }
+        refetchLeaderboard();
+
+        function openSignPanel() {
+            if (wofSignPanel || !canSign()) return;
+            if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+            let rating = null;
+            const p = document.createElement('div');
+            p.style.cssText = 'position:absolute;inset:0;z-index:9;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);';
+            p.innerHTML = `
+                <div style="background:#1a1510;border:2px solid #5a4a3a;border-radius:6px;padding:20px;width:min(320px,86vw);font-family:monospace;text-align:center;">
+                    <div style="color:#e8c040;letter-spacing:.18em;font-weight:700;margin-bottom:14px;">SIGN THE WALL</div>
+                    <input id="ds-wof-name" type="text" maxlength="30" placeholder="Your name" style="width:100%;box-sizing:border-box;background:#0d0a06;border:1px solid #5a4a3a;border-radius:3px;color:#eee;font:12px monospace;padding:7px;margin-bottom:8px;outline:none;">
+                    <input id="ds-wof-msg" type="text" maxlength="60" placeholder="Comment (optional)" style="width:100%;box-sizing:border-box;background:#0d0a06;border:1px solid #5a4a3a;border-radius:3px;color:#ccc;font:11px monospace;padding:7px;margin-bottom:10px;outline:none;">
+                    <div id="ds-wof-rate" style="display:flex;justify-content:center;gap:10px;margin-bottom:12px;">
+                        <button data-r="-1" style="font-size:1.3rem;background:none;border:1px solid #444;border-radius:4px;padding:4px 10px;cursor:pointer;">👎</button>
+                        <button data-r="1" style="font-size:1.3rem;background:none;border:1px solid #444;border-radius:4px;padding:4px 10px;cursor:pointer;">👍</button>
+                        <button data-r="2" style="font-size:1.3rem;background:none;border:1px solid #444;border-radius:4px;padding:4px 10px;cursor:pointer;">🔥</button>
+                    </div>
+                    <div id="ds-wof-err" style="color:#e0706a;font-size:.7rem;min-height:14px;margin-bottom:8px;"></div>
+                    <div style="display:flex;gap:8px;">
+                        <button id="ds-wof-submit" style="flex:1;background:#3a2f12;border:1px solid #6a5a2a;border-radius:4px;color:#ffd24a;font:bold 12px monospace;letter-spacing:.1em;padding:9px;cursor:pointer;">SIGN</button>
+                        <button id="ds-wof-cancel" style="background:none;border:1px solid #444;border-radius:4px;color:#888;font:12px monospace;padding:9px 14px;cursor:pointer;">CANCEL</button>
+                    </div>
+                </div>`;
+            canvasWrap.appendChild(p);
+            wofSignPanel = p;
+            const close = () => { if (p.parentNode) p.parentNode.removeChild(p); if (wofSignPanel === p) wofSignPanel = null; };
+            p.querySelectorAll('#ds-wof-rate button').forEach((b) => b.addEventListener('click', () => {
+                rating = parseInt(b.dataset.r, 10);
+                p.querySelectorAll('#ds-wof-rate button').forEach((x) => x.style.borderColor = '#444');
+                b.style.borderColor = '#e8c040';
+            }));
+            p.querySelector('#ds-wof-cancel').addEventListener('click', close);
+            ['ds-wof-name', 'ds-wof-msg'].forEach((id) => p.querySelector('#' + id).addEventListener('keydown', (e) => e.stopPropagation()));
+            const submit = p.querySelector('#ds-wof-submit');
+            submit.addEventListener('click', () => {
+                const name = (p.querySelector('#ds-wof-name').value || '').trim();
+                const errEl = p.querySelector('#ds-wof-err');
+                if (!name) { errEl.textContent = 'Enter your name'; return; }
+                submit.disabled = true; submit.textContent = 'SIGNING…';
+                const msg = (p.querySelector('#ds-wof-msg').value || '').trim();
+                const payload = { display_name: name, rating, install_id: dsInstallId() };
+                if (msg) payload.message = msg;
+                fetch('/api/plugins/the_daily/sign', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+                    .then((r) => r.text())
+                    .then((text) => {
+                        const data = text ? JSON.parse(text) : {};
+                        if (data.error) { errEl.textContent = data.error; submit.disabled = false; submit.textContent = 'SIGN'; return; }
+                        signed = true; try { localStorage.setItem('ds_signed_' + wofDate, 'true'); } catch (e) {}
+                        close(); refetchLeaderboard(); tabletSurface.refresh();
+                    })
+                    .catch(() => { errEl.textContent = 'Network error'; submit.disabled = false; submit.textContent = 'SIGN'; });
+            });
+            setTimeout(() => { const ni = p.querySelector('#ds-wof-name'); if (ni) ni.focus(); }, 50);
+        }
+
+        hubSections.push({
+            interact: (rc) => {
+                for (const hit of rc.intersectObjects([tabletSurface.mesh])) {
+                    if (hit.object === tabletSurface.mesh && hit.uv) {
+                        const ux = hit.uv.x, uy = 1 - hit.uv.y;
+                        const dp = DATE_HIT.prev, dn = DATE_HIT.next;
+                        if (ux >= dp.nx - dp.hw && ux <= dp.nx + dp.hw && uy >= dp.ny - dp.hh && uy <= dp.ny + dp.hh) { wofChangeDate(-1); return true; }
+                        if (ux >= dn.nx - dn.hw && ux <= dn.nx + dn.hw && uy >= dn.ny - dn.hh && uy <= dn.ny + dn.hh) { wofChangeDate(1); return true; }
+                        const entries = (wofTablet.leaderboard && wofTablet.leaderboard.entries) || [];
+                        const maxOff = Math.max(0, entries.length - 8);
+                        const au = ARROW_HIT.up, ad = ARROW_HIT.down;
+                        if (wofTablet.scrollOffset > 0 && ux >= au.nx - au.hw && ux <= au.nx + au.hw && uy >= au.ny - au.hh && uy <= au.ny + au.hh) { wofTablet.scrollOffset--; tabletSurface.refresh(); return true; }
+                        if (wofTablet.scrollOffset < maxOff && ux >= ad.nx - ad.hw && ux <= ad.nx + ad.hw && uy >= ad.ny - ad.hh && uy <= ad.ny + ad.hh) { wofTablet.scrollOffset++; tabletSurface.refresh(); return true; }
+                        if (canSign()) openSignPanel();
+                        return true;
+                    }
+                }
+                return false;
+            },
+            dispose: () => { tabletSurface.dispose(); if (wofSignPanel && wofSignPanel.parentNode) wofSignPanel.parentNode.removeChild(wofSignPanel); wofSignPanel = null; },
+        });
+    }
+
+    // Creative "vault antechamber" dressing — pillars, beams, ritual dais,
+    // braziers, the animated descent rift, banners, and drifting embers.
+    const hubDressing = _dsDressHub(THREE, scene, { HW, HH, HL, HY, doorZ });
+
+    // ── Quake first-person controls (unifies the Hub with the dungeon, ADR 0010) ─
+    // The Hub used to be a rail: forward = straight into Today. Now you mouselook +
+    // WASD around the chamber and enter an area by walking into its Passage.
+    const qc = _dsQuakeController(camera, { eye: HY });
+    let pointerLocked = false;
+    const HX_LIMIT = HW / 2 - 0.5, HZ_BACK = 1.0, HZ_FAR = doorZ, PASS_HALF = 0.85;
+    let lastThud = 0;
+    const passageEntries = [
+        { id: 'today', x: 0 },
+    ];
+
+    // The diegetic exit door was removed — leaving the Daily is now via Esc
+    // (showExitConfirm → exitToHost) or the main-menu QUIT, not an in-world door.
 
     // Modifier plaque — stone-styled diegetic surface next to the Today Passage
     const plaqueSurface = _dsCreateDiegeticSurface(THREE, {
@@ -2949,21 +3339,44 @@ function _dsBuildHub(THREE, overlay, d) {
     fadeEl.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2;transition:opacity 0.3s;';
     canvasWrap.appendChild(fadeEl);
 
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'position:absolute;top:36%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    dirLabel.innerHTML = '<div style="font-size:1.3rem;margin-bottom:3px;">🎸</div><div>TODAY</div>';
-    canvasWrap.appendChild(dirLabel);
-
     const escHint = document.createElement('div');
     escHint.style.cssText = 'position:absolute;bottom:8px;left:8px;z-index:3;color:#444;font-family:monospace;font-size:0.65rem;letter-spacing:.12em;pointer-events:none;';
-    escHint.textContent = 'ESC — LEAVE \u2022 EXIT DOOR';
+    escHint.textContent = 'ESC — LEAVE';
     canvasWrap.appendChild(escHint);
 
     const btnFwd = document.createElement('button');
     btnFwd.innerHTML = '▲';
     btnFwd.style.cssText = 'position:absolute;bottom:8px;right:8px;width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
-    btnFwd.onclick = () => { if (state.phase === 'idle') moveToPassage('today'); };
+    // Touch / no-mouse fallback: hold to walk forward (toward whatever you face).
+    const _fwdHold = (v) => (ev) => { ev.preventDefault(); if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.keys.f = v; };
+    btnFwd.addEventListener('pointerdown', _fwdHold(true));
+    btnFwd.addEventListener('pointerup', _fwdHold(false));
+    btnFwd.addEventListener('pointerleave', _fwdHold(false));
+    btnFwd.addEventListener('pointercancel', _fwdHold(false));
     canvasWrap.appendChild(btnFwd);
+
+    // Turn buttons (touch) — to the left of the forward button.
+    const btnTurnL = document.createElement('button');
+    btnTurnL.innerHTML = '◀';
+    btnTurnL.style.cssText = 'position:absolute;bottom:8px;right:160px;width:44px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
+    btnTurnL.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.yaw += 0.35; };
+    canvasWrap.appendChild(btnTurnL);
+    const btnTurnR = document.createElement('button');
+    btnTurnR.innerHTML = '▶';
+    btnTurnR.style.cssText = 'position:absolute;bottom:8px;right:110px;width:44px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
+    btnTurnR.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.yaw -= 0.35; };
+    canvasWrap.appendChild(btnTurnR);
+
+    // One-time controls hint (mouselook needs a click to engage Pointer Lock).
+    const hubHintEl = document.createElement('div');
+    hubHintEl.textContent = 'CLICK TO LOOK · WASD MOVE · CLICK A STATION · WALK INTO TODAY TO DESCEND';
+    hubHintEl.style.cssText = 'position:absolute;bottom:64px;left:50%;transform:translateX(-50%);color:#7a7a7a;font-family:monospace;font-size:0.7rem;letter-spacing:.16em;z-index:4;pointer-events:none;text-shadow:0 0 6px #000;transition:opacity .4s ease;';
+    canvasWrap.appendChild(hubHintEl);
+    function hideHubHint() { if (hubHintEl) hubHintEl.style.opacity = '0'; }
+
+    const hubReticle = document.createElement('div');
+    hubReticle.className = 'ds-reticle';
+    canvasWrap.appendChild(hubReticle);
 
     const hudEl = document.createElement('div');
     hudEl.style.cssText = 'height:44px;background:#060606;border-top:2px solid #181818;display:flex;align-items:center;padding:0 12px;font-family:monospace;font-size:0.75rem;color:#555;flex-shrink:0;';
@@ -2983,13 +3396,16 @@ function _dsBuildHub(THREE, overlay, d) {
         const dt = Math.min((now - prevTime) / 1000, 0.1);
         prevTime = now;
 
-        const flicker = Math.sin(now * 0.0023) * 0.4 + Math.sin(now * 0.0071) * 0.2;
-        torch1.intensity = 2.0 + flicker;
-        torch2.intensity = 1.6 + flicker * 0.7;
+        // Authentic Quake 10 Hz lightstyle flicker on the wall torches (the
+        // accent/portal glows below stay smooth — magical auras, not fire).
+        torch1.intensity = 2.0 * (0.7 + _dsSampleLightstyle('fire', now, 0) * 0.34);
+        torch2.intensity = 1.6 * (0.7 + _dsSampleLightstyle('fire', now, 7.3) * 0.34);
         passageGlow.intensity = 2.0 + Math.sin(now * 0.003) * 0.5;
         archiveGlow.intensity = 1.5 + Math.sin(now * 0.003 + 1.0) * 0.4;
         passportGlow.intensity = 1.5 + Math.sin(now * 0.003 + 2.0) * 0.4;
         shopGlow.intensity = 1.5 + Math.sin(now * 0.003 + 3.0) * 0.4;
+        wofGlow.intensity = 1.5 + Math.sin(now * 0.003 + 4.0) * 0.4;
+        if (hubDressing) hubDressing.tick(now, dt);
 
         if (state.phase === 'moving') {
             state.moveTween = Math.min(state.moveTween + dt / 2.5, 1);
@@ -3015,46 +3431,59 @@ function _dsBuildHub(THREE, overlay, d) {
                         _dsHub = null;
                         if (state.targetPassageId === 'today') {
                             _dsStartRun(overlay, d);
-                        } else if (state.targetPassageId === 'wof') {
-                            overlay.innerHTML = '';
-                            _dsWofRoom = _dsBuildWofRoom(_dsTHREE, overlay, d);
-                            _dsWofRoom.start();
-                        } else if (state.targetPassageId === 'archive') {
-                            overlay.innerHTML = '';
-                            _dsArchiveRoom = _dsBuildArchiveAntechamber(_dsTHREE, overlay, d);
-                            _dsArchiveRoom.start();
-                        } else if (state.targetPassageId === 'passport') {
-                            overlay.innerHTML = '';
-                            _dsHallOfRecords = _dsBuildHallOfRecords(_dsTHREE, overlay, d);
-                            _dsHallOfRecords.start();
-                        } else if (state.targetPassageId === 'shop') {
-                            overlay.innerHTML = '';
-                            _dsShopRoom = _dsBuildShopRoom(_dsTHREE, overlay, d);
-                            _dsShopRoom.start();
                         } else {
+                            // Exit door: leave the Daily entirely (no 2D fallback).
                             dsDungeonExit();
-                            if (d.is_complete) {
-                                dsShow('complete');
-                                _dsInCompleteView = true;
-                                dsRenderComplete();
-                                dsSwitchTab('wof');
-                            } else {
-                                dsRender();
-                                dsShow('setlist');
-                            }
+                            try { window.showScreen('home'); } catch (e) {}
                         }
                     }
                 }, 300);
             }
         } else if (state.phase === 'idle') {
-            camera.position.y = HY + Math.sin(now * 0.0015) * 0.008;
-            camera.position.z += (0 - camera.position.z) * Math.min(1, dt * 4);
-            camera.position.x += (0 - camera.position.x) * Math.min(1, dt * 4);
+            qc.applyLook();      // consume Pointer-Lock mouse deltas
+            hubMoveStep(dt);     // Quake walk + chamber/passage collision
         }
 
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * 8));
-        camera.lookAt(curLookTarget);
+        if (state.phase === 'idle') {
+            camera.rotation.set(qc.pitch, qc.yaw, qc.viewRoll);
+        } else {
+            // Walk-through transition: turn toward the chosen Passage as we glide in.
+            curLookTarget.lerp(lookTarget, Math.min(1, dt * 8));
+            camera.lookAt(curLookTarget);
+        }
         renderer.render(scene, camera);
+    }
+
+    // One Quake ground-move step against the Hub chamber. Walking into a Passage
+    // opening on the back wall enters that area (sealed ones thud + block).
+    function hubMoveStep(dt) {
+        const w = qc.wishDir();
+        qc.accelerate(dt, w.wx, w.wz, w.wishspeed);
+        // The Quake controller works in Quake-scale velocity (maxspeed ~320); the
+        // dungeon matches it by scaling its world ×64. The Hub is unscaled small
+        // units, so the velocity/bob output is divided by the same factor to get
+        // the same walking feel in this chamber.
+        const MS = 1 / 64;
+        let nx = camera.position.x + qc.vel.x * dt * MS;
+        let nz = camera.position.z + qc.vel.z * dt * MS;
+        if (nz <= HZ_FAR + 0.55) {
+            let entered = null;
+            for (const pe of passageEntries) {
+                if (Math.abs(nx - pe.x) <= PASS_HALF) { entered = pe; break; }
+            }
+            if (entered) {
+                if (_dsIsPassageOpen(entered.id)) { moveToPassage(entered.id); return; }
+                const tnow = performance.now();
+                if (tnow - lastThud > 700) { _dsPlayThud(); lastThud = tnow; }
+            }
+            nz = HZ_FAR + 0.55; qc.vel.z = 0;
+        }
+        if (nz > HZ_BACK) { nz = HZ_BACK; qc.vel.z = 0; }
+        if (nx < -HX_LIMIT) { nx = -HX_LIMIT; qc.vel.x = 0; }
+        if (nx >  HX_LIMIT) { nx =  HX_LIMIT; qc.vel.x = 0; }
+        camera.position.x = nx;
+        camera.position.z = nz;
+        camera.position.y = HY + qc.viewBobRoll(dt) * MS;
     }
 
     function moveToPassage(passageId) {
@@ -3066,6 +3495,12 @@ function _dsBuildHub(THREE, overlay, d) {
             _dsPlayThud();
             return;
         }
+        if (pointerLocked && document.exitPointerLock) document.exitPointerLock();
+        // Seed the turn-tween from where the player is currently looking so the
+        // glide into the Passage starts from their gaze, not a hard snap.
+        const dir = new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation);
+        curLookTarget.copy(camera.position).add(dir);
+        lookTarget.set(p.x, HY, doorZ);
         state.moveStartZ = camera.position.z;
         state.moveStartX = camera.position.x;
         state.phase = 'moving';
@@ -3078,11 +3513,7 @@ function _dsBuildHub(THREE, overlay, d) {
         const p = passages[passageId];
         if (!p) return false;
         if (passageId === 'today') return true;
-        if (passageId === 'archive') return true;
-        if (passageId === 'passport') return true;
-        if (passageId === 'shop') return true;
-        if (!d.is_complete) return false;
-        return true;
+        return false;
     }
 
     function exitToHost() {
@@ -3103,6 +3534,7 @@ function _dsBuildHub(THREE, overlay, d) {
     }
 
     function showExitConfirm() {
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         _dsRenderMenu(overlay, {
             title: 'LEAVE THE DAILY?',
             subtitle: 'Exit to the Slopsmith homepage.',
@@ -3120,40 +3552,37 @@ function _dsBuildHub(THREE, overlay, d) {
 
     const onKey = (e) => {
         if (state.phase === 'transitioning' || destroyed) return;
+        if (_dsAudio) _dsAudio.init();
         if (e.key === 'Escape') {
-            if (_dsHubEscConfirmed) {
-                exitToHost(); e.preventDefault();
-            } else {
-                showExitConfirm(); e.preventDefault();
-            }
-        } else if (e.key === 'e' || e.key === 'E') {
-            // Proximity check: exit door is within ~2.5 units?
-            const ex = camera.position.x - exitDoorX;
-            const ez = camera.position.z - exitDoorZ;
-            if (ex*ex + ez*ez < 6.25) {
-                exitToHost(); e.preventDefault();
-            }
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ' || e.key === 'Enter') {
-            if (state.phase === 'idle') { moveToPassage('today'); e.preventDefault(); }
+            if (pointerLocked && document.exitPointerLock) document.exitPointerLock();
+            if (_dsHubEscConfirmed) { exitToHost(); } else { showExitConfirm(); }
+            e.preventDefault(); return;
         }
+        if (state.phase === 'idle' && qc.setMoveKey(e, true)) { hideHubHint(); e.preventDefault(); }
     };
+    const onKeyUp = (e) => { if (qc.setMoveKey(e, false)) e.preventDefault(); };
+    const onMouseMove = (e) => { if (pointerLocked && state.phase === 'idle') qc.addMouse(e.movementX, e.movementY); };
+    const onPointerLockChange = () => { pointerLocked = (document.pointerLockElement === canvas); if (pointerLocked) { hideHubHint(); hubReticle.classList.add('ds-reticle-on'); } else { hubReticle.classList.remove('ds-reticle-on'); } };
+    const onBlur = () => qc.clearKeys();
     window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKeyUp);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    window.addEventListener('blur', onBlur);
     canvas.addEventListener('click', (e) => {
+        if (_dsAudio) _dsAudio.init();
         if (state.phase !== 'idle') return;
-        const rect = canvas.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        const hits = raycaster.intersectObjects(raycasterObjects);
-        if (hits.length > 0) {
-            for (const hit of hits) {
-                const pid = passageMeshes.get(hit.object);
-                if (pid === 'exit') { exitToHost(); return; }
-                if (pid) { moveToPassage(pid); return; }
-            }
-            return;
+        // Raycast against in-hub section surfaces (crosshair when locked, else
+        // cursor). If a station handled the click, stay as-is; otherwise grab
+        // pointer lock so mouselook resumes.
+        if (pointerLocked) mouse.set(0, 0);
+        else {
+            const rect = canvas.getBoundingClientRect();
+            mouse.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
         }
-        moveToPassage('today');
+        raycaster.setFromCamera(mouse, camera);
+        for (const s of hubSections) { if (s.interact(raycaster)) return; }
+        if (!pointerLocked && canvas.requestPointerLock) canvas.requestPointerLock();
     });
 
     const disposables = [wallMat, floorMat, ceilMat, backMat, darkWallMat];
@@ -3180,6 +3609,7 @@ function _dsBuildHub(THREE, overlay, d) {
     function triggerBossCelebration(streak) {
         if (celebrationDone) return;
         celebrationDone = true;
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         // Boss-clear stinger — Doom-style power chord
         if (_dsAudio) _dsAudio.playBossClear();
         // Celebration full-screen overlay
@@ -3252,31 +3682,16 @@ function _dsBuildHub(THREE, overlay, d) {
             });
         }
 
-        // Dismiss handler — removes overlay, triggers beat 2
+        // Dismiss handler — removes the overlay and (beat 2) takes the player
+        // straight into the Wall of Fame to sign, rather than just unsealing the
+        // door and leaving them in the lobby to find it.
         const dismissBtn = celEl.querySelector('#ds-cel-dismiss');
         function dismissCel() {
+            // The Wall of Fame is now an in-hub station — dismiss the celebration
+            // and leave the player in the Hub, where they can walk to the WoF
+            // tablet to sign.
             if (celEl.parentNode) celEl.parentNode.removeChild(celEl);
-            if (wofUnsealPending) {
-                wofUnsealPending = false;
-                setTimeout(() => {
-                    if (destroyed) return;
-                    const p = passages['wof'];
-                    if (p) {
-                        p.setSealed(false);
-                        const wofFlare = new THREE.PointLight(0x1d4ed8, 0, 6);
-                        wofFlare.position.set(2.3, HY, doorZ);
-                        scene.add(wofFlare);
-                        hubBossEffects.push(wofFlare);
-                        const f2Start = performance.now();
-                        function f2Anim(now) {
-                            const t = (now - f2Start) / 1000;
-                            if (t < 1.5) { wofFlare.intensity = (t / 1.5) * 3; requestAnimationFrame(f2Anim); }
-                            else { wofFlare.intensity = 2; }
-                        }
-                        requestAnimationFrame(f2Anim);
-                    }
-                }, 800);
-            }
+            wofUnsealPending = false;
         }
         if (dismissBtn) dismissBtn.onclick = dismissCel;
     }
@@ -3286,6 +3701,12 @@ function _dsBuildHub(THREE, overlay, d) {
         destroyed = true;
         if (state.rafId) { cancelAnimationFrame(state.rafId); state.rafId = null; }
         window.removeEventListener('keydown', onKey);
+        window.removeEventListener('keyup', onKeyUp);
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('pointerlockchange', onPointerLockChange);
+        window.removeEventListener('blur', onBlur);
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+        if (hubReticle.parentNode) hubReticle.parentNode.removeChild(hubReticle);
         // Clean up celebration overlay
         const celEl = document.getElementById('ds-boss-celebration');
         if (celEl && celEl.parentNode) celEl.parentNode.removeChild(celEl);
@@ -3294,2278 +3715,21 @@ function _dsBuildHub(THREE, overlay, d) {
         hubBossEffects.length = 0;
         if (hubBossSlab) { hubBossSlab.dispose(); hubBossSlab = null; }
         Object.values(passages).forEach(p => p.dispose());
+        hubSections.forEach(s => { try { s.dispose(); } catch (e) {} });
+        if (hubDressing) hubDressing.dispose();
         // Clean up exit door
-        scene.remove(exitGroup);
-        exitDoorDisposables.forEach(m => { try { m.dispose(); } catch(e) {} });
         disposables.forEach(m => { try { m.dispose(); } catch(e) {} });
         plaqueSurface.dispose();
         renderer.dispose();
     }
 
+    // Texture every remaining solid surface (stations, doors, beams, props…).
+    _dsTextureAllSurfaces(THREE, scene);
+
     return { start, destroy, refresh, setPassageSealed, triggerBossCelebration };
 }
 
 // ── Wall of Fame Room (stone hall behind unsealed WoF Passage) ────────────
-function _dsBuildWofRoom(THREE, overlay, d) {
-    const RENDER_W = 320, RENDER_H = 200;
-    const HW = 8, HH = 4, HL = 10, HY = 0.35;
-
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-    const raycasterObjects = [];
-    const returnDoorMap = new Map();
-
-    const state = { phase: 'idle', moveTween: 0, rafId: null, moveStartZ: 0, tablet: { leaderboard: null, loading: true, error: null, scrollOffset: 0 } };
-
-    const _gsToday = d.date || new Date().toISOString().slice(0, 10);
-    const gState = {
-        signed: localStorage.getItem('ds_signed_' + _gsToday) === 'true',
-        phase: 'idle', // idle | input | submitting
-        error: null,
-        rating: null,
-        bookSurface: null,
-        promptEl: null,
-        inputOverlay: null,
-        nameInput: null,
-        msgInput: null,
-    };
-
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
-
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x000511, 8, 14);
-    const camera = new THREE.PerspectiveCamera(70, RENDER_W / RENDER_H, 0.1, 50);
-    camera.position.set(0, HY, 0);
-
-    // Cool, reverent lighting — blue-white instead of Hub's warm orange
-    const ambientLight = new THREE.AmbientLight(0x151030);
-    scene.add(ambientLight);
-    const brazier1 = new THREE.PointLight(0x4488ff, 1.8, 10);
-    brazier1.position.set(-2.5, 1.5, -3.5);
-    scene.add(brazier1);
-    const brazier2 = new THREE.PointLight(0x4488ff, 1.5, 10);
-    brazier2.position.set(2.5, 1.5, -3.5);
-    scene.add(brazier2);
-    const shaftLight = new THREE.PointLight(0x6688cc, 0.8, 6);
-    shaftLight.position.set(0, HH, 0);
-    scene.add(shaftLight);
-
-    function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-
-    const wallMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(42, 40, 45, 3, 1) });
-    const floorMat = new THREE.MeshLambertMaterial({ map: stoneTexture(22, 22, 28, 2, 4) });
-    const ceilMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(30, 28, 35, 2, 4) });
-    const focalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(55, 52, 58, 2, 1) });
-
-    const addPlane = (geo, mat, rx, ry, px, py, pz) => {
-        const m = new THREE.Mesh(geo, mat);
-        m.rotation.set(rx, ry, 0);
-        m.position.set(px, py, pz);
-        scene.add(m);
-    };
-
-    const focalZ = -(HL / 2 - 1);
-    const entryZ = HL / 2 - 1;
-
-    // Floor, ceiling, side walls
-    addPlane(new THREE.PlaneGeometry(HW, HL), floorMat, -Math.PI/2, 0,      0,     HY-HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HW, HL), ceilMat,   Math.PI/2, 0,      0,     HY+HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0,  Math.PI/2, -HW/2, HY,    0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0, -Math.PI/2,  HW/2, HY,    0);
-
-    // Focal back wall (faces camera — z-negative, where leaderboard tablet mounts)
-    addPlane(new THREE.PlaneGeometry(HW, HH), focalMat,  0, 0,      0, HY, focalZ);
-
-    // ── Guestbook pedestal + book ────────────────────────────────
-    const pedestalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(35, 32, 38, 1, 1) });
-    const pedestal = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.30, 0.5), pedestalMat);
-    pedestal.position.set(0, 0.15, -1.5);
-    scene.add(pedestal);
-
-    const BOOK_W = 0.6, BOOK_H = 0.4;
-    const bookPos = [0, 0.30, -1.47];
-
-    function drawBook(ctx, w, h) {
-        if (gState.signed) {
-            ctx.fillStyle = '#1a1510';
-            ctx.fillRect(0, 0, w, h);
-            ctx.fillStyle = '#2a2010';
-            ctx.fillRect(3, 3, w-6, h-6);
-            ctx.strokeStyle = '#5a3a1a';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(3, 3, w-6, h-6);
-            ctx.fillStyle = '#3a2510';
-            ctx.fillRect(w/2-2, 3, 4, h-6);
-            ctx.font = 'bold 8px monospace';
-            ctx.fillStyle = '#666';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('SEALED', w/2, h/2-6);
-            ctx.font = '6px monospace';
-            ctx.fillStyle = '#555';
-            ctx.fillText('(signed)', w/2, h/2+8);
-            return;
-        }
-        if (gState.phase === 'idle') {
-            ctx.fillStyle = '#f5e6c8';
-            ctx.fillRect(0, 0, w, h);
-            ctx.fillStyle = '#8a7a6a';
-            ctx.fillRect(w/2-2, 0, 4, h);
-            ctx.font = 'bold 9px monospace';
-            ctx.fillStyle = '#3a2a1a';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('SIGN', w/4, h/2-8);
-            ctx.fillText('HERE', w/4, h/2+6);
-            ctx.font = '7px monospace';
-            ctx.fillStyle = '#7a6a5a';
-            ctx.fillText('click or E', 3*w/4, h/2-6);
-            ctx.fillText('to inscribe', 3*w/4, h/2+6);
-            return;
-        }
-        ctx.fillStyle = '#f5e6c8';
-        ctx.fillRect(0, 0, w, h);
-        ctx.fillStyle = '#8a7a6a';
-        ctx.fillRect(w/2-2, 0, 4, h);
-        ctx.font = 'bold 7px monospace';
-        ctx.fillStyle = '#3a2a1a';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillText('Name:', w/4, 6);
-        ctx.fillText('Comment:', w/4, 54);
-        ctx.font = 'bold 7px monospace';
-        ctx.fillStyle = '#3a2a1a';
-        ctx.fillText('Rate:', 3*w/4, 6);
-        const ratings = ['\uD83D\uDC4E', '\uD83D\uDC4D', '\uD83D\uDD25'];
-        const rVals = [-1, 1, 2];
-        for (let i = 0; i < 3; i++) {
-            const bx = 3*w/4 + (i-1)*28 - 14;
-            const by = 16;
-            const sel = gState.rating === rVals[i];
-            ctx.fillStyle = sel ? '#4a7a4a' : '#e8dcc8';
-            ctx.fillRect(bx, by, 24, 22);
-            ctx.strokeStyle = sel ? '#6a9a6a' : '#8a7a6a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(bx, by, 24, 22);
-            ctx.font = '11px serif';
-            ctx.fillStyle = sel ? '#fff' : '#555';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(ratings[i], bx+12, by+11);
-        }
-        if (gState.phase === 'submitting') {
-            ctx.font = '7px monospace';
-            ctx.fillStyle = '#888';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('Signing...', w/2, h-12);
-        } else {
-            ctx.fillStyle = '#3a6a3a';
-            ctx.fillRect(w/2-24, h-20, 48, 14);
-            ctx.strokeStyle = '#5a8a5a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(w/2-24, h-20, 48, 14);
-            ctx.font = 'bold 7px monospace';
-            ctx.fillStyle = '#fff';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('\u27A4SIGN', w/2, h-13);
-        }
-        if (gState.error) {
-            ctx.font = '6px monospace';
-            ctx.fillStyle = '#a44';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'bottom';
-            ctx.fillText(gState.error, w/2, h-24);
-        }
-    }
-
-    const bookSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: bookPos,
-        rotation: [0, 0, 0],
-        size: [BOOK_W, BOOK_H],
-        raycasterObjects,
-        draw: drawBook,
-    });
-    gState.bookSurface = bookSurface;
-    const bookMesh = bookSurface.mesh;
-
-    const RATING_HITS = [
-        { val: -1, cx: 3*256/4 + (-1)*28 - 14 + 12, cy: 16+11, hw: 12, hh: 11 },
-        { val: 1,  cx: 3*256/4 + 0*28 - 14 + 12,      cy: 16+11, hw: 12, hh: 11 },
-        { val: 2,  cx: 3*256/4 + 1*28 - 14 + 12,      cy: 16+11, hw: 12, hh: 11 },
-    ];
-    const SUBMIT_HIT = { cx: 256/2, cy: 180-13, hw: 24, hh: 7 };
-
-    function positionInputs() {
-        const v = new THREE.Vector3(0, 0.30, -1.47);
-        v.project(camera);
-        const rect = canvasWrap.getBoundingClientRect();
-        const rx = (v.x * 0.5 + 0.5) * rect.width;
-        const ry = (-v.y * 0.5 + 0.5) * rect.height;
-        if (gState.nameInput) {
-            gState.nameInput.style.left = (rx - 55) + 'px';
-            gState.nameInput.style.top = (ry - 18) + 'px';
-        }
-        if (gState.msgInput) {
-            gState.msgInput.style.left = (rx - 55) + 'px';
-            gState.msgInput.style.top = (ry + 7) + 'px';
-        }
-    }
-
-    function enterInputMode() {
-        if (gState.signed || gState.phase !== 'idle') return;
-        gState.phase = 'input';
-        gState.error = null;
-        gState.rating = null;
-
-        if (gState.promptEl) gState.promptEl.style.display = 'none';
-
-        gState.inputOverlay = document.createElement('div');
-        gState.inputOverlay.style.cssText = 'position:absolute;inset:0;z-index:5;pointer-events:none;';
-        canvasWrap.appendChild(gState.inputOverlay);
-
-        gState.nameInput = document.createElement('input');
-        gState.nameInput.type = 'text';
-        gState.nameInput.placeholder = 'Your name';
-        gState.nameInput.maxLength = 30;
-        gState.nameInput.style.cssText = 'position:absolute;width:110px;pointer-events:auto;background:rgba(245,230,200,0.95);border:1px solid #8a7a6a;border-radius:2px;font:10px monospace;color:#2a1a0a;padding:2px 4px;outline:none;z-index:6;';
-        gState.inputOverlay.appendChild(gState.nameInput);
-
-        gState.msgInput = document.createElement('input');
-        gState.msgInput.type = 'text';
-        gState.msgInput.placeholder = 'Comment (optional)';
-        gState.msgInput.maxLength = 60;
-        gState.msgInput.style.cssText = 'position:absolute;width:110px;pointer-events:auto;background:rgba(245,230,200,0.95);border:1px solid #8a7a6a;border-radius:2px;font:10px monospace;color:#2a1a0a;padding:2px 4px;outline:none;z-index:6;';
-        gState.inputOverlay.appendChild(gState.msgInput);
-
-        positionInputs();
-        gState.bookSurface.refresh();
-        setTimeout(function() { if (gState.nameInput) gState.nameInput.focus(); }, 50);
-    }
-
-    function exitInputMode() {
-        if (gState.phase === 'idle') return;
-        gState.phase = 'idle';
-        gState.error = null;
-        gState.rating = null;
-        if (gState.inputOverlay && gState.inputOverlay.parentNode) {
-            gState.inputOverlay.parentNode.removeChild(gState.inputOverlay);
-        }
-        gState.inputOverlay = null;
-        gState.nameInput = null;
-        gState.msgInput = null;
-        gState.bookSurface.refresh();
-    }
-
-    function handleBookClick(uv) {
-        if (gState.phase !== 'input' || gState.phase === 'submitting') return;
-        const cx = uv.x * 256;
-        const cy = (1 - uv.y) * 180;
-
-        for (const rh of RATING_HITS) {
-            if (cx >= rh.cx - rh.hw && cx <= rh.cx + rh.hw && cy >= rh.cy - rh.hh && cy <= rh.cy + rh.hh) {
-                gState.rating = gState.rating === rh.val ? null : rh.val;
-                gState.bookSurface.refresh();
-                return;
-            }
-        }
-
-        if (cx >= SUBMIT_HIT.cx - SUBMIT_HIT.hw && cx <= SUBMIT_HIT.cx + SUBMIT_HIT.hw && cy >= SUBMIT_HIT.cy - SUBMIT_HIT.hh && cy <= SUBMIT_HIT.cy + SUBMIT_HIT.hh) {
-            submitSign();
-            return;
-        }
-    }
-
-    function submitSign() {
-        if (gState.phase === 'submitting') return;
-        const name = (gState.nameInput ? gState.nameInput.value : '').trim();
-        if (!name) {
-            gState.error = 'Enter your name';
-            gState.bookSurface.refresh();
-            return;
-        }
-        gState.phase = 'submitting';
-        gState.error = null;
-        gState.bookSurface.refresh();
-
-        const message = (gState.msgInput ? gState.msgInput.value : '').trim();
-        const payload = { display_name: name, rating: gState.rating, install_id: dsInstallId() };
-        if (message) payload.message = message;
-
-        fetch('/api/plugins/the_daily/sign', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        })
-            .then(function(resp) { return resp.text(); })
-            .then(function(text) {
-                if (destroyed) return;
-                const data = text ? JSON.parse(text) : {};
-                if (data.error) {
-                    gState.phase = 'input';
-                    gState.error = data.error;
-                    gState.bookSurface.refresh();
-                    return;
-                }
-                // Success
-                gState.signed = true;
-                localStorage.setItem('ds_signed_' + _gsToday, 'true');
-                exitInputMode();
-                gState.bookSurface.refresh();
-                refetchLeaderboard();
-            })
-            .catch(function() {
-                if (destroyed) return;
-                gState.phase = 'input';
-                gState.error = 'Network error';
-                gState.bookSurface.refresh();
-            });
-    }
-
-    function refetchLeaderboard() {
-        fetch('/api/plugins/the_daily/leaderboard?date=' + encodeURIComponent(_gsToday), { cache: 'no-store' })
-            .then(function(resp) { return resp.text(); })
-            .then(function(text) {
-                if (destroyed) return;
-                state.tablet.leaderboard = text ? JSON.parse(text) : { entries: [] };
-                state.tablet.loading = false;
-                tabletSurface.refresh();
-            })
-            .catch(function() {});
-    }
-
-    // ── Leaderboard stone tablet (diegetic) ──────────────────────
-    let destroyed = false;
-
-    const ARROW_HIT = {
-        up: { cx: 128, cy: 156, hw: 24, hh: 8 },
-        down: { cx: 128, cy: 172, hw: 24, hh: 8 },
-    };
-
-    function drawTablet(ctx, w, h, tState) {
-        ctx.fillStyle = '#2a2520';
-        ctx.fillRect(0, 0, w, h);
-        const sd = ctx.getImageData(0, 0, w, h);
-        for (let i = 0; i < sd.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 12 - 6);
-            sd.data[i]   = Math.min(255, Math.max(0, sd.data[i]   + n));
-            sd.data[i+1] = Math.min(255, Math.max(0, sd.data[i+1] + n));
-            sd.data[i+2] = Math.min(255, Math.max(0, sd.data[i+2] + n));
-        }
-        ctx.putImageData(sd, 0, 0);
-
-        ctx.strokeStyle = '#5a4a3a';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(6, 6, w - 12, h - 12);
-        ctx.strokeStyle = '#1a1510';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(11, 11, w - 22, h - 22);
-
-        ctx.font = 'bold 10px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillStyle = '#e8c040';
-        ctx.fillText('WALL OF FAME', w / 2, 8);
-
-        ctx.strokeStyle = '#4a3a2a';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(20, 22);
-        ctx.lineTo(w - 20, 22);
-        ctx.stroke();
-
-        if (tState.loading) {
-            ctx.font = '9px monospace';
-            ctx.fillStyle = '#888';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('Carving names\u2026', w / 2, h / 2);
-            return;
-        }
-
-        if (tState.error) {
-            ctx.font = '9px monospace';
-            ctx.fillStyle = '#a44';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('The chisel broke.', w / 2, h / 2 - 8);
-            ctx.fillStyle = '#777';
-            ctx.fillText(tState.error, w / 2, h / 2 + 8);
-            return;
-        }
-
-        const lb = tState.leaderboard;
-        const entries = (lb && lb.entries) || [];
-
-        if (entries.length === 0) {
-            ctx.font = '9px monospace';
-            ctx.fillStyle = '#777';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('No names carved yet', w / 2, h / 2 - 6);
-            ctx.fillText('\u2014 be the first.', w / 2, h / 2 + 6);
-            return;
-        }
-
-        const scrollOff = tState.scrollOffset || 0;
-        const maxOff = Math.max(0, entries.length - 8);
-        const showArrows = entries.length > 8;
-        const rIcon = { '-1': '\uD83D\uDC4E', '1': '\uD83D\uDC4D', '2': '\uD83D\uDD25' };
-
-        ctx.textBaseline = 'top';
-        for (let i = 0; i < 8; i++) {
-            const idx = scrollOff + i;
-            if (idx >= entries.length) break;
-            const e = entries[idx];
-            const ey = 26 + i * 13;
-
-            ctx.font = 'bold 8px monospace';
-            ctx.fillStyle = '#6a5a4a';
-            ctx.textAlign = 'right';
-            ctx.fillText(String(idx + 1) + '.', 32, ey);
-
-            ctx.textAlign = 'left';
-            ctx.font = '8px monospace';
-            ctx.fillStyle = '#ddd';
-            ctx.fillText((e.display_name || 'Unknown').substring(0, 14), 36, ey);
-
-            if (e.streak && e.streak > 1) {
-                ctx.textAlign = 'right';
-                ctx.fillStyle = '#c08040';
-                ctx.font = '7px monospace';
-                ctx.fillText('\uD83D\uDD25' + e.streak + 'd', w - 56, ey + 1);
-            }
-
-            if (e.rating != null && rIcon[e.rating]) {
-                ctx.textAlign = 'right';
-                ctx.font = '9px serif';
-                ctx.fillText(rIcon[e.rating], w - 28, ey);
-            }
-        }
-
-        ctx.strokeStyle = '#4a3a2a';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(20, 130);
-        ctx.lineTo(w - 20, 130);
-        ctx.stroke();
-
-        const rc = { '-1': 0, '1': 0, '2': 0 };
-        for (const e of entries) { if (e.rating != null) rc[String(e.rating)]++; }
-        ctx.textBaseline = 'top';
-        ctx.textAlign = 'left';
-        ctx.font = '8px serif';
-        ctx.fillStyle = '#aaa';
-        let rStr = '';
-        if (rc['1'] > 0) rStr += '\uD83D\uDC4D ' + rc['1'] + '  ';
-        if (rc['2'] > 0) rStr += '\uD83D\uDD25 ' + rc['2'] + '  ';
-        if (rc['-1'] > 0) rStr += '\uD83D\uDC4E ' + rc['-1'] + '  ';
-        if (rStr) ctx.fillText(rStr.trim(), 20, 134);
-
-        const pop = (lb.lane_popularity || [])
-            .map(function(p) { return p.lane.charAt(0).toUpperCase() + p.lane.slice(1) + ' ' + p.percent + '%'; })
-            .join(' \u00B7 ');
-        if (pop) {
-            ctx.font = '7px monospace';
-            ctx.fillStyle = '#777';
-            ctx.fillText(pop, 20, 146);
-        }
-
-        if (showArrows) {
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.font = 'bold 11px monospace';
-            ctx.fillStyle = scrollOff > 0 ? '#e8c040' : '#3a3020';
-            ctx.fillText('\u25B2', 128, 156);
-            ctx.fillStyle = scrollOff < maxOff ? '#e8c040' : '#3a3020';
-            ctx.fillText('\u25BC', 128, 172);
-        }
-    }
-
-    const tabletSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: [0, HY + 0.1, focalZ + 0.03],
-        rotation: [0, 0, 0],
-        size: [3.5, 2.5],
-        raycasterObjects,
-        draw: function(ctx, w, h) { drawTablet(ctx, w, h, state.tablet); },
-    });
-
-    fetch('/api/plugins/the_daily/leaderboard?date=' + encodeURIComponent(_gsToday), { cache: 'no-store' })
-        .then(function(resp) { return resp.text(); })
-        .then(function(text) {
-            if (destroyed) return;
-            state.tablet.leaderboard = text ? JSON.parse(text) : { entries: [] };
-            state.tablet.loading = false;
-            tabletSurface.refresh();
-        })
-        .catch(function() {
-            if (destroyed) return;
-            state.tablet.loading = false;
-            state.tablet.error = 'Supabase unreachable';
-            tabletSurface.refresh();
-        });
-
-    // Entry wall (behind camera — z-positive, with return door)
-    addPlane(new THREE.PlaneGeometry(HW, HH),
-        new THREE.MeshLambertMaterial({ map: stoneTexture(42, 40, 45, 3, 1) }),
-        0, Math.PI, 0, HY, entryZ);
-
-    // Return door — glowing blue portal on the entry wall
-    const returnDoorMat = new THREE.MeshLambertMaterial({ color: 0x1d4ed8, emissive: 0x0a1840 });
-    const returnDoor = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), returnDoorMat);
-    returnDoor.position.set(0, HY, entryZ - 0.02);
-    scene.add(returnDoor);
-    raycasterObjects.push(returnDoor);
-    returnDoorMap.set(returnDoor, 'hub-return');
-
-    // Door label
-    const doorLabelCanvas = document.createElement('canvas');
-    doorLabelCanvas.width = 128; doorLabelCanvas.height = 48;
-    const dlCtx = doorLabelCanvas.getContext('2d');
-    dlCtx.font = 'bold 13px monospace';
-    dlCtx.fillStyle = '#e8c040';
-    dlCtx.textAlign = 'center';
-    dlCtx.textBaseline = 'middle';
-    dlCtx.fillText('HUB', 64, 24);
-    const dlTex = new THREE.CanvasTexture(doorLabelCanvas);
-    dlTex.minFilter = dlTex.magFilter = THREE.NearestFilter;
-    const dlMat = new THREE.MeshBasicMaterial({ map: dlTex, transparent: true });
-    const dlMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.45), dlMat);
-    dlMesh.position.set(0, HY + 1.5, entryZ - 0.03);
-    scene.add(dlMesh);
-
-    // HTML layers
-    const canvasWrap = document.createElement('div');
-    canvasWrap.style.cssText = 'flex:1;position:relative;overflow:hidden;';
-    overlay.appendChild(canvasWrap);
-    canvasWrap.appendChild(canvas);
-
-    // Guestbook prompt hint (appears when player is near the book)
-    const promptEl = document.createElement('div');
-    promptEl.style.cssText = 'position:absolute;bottom:90px;left:50%;transform:translateX(-50%);z-index:4;color:#e8c040;font-family:monospace;font-size:0.8rem;text-align:center;pointer-events:none;opacity:0;transition:opacity 0.3s;text-shadow:0 0 8px #000;display:none;';
-    promptEl.innerHTML = 'Press <span style="color:#fff;border:1px solid #555;padding:1px 6px;border-radius:2px;">E</span> to sign the guestbook';
-    canvasWrap.appendChild(promptEl);
-    gState.promptEl = promptEl;
-
-    const fadeEl = document.createElement('div');
-    fadeEl.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2;transition:opacity 0.3s;';
-    canvasWrap.appendChild(fadeEl);
-
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'position:absolute;top:36%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    dirLabel.innerHTML = '<div style="font-size:1.3rem;margin-bottom:3px;">\u{1F3DB}\u{FE0F}</div><div>WALL OF FAME</div>';
-    canvasWrap.appendChild(dirLabel);
-
-    const escHint = document.createElement('div');
-    escHint.style.cssText = 'position:absolute;bottom:8px;left:8px;z-index:3;color:#444;font-family:monospace;font-size:0.65rem;letter-spacing:.12em;pointer-events:none;';
-    escHint.textContent = 'ESC \u2014 RETURN';
-    canvasWrap.appendChild(escHint);
-
-    const btnFwd = document.createElement('button');
-    btnFwd.innerHTML = '\u25B2';
-    btnFwd.style.cssText = 'position:absolute;bottom:8px;right:8px;width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
-    btnFwd.onclick = () => { if (state.phase === 'idle') returnToHub(); };
-    canvasWrap.appendChild(btnFwd);
-
-    const hudEl = document.createElement('div');
-    hudEl.style.cssText = 'height:44px;background:#060606;border-top:2px solid #181818;display:flex;align-items:center;padding:0 12px;font-family:monospace;font-size:0.75rem;color:#555;flex-shrink:0;';
-    const mod = d.modifier || {};
-    hudEl.innerHTML = '<span style="flex:1;color:#3a78c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(d.day_name || '') + '</span><span style="color:#444;">WALL OF FAME</span>';
-    overlay.appendChild(hudEl);
-
-    const lookTarget    = new THREE.Vector3(0, HY, focalZ);
-    const curLookTarget = new THREE.Vector3(0, HY, focalZ);
-    const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
-    let prevTime = performance.now();
-
-    function loop(now) {
-        if (destroyed) return;
-        state.rafId = requestAnimationFrame(loop);
-        const dt = Math.min((now - prevTime) / 1000, 0.1);
-        prevTime = now;
-
-        const flicker = Math.sin(now * 0.0018) * 0.3 + Math.sin(now * 0.0055) * 0.15;
-        brazier1.intensity = 1.6 + flicker;
-        brazier2.intensity = 1.3 + flicker * 0.7;
-        shaftLight.intensity = 0.7 + Math.sin(now * 0.002) * 0.1;
-
-        if (state.phase === 'moving') {
-            state.moveTween = Math.min(state.moveTween + dt / 2.5, 1);
-            const t = easeInOutCubic(state.moveTween);
-            camera.position.z = state.moveStartZ + (entryZ - state.moveStartZ) * t;
-            camera.position.y = HY + Math.sin(t * Math.PI * 4) * 0.022;
-            if (state.moveTween >= 1) {
-                state.phase = 'transitioning';
-                fadeEl.style.opacity = '1';
-                setTimeout(() => {
-                    if (!destroyed) {
-                        destroy();
-                        _dsWofRoom = null;
-                        overlay.innerHTML = '';
-                        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-                        _dsHub.start();
-                    }
-                }, 300);
-            }
-        } else if (state.phase === 'idle') {
-            camera.position.y = HY + Math.sin(now * 0.0012) * 0.006;
-            // Guestbook proximity check
-            if (!gState.signed) {
-                const _dx = camera.position.x;
-                const _dz = camera.position.z - (-1.5);
-                const _near = (_dx*_dx + _dz*_dz) < 4.0;
-                if (_near && gState.phase === 'input' && gState.inputOverlay) {
-                    positionInputs();
-                }
-                if (_near !== (gState.promptEl.style.display !== 'none')) {
-                    gState.promptEl.style.display = _near ? 'block' : 'none';
-                    gState.promptEl.style.opacity = _near ? '1' : '0';
-                }
-                if (!_near && gState.phase === 'input') {
-                    exitInputMode();
-                }
-            }
-        }
-
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * 6));
-        camera.lookAt(curLookTarget);
-        renderer.render(scene, camera);
-    }
-
-    function returnToHub() {
-        if (state.phase !== 'idle') return;
-        state.moveStartZ = camera.position.z;
-        state.phase = 'moving';
-        state.moveTween = 0;
-    }
-
-    const onKey = (e) => {
-        if (state.phase === 'transitioning' || destroyed) return;
-        if (gState.phase === 'input') {
-            if (e.key === 'Escape') { exitInputMode(); e.preventDefault(); }
-            else if (e.key === 'Enter') { submitSign(); e.preventDefault(); }
-            return;
-        }
-        if (e.key === 'Escape') {
-            returnToHub(); e.preventDefault();
-        } else if (e.key === 'e' && !gState.signed && gState.promptEl && gState.promptEl.style.display !== 'none') {
-            enterInputMode(); e.preventDefault();
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ' || e.key === 'Enter') {
-            if (state.phase === 'idle') { returnToHub(); e.preventDefault(); }
-        }
-    };
-    window.addEventListener('keydown', onKey);
-    canvas.addEventListener('click', (e) => {
-        if (state.phase !== 'idle') return;
-        const rect = canvas.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        const hits = raycaster.intersectObjects(raycasterObjects);
-        if (hits.length > 0) {
-            for (const hit of hits) {
-                if (hit.object === bookMesh) {
-                    if (gState.signed) return;
-                    if (gState.phase === 'idle') { enterInputMode(); return; }
-                    if (gState.phase === 'input' && hit.uv) { handleBookClick(hit.uv); return; }
-                    return;
-                }
-                if (hit.object === tabletSurface.mesh && hit.uv) {
-                    const cx = Math.round(hit.uv.x * 256);
-                    const cy = Math.round((1 - hit.uv.y) * 180);
-                    const scrollState = state.tablet;
-                    const maxOff = Math.max(0, (scrollState.leaderboard && scrollState.leaderboard.entries ? scrollState.leaderboard.entries.length : 0) - 8);
-                    const au = ARROW_HIT.up;
-                    if (scrollState.scrollOffset > 0 && cx >= au.cx - au.hw && cx <= au.cx + au.hw && cy >= au.cy - au.hh && cy <= au.cy + au.hh) {
-                        scrollState.scrollOffset = Math.max(0, scrollState.scrollOffset - 1);
-                        tabletSurface.refresh();
-                        return;
-                    }
-                    const ad = ARROW_HIT.down;
-                    if (scrollState.scrollOffset < maxOff && cx >= ad.cx - ad.hw && cx <= ad.cx + ad.hw && cy >= ad.cy - ad.hh && cy <= ad.cy + ad.hh) {
-                        scrollState.scrollOffset = Math.min(maxOff, scrollState.scrollOffset + 1);
-                        tabletSurface.refresh();
-                        return;
-                    }
-                }
-                const pid = returnDoorMap.get(hit.object);
-                if (pid) { returnToHub(); return; }
-            }
-        }
-        returnToHub();
-    });
-
-    const disposables = [wallMat, floorMat, ceilMat, focalMat, pedestalMat, returnDoorMat, dlMat, dlTex];
-    function destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        if (state.rafId) { cancelAnimationFrame(state.rafId); state.rafId = null; }
-        window.removeEventListener('keydown', onKey);
-        if (gState.inputOverlay && gState.inputOverlay.parentNode) {
-            gState.inputOverlay.parentNode.removeChild(gState.inputOverlay);
-            gState.inputOverlay = null;
-            gState.nameInput = null;
-            gState.msgInput = null;
-        }
-        if (gState.promptEl && gState.promptEl.parentNode) {
-            gState.promptEl.parentNode.removeChild(gState.promptEl);
-            gState.promptEl = null;
-        }
-        disposables.forEach(m => { try { m.dispose(); } catch(e) {} });
-        if (tabletSurface) tabletSurface.dispose();
-        if (gState.bookSurface) gState.bookSurface.dispose();
-        renderer.dispose();
-    }
-
-    function start() {
-        curLookTarget.copy(lookTarget);
-        prevTime = performance.now();
-        state.rafId = requestAnimationFrame(loop);
-    }
-
-    return { start, destroy };
-}
-
-// ── Archive Antechamber (library/study behind History Passage) ──────────
-function _dsBuildArchiveAntechamber(THREE, overlay, d) {
-    const RENDER_W = 320, RENDER_H = 200;
-    const HW = 7, HH = 3.5, HL = 9, HY = 0.35;
-
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-    const raycasterObjects = [];
-    const returnDoorMap = new Map();
-
-    const state = { phase: 'idle', moveTween: 0, rafId: null, moveStartZ: 0 };
-
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
-
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x1a1410, 7, 12);
-    const camera = new THREE.PerspectiveCamera(70, RENDER_W / RENDER_H, 0.1, 50);
-    camera.position.set(0, HY, 0);
-
-    // Warm library/study lighting — amber tones, warmer than Hub, cooler than WoF
-    const ambientLight = new THREE.AmbientLight(0x2a1e10);
-    scene.add(ambientLight);
-    const lamp1 = new THREE.PointLight(0xff8844, 1.8, 8);
-    lamp1.position.set(-2.0, 1.8, -2.5);
-    scene.add(lamp1);
-    const lamp2 = new THREE.PointLight(0xff8844, 1.5, 8);
-    lamp2.position.set(2.0, 1.8, -2.5);
-    scene.add(lamp2);
-    const pedestalLight = new THREE.PointLight(0xffaa66, 0.6, 4);
-    pedestalLight.position.set(0, 0.8, -(HL/2 - 1.5));
-    scene.add(pedestalLight);
-
-    function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-
-    // Warmer stone tones — records hall, more brown/gold than Hub's grey-brown
-    const wallMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(50, 42, 32, 3, 1) });
-    const floorMat = new THREE.MeshLambertMaterial({ map: stoneTexture(30, 25, 18, 2, 4) });
-    const ceilMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(25, 20, 15, 2, 4) });
-    const focalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(60, 50, 38, 2, 1) });
-    const shelfMat = new THREE.MeshLambertMaterial({ color: 0x2a1a0a });
-
-    const addPlane = (geo, mat, rx, ry, px, py, pz) => {
-        const m = new THREE.Mesh(geo, mat);
-        m.rotation.set(rx, ry, 0);
-        m.position.set(px, py, pz);
-        scene.add(m);
-    };
-
-    const focalZ = -(HL / 2 - 1);
-    const entryZ = HL / 2 - 1;
-
-    // Floor, ceiling, side walls
-    addPlane(new THREE.PlaneGeometry(HW, HL), floorMat, -Math.PI/2, 0, 0, HY-HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HW, HL), ceilMat,   Math.PI/2, 0, 0, HY+HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0,  Math.PI/2, -HW/2, HY, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0, -Math.PI/2,  HW/2, HY, 0);
-
-    // Focal back wall
-    addPlane(new THREE.PlaneGeometry(HW, HH), focalMat,  0, 0, 0, HY, focalZ);
-
-    // Bookshelf visual — horizontal shelf boards and vertical dividers on side walls
-    for (let i = 0; i < 4; i++) {
-        const sy = HY - 0.6 + i * 0.55;
-        // Left wall shelves
-        const sl = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.03, HL * 0.65), shelfMat);
-        sl.position.set(-HW/2 + 0.03, sy, 0);
-        scene.add(sl);
-        // Right wall shelves
-        const sr = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.03, HL * 0.65), shelfMat);
-        sr.position.set(HW/2 - 0.03, sy, 0);
-        scene.add(sr);
-    }
-    // Vertical dividers between shelf sections
-    const divMat = new THREE.MeshLambertMaterial({ color: 0x1a1008 });
-    for (let sz = -2.5; sz <= 2.5; sz += 1.8) {
-        const dl = new THREE.Mesh(new THREE.BoxGeometry(0.07, 1.7, 0.03), divMat);
-        dl.position.set(-HW/2 + 0.04, HY, sz);
-        scene.add(dl);
-        const dr = new THREE.Mesh(new THREE.BoxGeometry(0.07, 1.7, 0.03), divMat);
-        dr.position.set(HW/2 - 0.04, HY, sz);
-        scene.add(dr);
-    }
-
-    // ── Calendar pedestal with diegetic calendar device ────────────────────
-    const pedestalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(55, 45, 35, 1, 1) });
-    const pedestal = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.4, 0.6), pedestalMat);
-    pedestal.position.set(0, 0.2, focalZ + 0.5);
-    scene.add(pedestal);
-
-    // Calendar date state (UTC, matching backend _EPOCH)
-    const _CAL_EPOCH = new Date('2026-04-22T00:00:00Z');
-    const _calNow = new Date();
-    const _calTodayUTC = new Date(Date.UTC(_calNow.getUTCFullYear(), _calNow.getUTCMonth(), _calNow.getUTCDate()));
-    const _calYesterday = new Date(_calTodayUTC);
-    _calYesterday.setUTCDate(_calYesterday.getUTCDate() - 1);
-    let _calSelDate = _calYesterday < _CAL_EPOCH ? new Date(_CAL_EPOCH) : _calYesterday;
-    function _calDateStr(d) { return d.toISOString().slice(0, 10); }
-    function _calAddDays(d, n) { const r = new Date(d); r.setUTCDate(r.getUTCDate() + n); return r; }
-
-    // Interactive calendar surface
-    const pedSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: [0, 0.41, focalZ + 0.5],
-        rotation: [0, 0, 0],
-        size: [0.55, 0.55],
-        raycasterObjects,
-        draw: (ctx, w, h) => {
-            const selStr = _calDateStr(_calSelDate);
-            const canPrev = _calSelDate > _CAL_EPOCH;
-            const canNext = _calSelDate < _calTodayUTC;
-
-            // Stone background with noise grain
-            ctx.fillStyle = '#3a2a1a';
-            ctx.fillRect(0, 0, w, h);
-            const sd = ctx.getImageData(0, 0, w, h);
-            for (let i = 0; i < sd.data.length; i += 4) {
-                const n = Math.floor(Math.random() * 10 - 5);
-                sd.data[i]   = Math.min(255, Math.max(0, sd.data[i]   + n));
-                sd.data[i+1] = Math.min(255, Math.max(0, sd.data[i+1] + n));
-                sd.data[i+2] = Math.min(255, Math.max(0, sd.data[i+2] + n));
-            }
-            ctx.putImageData(sd, 0, 0);
-
-            // Outer bevel
-            ctx.strokeStyle = '#6a4a2a';
-            ctx.lineWidth = 3;
-            ctx.strokeRect(6, 6, w - 12, h - 12);
-            ctx.strokeStyle = '#4a3a2a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(11, 11, w - 22, h - 22);
-
-            // Title
-            ctx.font = 'bold 8px monospace';
-            ctx.fillStyle = '#8a7a5a';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'top';
-            ctx.fillText('ARCHIVE', w / 2, 14);
-
-            // Prev arrow
-            ctx.textBaseline = 'middle';
-            ctx.font = 'bold 22px monospace';
-            ctx.fillStyle = canPrev ? '#c4a050' : '#3a3525';
-            ctx.textAlign = 'center';
-            ctx.fillText('<', 38, h / 2 - 4);
-
-            // Date
-            ctx.font = 'bold 14px monospace';
-            ctx.fillStyle = '#d4a044';
-            ctx.fillText(selStr, w / 2, h / 2 - 4);
-
-            // Next arrow
-            ctx.font = 'bold 22px monospace';
-            ctx.fillStyle = canNext ? '#c4a050' : '#3a3525';
-            ctx.fillText('>', w - 38, h / 2 - 4);
-
-            // Confirm button
-            ctx.fillStyle = '#2a2015';
-            ctx.fillRect(60, h - 38, w - 120, 26);
-            ctx.strokeStyle = '#5a4a2a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(60, h - 38, w - 120, 26);
-            ctx.font = 'bold 8px monospace';
-            ctx.fillStyle = '#b09070';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('CONFIRM', w / 2, h - 25);
-        },
-    });
-
-    function _calChangeDir(dir) {
-        const next = _calAddDays(_calSelDate, dir);
-        if (next < _CAL_EPOCH || next > _calTodayUTC) return;
-        _calSelDate = next;
-        pedSurface.refresh();
-    }
-
-    function _calConfirm() {
-        if (state.phase !== 'idle') return;
-        state.phase = 'loading';
-        const selStr = _calDateStr(_calSelDate);
-        _dsLoadHistoricalDungeon(selStr, overlay).then(ok => {
-            if (!ok && !destroyed) state.phase = 'idle';
-        });
-    }
-
-    // Entry wall (behind camera)
-    addPlane(new THREE.PlaneGeometry(HW, HH),
-        new THREE.MeshLambertMaterial({ map: stoneTexture(50, 42, 32, 3, 1) }),
-        0, Math.PI, 0, HY, entryZ);
-
-    // Return door — glowing blue portal on the entry wall
-    const returnDoorMat = new THREE.MeshLambertMaterial({ color: 0x1d4ed8, emissive: 0x0a1840 });
-    const returnDoor = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), returnDoorMat);
-    returnDoor.position.set(0, HY, entryZ - 0.02);
-    scene.add(returnDoor);
-    raycasterObjects.push(returnDoor);
-    returnDoorMap.set(returnDoor, 'hub-return');
-
-    // Door label
-    const doorLabelCanvas = document.createElement('canvas');
-    doorLabelCanvas.width = 128; doorLabelCanvas.height = 48;
-    const dlCtx = doorLabelCanvas.getContext('2d');
-    dlCtx.font = 'bold 13px monospace';
-    dlCtx.fillStyle = '#e8c040';
-    dlCtx.textAlign = 'center';
-    dlCtx.textBaseline = 'middle';
-    dlCtx.fillText('HUB', 64, 24);
-    const dlTex = new THREE.CanvasTexture(doorLabelCanvas);
-    dlTex.minFilter = dlTex.magFilter = THREE.NearestFilter;
-    const dlMat = new THREE.MeshBasicMaterial({ map: dlTex, transparent: true });
-    const dlMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.45), dlMat);
-    dlMesh.position.set(0, HY + 1.5, entryZ - 0.03);
-    scene.add(dlMesh);
-
-    // HTML layers
-    const canvasWrap = document.createElement('div');
-    canvasWrap.style.cssText = 'flex:1;position:relative;overflow:hidden;';
-    overlay.appendChild(canvasWrap);
-    canvasWrap.appendChild(canvas);
-
-    const fadeEl = document.createElement('div');
-    fadeEl.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2;transition:opacity 0.3s;';
-    canvasWrap.appendChild(fadeEl);
-
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'position:absolute;top:36%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    dirLabel.innerHTML = '<div style="font-size:1.3rem;margin-bottom:3px;">\uD83D\uDCDC</div><div>ARCHIVE</div>';
-    canvasWrap.appendChild(dirLabel);
-
-    const escHint = document.createElement('div');
-    escHint.style.cssText = 'position:absolute;bottom:8px;left:8px;z-index:3;color:#444;font-family:monospace;font-size:0.65rem;letter-spacing:.12em;pointer-events:none;';
-    escHint.textContent = 'ESC \u2014 RETURN';
-    canvasWrap.appendChild(escHint);
-
-    const btnFwd = document.createElement('button');
-    btnFwd.innerHTML = '\u25B2';
-    btnFwd.style.cssText = 'position:absolute;bottom:8px;right:8px;width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
-    btnFwd.onclick = () => { if (state.phase === 'idle') returnToHub(); };
-    canvasWrap.appendChild(btnFwd);
-
-    const hudEl = document.createElement('div');
-    hudEl.style.cssText = 'height:44px;background:#060606;border-top:2px solid #181818;display:flex;align-items:center;padding:0 12px;font-family:monospace;font-size:0.75rem;color:#555;flex-shrink:0;';
-    const mod = d.modifier || {};
-    hudEl.innerHTML = `<span style="flex:1;color:#3a78c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(d.day_name || '')}</span><span style="color:#d4a044;">ARCHIVE</span>`;
-    overlay.appendChild(hudEl);
-
-    const lookTarget    = new THREE.Vector3(0, HY, focalZ);
-    const curLookTarget = new THREE.Vector3(0, HY, focalZ);
-    const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
-    let prevTime = performance.now();
-    let destroyed = false;
-
-    function loop(now) {
-        if (destroyed) return;
-        state.rafId = requestAnimationFrame(loop);
-        const dt = Math.min((now - prevTime) / 1000, 0.1);
-        prevTime = now;
-
-        const flicker = Math.sin(now * 0.0018) * 0.3 + Math.sin(now * 0.0055) * 0.15;
-        lamp1.intensity = 1.6 + flicker;
-        lamp2.intensity = 1.3 + flicker * 0.7;
-        pedestalLight.intensity = 0.5 + Math.sin(now * 0.002) * 0.1;
-
-        if (state.phase === 'moving') {
-            state.moveTween = Math.min(state.moveTween + dt / 2.5, 1);
-            const t = easeInOutCubic(state.moveTween);
-            camera.position.z = state.moveStartZ + (entryZ - state.moveStartZ) * t;
-            camera.position.y = HY + Math.sin(t * Math.PI * 4) * 0.022;
-            if (state.moveTween >= 1) {
-                state.phase = 'transitioning';
-                fadeEl.style.opacity = '1';
-                setTimeout(() => {
-                    if (!destroyed) {
-                        destroy();
-                        _dsArchiveRoom = null;
-                        overlay.innerHTML = '';
-                        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-                        _dsHub.start();
-                    }
-                }, 300);
-            }
-        } else if (state.phase === 'idle') {
-            camera.position.y = HY + Math.sin(now * 0.0012) * 0.006;
-        }
-
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * 6));
-        camera.lookAt(curLookTarget);
-        renderer.render(scene, camera);
-    }
-
-    function returnToHub() {
-        if (state.phase !== 'idle') return;
-        state.moveStartZ = camera.position.z;
-        state.phase = 'moving';
-        state.moveTween = 0;
-    }
-
-    const onKey = (e) => {
-        if (state.phase === 'transitioning' || destroyed) return;
-        if (e.key === 'Escape') {
-            returnToHub(); e.preventDefault();
-        } else if (e.key === 'ArrowLeft') {
-            _calChangeDir(-1); e.preventDefault();
-        } else if (e.key === 'ArrowRight') {
-            _calChangeDir(1); e.preventDefault();
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ') {
-            if (state.phase === 'idle') { returnToHub(); e.preventDefault(); }
-        } else if (e.key === 'Enter') {
-            if (state.phase === 'idle') { _calConfirm(); e.preventDefault(); }
-        }
-    };
-    window.addEventListener('keydown', onKey);
-    canvas.addEventListener('click', (e) => {
-        if (state.phase !== 'idle') return;
-        const rect = canvas.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        const hits = raycaster.intersectObjects(raycasterObjects);
-        if (hits.length > 0) {
-            for (const hit of hits) {
-                if (hit.object === pedSurface.mesh && hit.uv) {
-                    const ux = hit.uv.x, uy = hit.uv.y;
-                    // UV: (0,0) bottom-left, (1,1) top-right
-                    // Top 22%: title; middle 22%-78%: date/arrow area; bottom 78%+: confirm
-                    if (uy >= 0.78) {
-                        _calConfirm();
-                    } else if (uy > 0.22) {
-                        if (ux < 0.3) {
-                            _calChangeDir(-1);
-                        } else if (ux > 0.7) {
-                            _calChangeDir(1);
-                        }
-                    }
-                    return;
-                }
-                const pid = returnDoorMap.get(hit.object);
-                if (pid) { returnToHub(); return; }
-            }
-        }
-        returnToHub();
-    });
-
-    const disposables = [
-        wallMat, floorMat, ceilMat, focalMat, shelfMat, divMat,
-        pedestalMat, returnDoorMat, dlMat, dlTex
-    ];
-    function destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        if (state.rafId) { cancelAnimationFrame(state.rafId); state.rafId = null; }
-        window.removeEventListener('keydown', onKey);
-        disposables.forEach(m => { try { m.dispose(); } catch(e) {} });
-        pedSurface.dispose();
-        renderer.dispose();
-    }
-
-    function start() {
-        curLookTarget.copy(lookTarget);
-        prevTime = performance.now();
-        state.rafId = requestAnimationFrame(loop);
-    }
-
-    return { start, destroy };
-}
-
-// ── Hall of Records (behind Passport Passage) ──────────────────────────
-function _dsBuildHallOfRecords(THREE, overlay, d) {
-    const RENDER_W = 320, RENDER_H = 200;
-    const HW = 8, HH = 4, HL = 10, HY = 0.35;
-
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-    const raycasterObjects = [];
-    const returnDoorMap = new Map();
-
-    const state = { phase: 'idle', moveTween: 0, rafId: null, moveStartZ: 0, passportData: null, passportLoaded: false };
-
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
-
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x0a0806, 7, 13);
-    const camera = new THREE.PerspectiveCamera(70, RENDER_W / RENDER_H, 0.1, 50);
-    camera.position.set(0, HY, 0);
-
-    // Warm record-hall lighting — deep amber tones
-    const ambientLight = new THREE.AmbientLight(0x1a1410);
-    scene.add(ambientLight);
-    const lamp1 = new THREE.PointLight(0xff8844, 1.8, 9);
-    lamp1.position.set(-3.0, 2.0, -2.5);
-    scene.add(lamp1);
-    const lamp2 = new THREE.PointLight(0xff8844, 1.5, 9);
-    lamp2.position.set(3.0, 2.0, -2.5);
-    scene.add(lamp2);
-    const plinthLight = new THREE.PointLight(0xffaa66, 0.5, 4);
-    plinthLight.position.set(0, 1.0, -1.0);
-    scene.add(plinthLight);
-    const wallLight = new THREE.PointLight(0x885522, 0.6, 5);
-    wallLight.position.set(-3.8, 1.8, 0);
-    scene.add(wallLight);
-    const wallLight2 = new THREE.PointLight(0x885522, 0.6, 5);
-    wallLight2.position.set(3.8, 1.8, 0);
-    scene.add(wallLight2);
-
-    function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-
-    // Rich warm stone — like a museum archive
-    const wallMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(60, 50, 36, 3, 1) });
-    const floorMat = new THREE.MeshLambertMaterial({ map: stoneTexture(32, 26, 18, 2, 4) });
-    const ceilMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(22, 18, 14, 2, 4) });
-    const focalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(68, 55, 40, 2, 1) });
-    const accentMat = new THREE.MeshLambertMaterial({ map: stoneTexture(75, 60, 42, 2, 1) });
-
-    const addPlane = (geo, mat, rx, ry, px, py, pz) => {
-        const m = new THREE.Mesh(geo, mat);
-        m.rotation.set(rx, ry, 0);
-        m.position.set(px, py, pz);
-        scene.add(m);
-    };
-
-    const focalZ = -(HL / 2 - 1);
-    const entryZ = HL / 2 - 1;
-
-    // Floor, ceiling, side walls
-    addPlane(new THREE.PlaneGeometry(HW, HL), floorMat, -Math.PI/2, 0, 0, HY-HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HW, HL), ceilMat,   Math.PI/2, 0, 0, HY+HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0,  Math.PI/2, -HW/2, HY, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0, -Math.PI/2,  HW/2, HY, 0);
-
-    // Focal back wall (faces camera)
-    addPlane(new THREE.PlaneGeometry(HW, HH), focalMat,  0, 0, 0, HY, focalZ);
-
-    // ── Central plinth (pedestal with totals) ─────────────────────────
-    const plinthPedestalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(45, 38, 28, 1, 1) });
-    const plinthPedestal = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.35, 0.8), plinthPedestalMat);
-    plinthPedestal.position.set(0, 0.175, -1.2);
-    scene.add(plinthPedestal);
-
-    // Totals diegetic surface on top of the plinth
-    const totalsSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: [0, 0.36, -1.2],
-        rotation: [0, 0, 0],
-        size: [0.7, 0.7],
-        raycasterObjects,
-        draw: (ctx, w, h) => {
-            ctx.fillStyle = '#2a2218';
-            ctx.fillRect(0, 0, w, h);
-            const sd = ctx.getImageData(0, 0, w, h);
-            for (let i = 0; i < sd.data.length; i += 4) {
-                const n = Math.floor(Math.random() * 10 - 5);
-                sd.data[i]   = Math.min(255, Math.max(0, sd.data[i]   + n));
-                sd.data[i+1] = Math.min(255, Math.max(0, sd.data[i+1] + n));
-                sd.data[i+2] = Math.min(255, Math.max(0, sd.data[i+2] + n));
-            }
-            ctx.putImageData(sd, 0, 0);
-
-            ctx.strokeStyle = '#6a4a2a';
-            ctx.lineWidth = 3;
-            ctx.strokeRect(4, 4, w - 8, h - 8);
-            ctx.strokeStyle = '#4a3a2a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(9, 9, w - 18, h - 18);
-
-            if (!state.passportLoaded || !state.passportData) {
-                ctx.font = 'bold 8px monospace';
-                ctx.fillStyle = '#888';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText('Loading\u2026', w / 2, h / 2);
-                return;
-            }
-
-            const t = state.passportData.totals || {};
-            const items = [
-                { label: 'DAILIES', value: String(t.total_dailies || 0) },
-                { label: 'STREAK', value: String(t.current_streak || 0) },
-                { label: 'BEST', value: String(t.longest_streak || 0) },
-                { label: '\uD83D\uDFE0', value: String(t.lifetime_tokens_earned || 0) },
-            ];
-            const cellW = w / 2, cellH = h / 2;
-            items.forEach((it, i) => {
-                const col = i % 2, row = Math.floor(i / 2);
-                const cx = col * cellW + cellW / 2;
-                const cy = row * cellH + cellH / 2;
-                ctx.font = 'bold 18px monospace';
-                ctx.fillStyle = '#e8c040';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(it.value, cx, cy - 6);
-                ctx.font = 'bold 6px monospace';
-                ctx.fillStyle = '#8a7a5a';
-                ctx.fillText(it.label, cx, cy + 14);
-            });
-        },
-    });
-
-    // ── Stamp grid wall (passport grid on back wall lower section) ────
-    const gridSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: [0, HY - 0.2, focalZ + 0.03],
-        rotation: [0, 0, 0],
-        size: [3.5, 1.8],
-        raycasterObjects,
-        draw: (ctx, w, h) => {
-            ctx.fillStyle = '#2a2218';
-            ctx.fillRect(0, 0, w, h);
-            const sd = ctx.getImageData(0, 0, w, h);
-            for (let i = 0; i < sd.data.length; i += 4) {
-                const n = Math.floor(Math.random() * 10 - 5);
-                sd.data[i]   = Math.min(255, Math.max(0, sd.data[i]   + n));
-                sd.data[i+1] = Math.min(255, Math.max(0, sd.data[i+1] + n));
-                sd.data[i+2] = Math.min(255, Math.max(0, sd.data[i+2] + n));
-            }
-            ctx.putImageData(sd, 0, 0);
-
-            ctx.strokeStyle = '#6a4a2a';
-            ctx.lineWidth = 3;
-            ctx.strokeRect(4, 4, w - 8, h - 8);
-            ctx.strokeStyle = '#4a3a2a';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(9, 9, w - 18, h - 18);
-
-            ctx.font = 'bold 10px monospace';
-            ctx.fillStyle = '#e8c040';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'top';
-            ctx.fillText('PASSPORT GRID', w / 2, 10);
-
-            ctx.strokeStyle = '#4a3a2a';
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(20, 22);
-            ctx.lineTo(w - 20, 22);
-            ctx.stroke();
-
-            if (!state.passportLoaded || !state.passportData) {
-                ctx.font = '8px monospace';
-                ctx.fillStyle = '#888';
-                ctx.textBaseline = 'middle';
-                ctx.fillText('Loading\u2026', w / 2, h / 2);
-                return;
-            }
-
-            const days = state.passportData.days || [];
-            if (!days.length) {
-                ctx.font = '8px monospace';
-                ctx.fillStyle = '#777';
-                ctx.textBaseline = 'middle';
-                ctx.fillText('No days completed yet', w / 2, h / 2);
-                return;
-            }
-
-            // Group days by month
-            const byMonth = {};
-            days.forEach(day => {
-                const ym = day.date.slice(0, 7);
-                (byMonth[ym] = byMonth[ym] || []).push(day);
-            });
-            const months = Object.keys(byMonth).sort().slice(-4);
-
-            const cellSize = 10;
-            const gap = 1;
-            const startY = 28;
-            let curY = startY;
-
-            months.forEach(ym => {
-                const label = ym;
-                ctx.font = 'bold 6px monospace';
-                ctx.fillStyle = '#8a7a5a';
-                ctx.textAlign = 'left';
-                ctx.textBaseline = 'top';
-                ctx.fillText(label, 14, curY);
-                curY += 8;
-
-                const monthDays = byMonth[ym];
-                let col = 0;
-                monthDays.forEach(day => {
-                    if (col >= 7) { col = 0; curY += cellSize + gap; }
-                    const x = 14 + col * (cellSize + gap);
-                    const y = curY;
-                    const done = day.boss_done;
-                    ctx.fillStyle = done ? '#3a7a3a' : '#1a1a1a';
-                    ctx.fillRect(x, y, cellSize, cellSize);
-                    ctx.strokeStyle = done ? '#5a9a5a' : '#2a2a2a';
-                    ctx.lineWidth = 0.5;
-                    ctx.strokeRect(x, y, cellSize, cellSize);
-                    if (done) {
-                        ctx.font = 'bold 7px monospace';
-                        ctx.fillStyle = '#8ac88a';
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillText('\u2713', x + cellSize / 2, y + cellSize / 2);
-                    }
-                    col++;
-                });
-                curY += cellSize + gap + 2;
-            });
-        },
-    });
-
-    // ── Stamp display cases on side walls ─────────────────────────────
-    const STAMP_CATEGORY_ORDER = ['streak', 'completions', 'lane', 'decade', 'modifier'];
-    function stampDisplayName(id) {
-        if (!id) return '';
-        return id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    }
-
-    const stampCaseSurfaces = [];
-    function buildStampCases(data) {
-        const earned = (data.stamps_earned || []).slice(-8);
-        const perWall = Math.min(earned.length, 6);
-
-        // Right wall: earned stamps
-        for (let i = 0; i < perWall; i++) {
-            const stamp = earned[i];
-            const zPos = 3.5 - i * 0.75;
-            const surf = _dsCreateDiegeticSurface(THREE, {
-                scene,
-                position: [HW / 2 - 0.04, HY + 0.15, zPos],
-                rotation: [0, -Math.PI / 2, 0],
-                size: [0.6, 0.5],
-                draw: (ctx, cw, ch) => {
-                    ctx.fillStyle = '#1a1510';
-                    ctx.fillRect(0, 0, cw, ch);
-                    const sd = ctx.getImageData(0, 0, cw, ch);
-                    for (let i2 = 0; i2 < sd.data.length; i2 += 4) {
-                        const n = Math.floor(Math.random() * 8 - 4);
-                        sd.data[i2]   = Math.min(255, Math.max(0, sd.data[i2]   + n));
-                        sd.data[i2+1] = Math.min(255, Math.max(0, sd.data[i2+1] + n));
-                        sd.data[i2+2] = Math.min(255, Math.max(0, sd.data[i2+2] + n));
-                    }
-                    ctx.putImageData(sd, 0, 0);
-
-                    // Gold frame (earned)
-                    ctx.strokeStyle = '#c4a050';
-                    ctx.lineWidth = 3;
-                    ctx.strokeRect(3, 3, cw - 6, ch - 6);
-                    ctx.strokeStyle = '#8a6a30';
-                    ctx.lineWidth = 1;
-                    ctx.strokeRect(7, 7, cw - 14, ch - 14);
-
-                    // Star icon
-                    ctx.font = '26px serif';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillStyle = '#e8c040';
-                    ctx.fillText('\u2B50', cw / 2, ch / 2 - 6);
-
-                    // Name at bottom
-                    const name = stampDisplayName(stamp.id).substring(0, 18);
-                    ctx.font = 'bold 7px monospace';
-                    ctx.fillStyle = '#c4a050';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'bottom';
-                    ctx.fillText(name, cw / 2, ch - 6);
-                },
-            });
-            stampCaseSurfaces.push(surf);
-        }
-
-        // Left wall: stamp categories / locked slots
-        const categoryLabels = [
-            { id: 'streak', label: 'Streak', icon: '\uD83D\uDD25' },
-            { id: 'completions', label: 'Completions', icon: '\u2714\uFE0F' },
-            { id: 'lane', label: 'Lanes', icon: '\uD83D\uDEE1\uFE0F' },
-            { id: 'decade', label: 'Decades', icon: '\uD83D\uDD70\uFE0F' },
-            { id: 'modifier', label: 'Modifiers', icon: '\u2697\uFE0F' },
-        ];
-        // Count earned per category
-        const catCounts = {};
-        (data.stamps_earned || []).forEach(s => {
-            const prefix = s.id.split('_')[0];
-            catCounts[prefix] = (catCounts[prefix] || 0) + 1;
-        });
-
-        categoryLabels.forEach((cat, i) => {
-            const count = catCounts[cat.id] || 0;
-            const zPos = 3.5 - i * 0.75;
-            const surf = _dsCreateDiegeticSurface(THREE, {
-                scene,
-                position: [-HW / 2 + 0.04, HY + 0.15, zPos],
-                rotation: [0, Math.PI / 2, 0],
-                size: [0.6, 0.5],
-                draw: (ctx, cw, ch) => {
-                    ctx.fillStyle = '#1a1510';
-                    ctx.fillRect(0, 0, cw, ch);
-                    const sd = ctx.getImageData(0, 0, cw, ch);
-                    for (let i2 = 0; i2 < sd.data.length; i2 += 4) {
-                        const n = Math.floor(Math.random() * 8 - 4);
-                        sd.data[i2]   = Math.min(255, Math.max(0, sd.data[i2]   + n));
-                        sd.data[i2+1] = Math.min(255, Math.max(0, sd.data[i2+1] + n));
-                        sd.data[i2+2] = Math.min(255, Math.max(0, sd.data[i2+2] + n));
-                    }
-                    ctx.putImageData(sd, 0, 0);
-
-                    const hasAny = count > 0;
-                    const borderCol = hasAny ? '#6a4a2a' : '#3a3020';
-                    ctx.strokeStyle = borderCol;
-                    ctx.lineWidth = 3;
-                    ctx.strokeRect(3, 3, cw - 6, ch - 6);
-                    ctx.strokeStyle = hasAny ? '#8a6a40' : '#2a2010';
-                    ctx.lineWidth = 1;
-                    ctx.strokeRect(7, 7, cw - 14, ch - 14);
-
-                    if (count > 0) {
-                        ctx.font = '22px serif';
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = '#c4a050';
-                        ctx.fillText(cat.icon, cw / 2, ch / 2 - 8);
-                        ctx.font = 'bold 9px monospace';
-                        ctx.fillStyle = '#8a7a5a';
-                        ctx.fillText(count + ' earned', cw / 2, ch / 2 + 16);
-                    } else {
-                        ctx.font = '18px serif';
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = '#3a3020';
-                        ctx.fillText('\uD83D\uDD12', cw / 2, ch / 2 - 6);
-                    }
-
-                    ctx.font = 'bold 6px monospace';
-                    ctx.fillStyle = count > 0 ? '#c4a050' : '#5a4a30';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'bottom';
-                    ctx.fillText(cat.label, cw / 2, ch - 6);
-                },
-            });
-            stampCaseSurfaces.push(surf);
-        });
-    }
-
-    // ── Fetch passport data ─────────────────────────────────────────────
-    fetch(dsApiUrl('/api/plugins/the_daily/passport'), { headers: { 'X-Install-Id': dsInstallId() } })
-        .then(r => r.text())
-        .then(text => {
-            if (destroyed) return;
-            const data = text ? JSON.parse(text) : null;
-            if (data && !data.error) {
-                state.passportData = data;
-                state.passportLoaded = true;
-                buildStampCases(data);
-                totalsSurface.refresh();
-                gridSurface.refresh();
-            } else {
-                state.passportLoaded = true;
-                totalsSurface.refresh();
-                gridSurface.refresh();
-            }
-        })
-        .catch(() => {
-            if (destroyed) return;
-            state.passportLoaded = true;
-            totalsSurface.refresh();
-            gridSurface.refresh();
-        });
-
-    // Entry wall (behind camera)
-    addPlane(new THREE.PlaneGeometry(HW, HH),
-        new THREE.MeshLambertMaterial({ map: stoneTexture(60, 50, 36, 3, 1) }),
-        0, Math.PI, 0, HY, entryZ);
-
-    // Return door — glowing blue portal on the entry wall
-    const returnDoorMat = new THREE.MeshLambertMaterial({ color: 0x1d4ed8, emissive: 0x0a1840 });
-    const returnDoor = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), returnDoorMat);
-    returnDoor.position.set(0, HY, entryZ - 0.02);
-    scene.add(returnDoor);
-    raycasterObjects.push(returnDoor);
-    returnDoorMap.set(returnDoor, 'hub-return');
-
-    // Door label
-    const doorLabelCanvas = document.createElement('canvas');
-    doorLabelCanvas.width = 128; doorLabelCanvas.height = 48;
-    const dlCtx = doorLabelCanvas.getContext('2d');
-    dlCtx.font = 'bold 13px monospace';
-    dlCtx.fillStyle = '#e8c040';
-    dlCtx.textAlign = 'center';
-    dlCtx.textBaseline = 'middle';
-    dlCtx.fillText('HUB', 64, 24);
-    const dlTex = new THREE.CanvasTexture(doorLabelCanvas);
-    dlTex.minFilter = dlTex.magFilter = THREE.NearestFilter;
-    const dlMat = new THREE.MeshBasicMaterial({ map: dlTex, transparent: true });
-    const dlMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.45), dlMat);
-    dlMesh.position.set(0, HY + 1.5, entryZ - 0.03);
-    scene.add(dlMesh);
-
-    // HTML layers
-    const canvasWrap = document.createElement('div');
-    canvasWrap.style.cssText = 'flex:1;position:relative;overflow:hidden;';
-    overlay.appendChild(canvasWrap);
-    canvasWrap.appendChild(canvas);
-
-    const fadeEl = document.createElement('div');
-    fadeEl.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2;transition:opacity 0.3s;';
-    canvasWrap.appendChild(fadeEl);
-
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'position:absolute;top:36%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    dirLabel.innerHTML = '<div style="font-size:1.3rem;margin-bottom:3px;">\uD83D\uDCCB</div><div>HALL OF RECORDS</div>';
-    canvasWrap.appendChild(dirLabel);
-
-    const escHint = document.createElement('div');
-    escHint.style.cssText = 'position:absolute;bottom:8px;left:8px;z-index:3;color:#444;font-family:monospace;font-size:0.65rem;letter-spacing:.12em;pointer-events:none;';
-    escHint.textContent = 'ESC \u2014 RETURN';
-    canvasWrap.appendChild(escHint);
-
-    const btnFwd = document.createElement('button');
-    btnFwd.innerHTML = '\u25B2';
-    btnFwd.style.cssText = 'position:absolute;bottom:8px;right:8px;width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
-    btnFwd.onclick = () => { if (state.phase === 'idle') returnToHub(); };
-    canvasWrap.appendChild(btnFwd);
-
-    const hudEl = document.createElement('div');
-    hudEl.style.cssText = 'height:44px;background:#060606;border-top:2px solid #181818;display:flex;align-items:center;padding:0 12px;font-family:monospace;font-size:0.75rem;color:#555;flex-shrink:0;';
-    const mod = d.modifier || {};
-    hudEl.innerHTML = `<span style="flex:1;color:#3a78c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(d.day_name || '')}</span><span style="color:#d4a044;">RECORDS</span>`;
-    overlay.appendChild(hudEl);
-
-    const lookTarget    = new THREE.Vector3(0, HY, focalZ);
-    const curLookTarget = new THREE.Vector3(0, HY, focalZ);
-    const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
-    let prevTime = performance.now();
-    let destroyed = false;
-
-    function loop(now) {
-        if (destroyed) return;
-        state.rafId = requestAnimationFrame(loop);
-        const dt = Math.min((now - prevTime) / 1000, 0.1);
-        prevTime = now;
-
-        const flicker = Math.sin(now * 0.0018) * 0.3 + Math.sin(now * 0.0055) * 0.15;
-        lamp1.intensity = 1.6 + flicker;
-        lamp2.intensity = 1.3 + flicker * 0.7;
-        plinthLight.intensity = 0.4 + Math.sin(now * 0.002) * 0.1;
-
-        if (state.phase === 'moving') {
-            state.moveTween = Math.min(state.moveTween + dt / 2.5, 1);
-            const t = easeInOutCubic(state.moveTween);
-            camera.position.z = state.moveStartZ + (entryZ - state.moveStartZ) * t;
-            camera.position.y = HY + Math.sin(t * Math.PI * 4) * 0.022;
-            if (state.moveTween >= 1) {
-                state.phase = 'transitioning';
-                fadeEl.style.opacity = '1';
-                setTimeout(() => {
-                    if (!destroyed) {
-                        destroy();
-                        _dsHallOfRecords = null;
-                        overlay.innerHTML = '';
-                        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-                        _dsHub.start();
-                    }
-                }, 300);
-            }
-        } else if (state.phase === 'idle') {
-            camera.position.y = HY + Math.sin(now * 0.0012) * 0.006;
-        }
-
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * 6));
-        camera.lookAt(curLookTarget);
-        renderer.render(scene, camera);
-    }
-
-    function returnToHub() {
-        if (state.phase !== 'idle') return;
-        state.moveStartZ = camera.position.z;
-        state.phase = 'moving';
-        state.moveTween = 0;
-    }
-
-    const onKey = (e) => {
-        if (state.phase === 'transitioning' || destroyed) return;
-        if (e.key === 'Escape') {
-            returnToHub(); e.preventDefault();
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ' || e.key === 'Enter') {
-            if (state.phase === 'idle') { returnToHub(); e.preventDefault(); }
-        }
-    };
-    window.addEventListener('keydown', onKey);
-    canvas.addEventListener('click', (e) => {
-        if (state.phase !== 'idle') return;
-        const rect = canvas.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        const hits = raycaster.intersectObjects(raycasterObjects);
-        if (hits.length > 0) {
-            for (const hit of hits) {
-                const pid = returnDoorMap.get(hit.object);
-                if (pid) { returnToHub(); return; }
-            }
-        }
-        returnToHub();
-    });
-
-    const disposables = [
-        wallMat, floorMat, ceilMat, focalMat, accentMat,
-        plinthPedestalMat, returnDoorMat, dlMat, dlTex
-    ];
-    function destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        if (state.rafId) { cancelAnimationFrame(state.rafId); state.rafId = null; }
-        window.removeEventListener('keydown', onKey);
-        disposables.forEach(m => { try { m.dispose(); } catch(e) {} });
-        totalsSurface.dispose();
-        gridSurface.dispose();
-        stampCaseSurfaces.forEach(s => s.dispose());
-        stampCaseSurfaces.length = 0;
-        renderer.dispose();
-    }
-
-    function start() {
-        curLookTarget.copy(lookTarget);
-        prevTime = performance.now();
-        state.rafId = requestAnimationFrame(loop);
-    }
-
-    return { start, destroy };
-}
-
-// ── Shop Room (diegetic shop counter behind the Shop Passage) ────────────
-function _dsBuildShopRoom(THREE, overlay, d) {
-    const RENDER_W = 320, RENDER_H = 200;
-    const HW = 7, HH = 3.5, HL = 9, HY = 0.35;
-
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-    const raycasterObjects = [];
-    const returnDoorMap = new Map();
-
-    const state = { phase: 'idle', moveTween: 0, rafId: null, moveStartZ: 0 };
-
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
-
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x0a0804, 7, 12);
-    const camera = new THREE.PerspectiveCamera(70, RENDER_W / RENDER_H, 0.1, 50);
-    camera.position.set(0, HY, 0);
-
-    const ambientLight = new THREE.AmbientLight(0x160d04);
-    scene.add(ambientLight);
-    const shopLight1 = new THREE.PointLight(0xffaa44, 1.4, 8);
-    shopLight1.position.set(-2.0, 1.8, -2.5);
-    scene.add(shopLight1);
-    const shopLight2 = new THREE.PointLight(0xff8822, 1.1, 8);
-    shopLight2.position.set(2.0, 1.8, -2.5);
-    scene.add(shopLight2);
-    const counterLight = new THREE.PointLight(0xffcc88, 1.8, 4);
-    counterLight.position.set(0, 0.8, -(HL/2 - 1.5));
-    scene.add(counterLight);
-
-    function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-
-    const wallMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(70, 58, 46, 3, 1) });
-    const floorMat = new THREE.MeshLambertMaterial({ map: stoneTexture(30, 24, 18, 2, 4) });
-    const ceilMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(22, 18, 14, 2, 4) });
-    const focalMat = new THREE.MeshLambertMaterial({ map: stoneTexture(78, 66, 52, 2, 1) });
-    const counterMat = new THREE.MeshLambertMaterial({ color: 0x2e2010 });
-
-    const addPlane = (geo, mat, rx, ry, px, py, pz) => {
-        const m = new THREE.Mesh(geo, mat);
-        m.rotation.set(rx, ry, 0);
-        m.position.set(px, py, pz);
-        scene.add(m);
-    };
-
-    const focalZ = -(HL / 2 - 1);
-    const entryZ = HL / 2 - 1;
-
-    addPlane(new THREE.PlaneGeometry(HW, HL), floorMat, -Math.PI/2, 0, 0, HY-HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HW, HL), ceilMat,   Math.PI/2, 0, 0, HY+HH/2, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0,  Math.PI/2, -HW/2, HY, 0);
-    addPlane(new THREE.PlaneGeometry(HL, HH), wallMat,   0, -Math.PI/2,  HW/2, HY, 0);
-    addPlane(new THREE.PlaneGeometry(HW, HH), focalMat,  0, 0, 0, HY, focalZ);
-
-    const counter = new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.15, 0.4), counterMat);
-    counter.position.set(0, HY - 0.4, focalZ + 0.5);
-    scene.add(counter);
-
-    // Clerk silhouette — low-poly humanoid behind the counter, no face
-    const clerkSilMat = new THREE.MeshLambertMaterial({ color: 0x0d0a08 });
-    const clerkBaseZ = focalZ + 0.18;
-    const clerkFloorY = HY - HH / 2;
-    const clerkTorso = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.62, 0.18), clerkSilMat);
-    clerkTorso.position.set(0, clerkFloorY + 1.30, clerkBaseZ);
-    scene.add(clerkTorso);
-    const clerkShoulders = new THREE.Mesh(new THREE.BoxGeometry(0.60, 0.12, 0.20), clerkSilMat);
-    clerkShoulders.position.set(0, clerkFloorY + 1.56, clerkBaseZ);
-    scene.add(clerkShoulders);
-    const clerkHead = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.28, 0.18), clerkSilMat);
-    clerkHead.position.set(0, clerkFloorY + 1.77, clerkBaseZ);
-    scene.add(clerkHead);
-    [-0.22, 0.22].forEach(ax => {
-        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.10, 0.36), clerkSilMat);
-        arm.position.set(ax, HY - 0.38, (focalZ + 0.5 + clerkBaseZ) / 2);
-        scene.add(arm);
-    });
-
-    // Shelves along both side walls with generic low-poly items
-    const shelfBoardMat = new THREE.MeshLambertMaterial({ color: 0x2e2010 });
-    const shelfItemMatA = new THREE.MeshLambertMaterial({ color: 0x8a5a2a, emissive: 0x0e0600 });
-    const shelfItemMatB = new THREE.MeshLambertMaterial({ color: 0x4a3a6a, emissive: 0x050010 });
-    const shelfItemMatC = new THREE.MeshLambertMaterial({ color: 0x2a5a3a, emissive: 0x001808 });
-    const shelfYLevels = [clerkFloorY + 1.42, clerkFloorY + 0.94];
-    const shelfZPositions = [2.0, 0.5, -1.0];
-    const shelfItemMats = [shelfItemMatA, shelfItemMatB, shelfItemMatC];
-    [[-HW / 2, 1], [HW / 2, -1]].forEach(([wx, side]) => {
-        shelfYLevels.forEach(sy => {
-            shelfZPositions.forEach(sz => {
-                const board = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.05, 0.90), shelfBoardMat);
-                board.position.set(wx + side * 0.03, sy, sz);
-                scene.add(board);
-                shelfItemMats.forEach((mat, k) => {
-                    const ih = 0.13 + k * 0.04;
-                    const item = new THREE.Mesh(new THREE.BoxGeometry(0.08, ih, 0.08), mat);
-                    item.position.set(wx + side * 0.10, sy + 0.025 + ih / 2, sz - 0.26 + k * 0.26);
-                    scene.add(item);
-                });
-            });
-        });
-    });
-
-    const shopState = { items: [], tokens: 0, loading: true, error: null, buying: false };
-    const BUY_HITS = [];
-
-    function drawShop(ctx, w, h) {
-        ctx.fillStyle = '#1a0a2a';
-        ctx.fillRect(0, 0, w, h);
-        const sd = ctx.getImageData(0, 0, w, h);
-        for (let i = 0; i < sd.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 10 - 5);
-            sd.data[i]   = Math.min(255, Math.max(0, sd.data[i]   + n));
-            sd.data[i+1] = Math.min(255, Math.max(0, sd.data[i+1] + n));
-            sd.data[i+2] = Math.min(255, Math.max(0, sd.data[i+2] + n));
-        }
-        ctx.putImageData(sd, 0, 0);
-
-        ctx.strokeStyle = '#5a3a7a';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(4, 4, w - 8, h - 8);
-        ctx.strokeStyle = '#2a0a4a';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(10, 10, w - 20, h - 20);
-
-        ctx.font = 'bold 9px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillStyle = '#d4a044';
-        ctx.fillText('\u{1F3EA} SHOP', w / 2, 5);
-        ctx.textAlign = 'right';
-        ctx.fillStyle = '#e8c040';
-        ctx.font = 'bold 8px monospace';
-        ctx.fillText('\uD83E\uDE99 ' + shopState.tokens, w - 12, 6);
-
-        ctx.strokeStyle = '#3a2a4a';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(12, 20);
-        ctx.lineTo(w - 12, 20);
-        ctx.stroke();
-
-        if (shopState.buying) {
-            ctx.font = '6px monospace';
-            ctx.fillStyle = '#888';
-            ctx.textAlign = 'center';
-            ctx.fillText('Processing\u2026', w / 2, 12);
-        }
-
-        if (shopState.loading) {
-            ctx.font = '8px monospace';
-            ctx.fillStyle = '#888';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('Loading\u2026', w / 2, h / 2);
-            return;
-        }
-
-        if (shopState.error) {
-            ctx.font = '8px monospace';
-            ctx.fillStyle = '#a44';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(shopState.error, w / 2, h / 2);
-            return;
-        }
-
-        BUY_HITS.length = 0;
-        const headerH = 22;
-        const rowH = 26;
-
-        for (let i = 0; i < shopState.items.length; i++) {
-            const item = shopState.items[i];
-            const y0 = headerH + i * rowH;
-
-            if (i % 2 === 0) {
-                ctx.fillStyle = 'rgba(60, 30, 80, 0.3)';
-                ctx.fillRect(12, y0, w - 24, rowH);
-            }
-
-            ctx.font = 'bold 8px monospace';
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'top';
-            ctx.fillStyle = item.owned ? '#666' : '#ddd';
-            ctx.fillText(item.name.substring(0, 16), 14, y0 + 2);
-
-            ctx.font = '6px monospace';
-            ctx.fillStyle = '#777';
-            ctx.fillText((item.description || item.type || '').substring(0, 20), 14, y0 + 12);
-
-            const cost = item.discounted_cost ?? item.cost;
-            ctx.font = '7px monospace';
-            ctx.textAlign = 'right';
-            ctx.fillStyle = '#e8c040';
-            ctx.fillText('\uD83E\uDE99' + cost, w - 62, y0 + 3);
-
-            if (item.owned) {
-                ctx.fillStyle = item.equipped ? '#2a6a2a' : '#4a4a4a';
-                ctx.fillRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.strokeStyle = item.equipped ? '#4a8a4a' : '#5a5a5a';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.font = 'bold 6px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillStyle = item.equipped ? '#8f8' : '#888';
-                ctx.fillText(item.equipped ? 'EQUIPPED' : 'OWNED', w - 34, y0 + 9);
-            } else if (!item.affordable) {
-                ctx.fillStyle = '#3a2020';
-                ctx.fillRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.strokeStyle = '#5a3030';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.font = 'bold 6px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillStyle = '#844';
-                ctx.fillText('NOT', w - 34, y0 + 4);
-                ctx.fillText('ENOUGH', w - 34, y0 + 13);
-            } else {
-                ctx.fillStyle = '#2a1a4a';
-                ctx.fillRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.strokeStyle = '#6a3a9a';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(w - 56, y0 + 1, 44, rowH - 4);
-                ctx.font = 'bold 7px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillStyle = '#b080e0';
-                ctx.fillText('BUY', w - 34, y0 + 7);
-
-                BUY_HITS.push({
-                    idx: i,
-                    itemId: item.id,
-                    x1: (w - 56) / w,
-                    x2: (w - 56 + 44) / w,
-                    y1: y0 / h,
-                    y2: (y0 + rowH) / h,
-                });
-            }
-        }
-    }
-
-    const shopSurface = _dsCreateDiegeticSurface(THREE, {
-        scene,
-        position: [0, HY + 0.1, focalZ + 0.03],
-        rotation: [0, 0, 0],
-        size: [3.5, 2.5],
-        raycasterObjects,
-        draw: drawShop,
-    });
-
-    function loadShop() {
-        shopState.loading = true;
-        shopState.error = null;
-        shopSurface.refresh();
-        fetch(dsApiUrl('/api/plugins/the_daily/shop'), {
-            headers: { 'X-Install-Id': dsInstallId() }
-        })
-        .then(function(r) { return r.text(); })
-        .then(function(text) {
-            if (destroyed) return;
-            var data = text ? JSON.parse(text) : {};
-            if (data.error) {
-                shopState.error = data.error;
-                shopState.loading = false;
-                shopSurface.refresh();
-                return;
-            }
-            shopState.items = data.items || [];
-            shopState.tokens = data.tokens || 0;
-            shopState.loading = false;
-            shopSurface.refresh();
-        })
-        .catch(function() {
-            if (destroyed) return;
-            shopState.loading = false;
-            shopState.error = 'Network error';
-            shopSurface.refresh();
-        });
-    }
-
-    function handleShopClick(uv) {
-        if (shopState.loading || shopState.buying) return;
-        var cx = uv.x;
-        var cy = uv.y;
-        for (var b = 0; b < BUY_HITS.length; b++) {
-            var hit = BUY_HITS[b];
-            if (cx >= hit.x1 && cx <= hit.x2 && cy >= hit.y1 && cy <= hit.y2) {
-                buyItem(hit.itemId);
-                return;
-            }
-        }
-    }
-
-    function buyItem(itemId) {
-        if (shopState.buying) return;
-        shopState.buying = true;
-        shopSurface.refresh();
-        fetch(dsApiUrl('/api/plugins/the_daily/shop/buy'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() },
-            body: JSON.stringify({ item_id: itemId }),
-        })
-        .then(function(r) { return r.text(); })
-        .then(function(text) {
-            if (destroyed) return;
-            shopState.buying = false;
-            var data = text ? JSON.parse(text) : {};
-            if (data.error) {
-                shopState.error = data.error;
-                shopSurface.refresh();
-                return;
-            }
-            loadShop();
-        })
-        .catch(function() {
-            if (destroyed) return;
-            shopState.buying = false;
-            shopState.error = 'Network error';
-            shopSurface.refresh();
-        });
-    }
-
-    addPlane(new THREE.PlaneGeometry(HW, HH),
-        new THREE.MeshLambertMaterial({ map: stoneTexture(70, 58, 46, 3, 1) }),
-        0, Math.PI, 0, HY, entryZ);
-
-    const returnDoorMat = new THREE.MeshLambertMaterial({ color: 0x1d4ed8, emissive: 0x0a1840 });
-    const returnDoor = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), returnDoorMat);
-    returnDoor.position.set(0, HY, entryZ - 0.02);
-    scene.add(returnDoor);
-    raycasterObjects.push(returnDoor);
-    returnDoorMap.set(returnDoor, 'hub-return');
-
-    const doorLabelCanvas = document.createElement('canvas');
-    doorLabelCanvas.width = 128; doorLabelCanvas.height = 48;
-    const dlCtx = doorLabelCanvas.getContext('2d');
-    dlCtx.font = 'bold 13px monospace';
-    dlCtx.fillStyle = '#e8c040';
-    dlCtx.textAlign = 'center';
-    dlCtx.textBaseline = 'middle';
-    dlCtx.fillText('HUB', 64, 24);
-    const dlTex = new THREE.CanvasTexture(doorLabelCanvas);
-    dlTex.minFilter = dlTex.magFilter = THREE.NearestFilter;
-    const dlMat = new THREE.MeshBasicMaterial({ map: dlTex, transparent: true });
-    const dlMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.45), dlMat);
-    dlMesh.position.set(0, HY + 1.5, entryZ - 0.03);
-    scene.add(dlMesh);
-
-    const canvasWrap = document.createElement('div');
-    canvasWrap.style.cssText = 'flex:1;position:relative;overflow:hidden;';
-    overlay.appendChild(canvasWrap);
-    canvasWrap.appendChild(canvas);
-
-    const fadeEl = document.createElement('div');
-    fadeEl.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:2;transition:opacity 0.3s;';
-    canvasWrap.appendChild(fadeEl);
-
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'position:absolute;top:36%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    dirLabel.innerHTML = '<div style="font-size:1.3rem;margin-bottom:3px;">\u{1F3EA}</div><div>SHOP</div>';
-    canvasWrap.appendChild(dirLabel);
-
-    const escHint = document.createElement('div');
-    escHint.style.cssText = 'position:absolute;bottom:8px;left:8px;z-index:3;color:#444;font-family:monospace;font-size:0.65rem;letter-spacing:.12em;pointer-events:none;';
-    escHint.textContent = 'ESC \u2014 RETURN';
-    canvasWrap.appendChild(escHint);
-
-    const btnFwd = document.createElement('button');
-    btnFwd.innerHTML = '\u25B2';
-    btnFwd.style.cssText = 'position:absolute;bottom:8px;right:8px;width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;z-index:6;';
-    btnFwd.onclick = function() { if (state.phase === 'idle') returnToHub(); };
-    canvasWrap.appendChild(btnFwd);
-
-    const hudEl = document.createElement('div');
-    hudEl.style.cssText = 'height:44px;background:#060606;border-top:2px solid #181818;display:flex;align-items:center;padding:0 12px;font-family:monospace;font-size:0.75rem;color:#555;flex-shrink:0;';
-    const mod = d.modifier || {};
-    hudEl.innerHTML = '<span style="flex:1;color:#3a78c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(d.day_name || '') + '</span><span style="color:#7c3aed;">SHOP</span>';
-    overlay.appendChild(hudEl);
-
-    const lookTarget    = new THREE.Vector3(0, HY, focalZ);
-    const curLookTarget = new THREE.Vector3(0, HY, focalZ);
-    const easeInOutCubic = function(t) { return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2; };
-    var prevTime = performance.now();
-    var destroyed = false;
-
-    function loop(now) {
-        if (destroyed) return;
-        state.rafId = requestAnimationFrame(loop);
-        var dt = Math.min((now - prevTime) / 1000, 0.1);
-        prevTime = now;
-
-        var flicker = Math.sin(now * 0.0018) * 0.3 + Math.sin(now * 0.0055) * 0.15;
-        shopLight1.intensity = 1.3 + flicker;
-        shopLight2.intensity = 1.0 + flicker * 0.7;
-        counterLight.intensity = 0.4 + Math.sin(now * 0.002) * 0.1;
-
-        if (state.phase === 'moving') {
-            state.moveTween = Math.min(state.moveTween + dt / 2.5, 1);
-            var t = easeInOutCubic(state.moveTween);
-            camera.position.z = state.moveStartZ + (entryZ - state.moveStartZ) * t;
-            camera.position.y = HY + Math.sin(t * Math.PI * 4) * 0.022;
-            if (state.moveTween >= 1) {
-                state.phase = 'transitioning';
-                fadeEl.style.opacity = '1';
-                setTimeout(function() {
-                    if (!destroyed) {
-                        destroy();
-                        _dsShopRoom = null;
-                        overlay.innerHTML = '';
-                        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-                        _dsHub.start();
-                    }
-                }, 300);
-            }
-        } else if (state.phase === 'idle') {
-            camera.position.y = HY + Math.sin(now * 0.0012) * 0.006;
-        }
-
-        curLookTarget.lerp(lookTarget, Math.min(1, dt * 6));
-        camera.lookAt(curLookTarget);
-        renderer.render(scene, camera);
-    }
-
-    function returnToHub() {
-        if (state.phase !== 'idle') return;
-        state.moveStartZ = camera.position.z;
-        state.phase = 'moving';
-        state.moveTween = 0;
-    }
-
-    var onKey = function(e) {
-        if (state.phase === 'transitioning' || destroyed) return;
-        if (e.key === 'Escape') {
-            returnToHub(); e.preventDefault();
-        } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ' || e.key === 'Enter') {
-            if (state.phase === 'idle') { returnToHub(); e.preventDefault(); }
-        }
-    };
-    window.addEventListener('keydown', onKey);
-    canvas.addEventListener('click', function(e) {
-        if (state.phase !== 'idle') return;
-        var rect = canvas.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(mouse, camera);
-        var hits = raycaster.intersectObjects(raycasterObjects);
-        if (hits.length > 0) {
-            for (var hi = 0; hi < hits.length; hi++) {
-                var hit = hits[hi];
-                if (hit.object === shopSurface.mesh && hit.uv) {
-                    handleShopClick(hit.uv);
-                    return;
-                }
-                var pid = returnDoorMap.get(hit.object);
-                if (pid) { returnToHub(); return; }
-            }
-        }
-        returnToHub();
-    });
-
-    var disposables = [wallMat, floorMat, ceilMat, focalMat, counterMat, returnDoorMat, dlMat, dlTex];
-    function destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        if (state.rafId) { cancelAnimationFrame(state.rafId); state.rafId = null; }
-        window.removeEventListener('keydown', onKey);
-        for (var di = 0; di < disposables.length; di++) { try { disposables[di].dispose(); } catch(e) {} }
-        shopSurface.dispose();
-        renderer.dispose();
-    }
-
-    function start() {
-        curLookTarget.copy(lookTarget);
-        prevTime = performance.now();
-        state.rafId = requestAnimationFrame(loop);
-    }
-
-    loadShop();
-
-    return { start: start, destroy: destroy };
-}
-
-// Cheap WebGL-capability probe. The dungeon's full-screen takeover hides the
-// rest of Slopsmith, so if the 3D context can't be created we must show a
-// recoverable, pure-DOM error rather than a black screen the user can't escape.
 function _dsWebGLAvailable() {
     try {
         const c = document.createElement('canvas');
@@ -5596,8 +3760,7 @@ function _dsShowDungeonFatal(overlay, title, body) {
     const bail = () => {
         window.removeEventListener('keydown', onKey, true);
         try { dsDungeonExit(); } catch (e) {}
-        try { dsRender(); } catch (e) {}
-        try { dsShow('setlist'); } catch (e) {}
+        try { window.showScreen('home'); } catch (e) {}
     };
     const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); bail(); } };
     btn.onclick = bail;
@@ -5642,20 +3805,12 @@ async function dsDungeonEnter(d) {
     if (_dsHub) { _dsHub.destroy(); _dsHub = null; }
     overlay.innerHTML = '';
     // Init shared audio if not already running. Ambient drone cross-fades
-    // through Hub and dungeon without restart between room transitions.
+    // through the main menu, Hub, and dungeon without restart between rooms.
     if (_dsAudio) _dsAudio.init();
     if (_dsAudio) _dsAudio.setRoomMotif('hub');
-    try {
-        _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
-        _dsHub.start();
-    } catch (e) {
-        console.error('[daily] hub scene failed to build:', e);
-        _dsHub = null;
-        _dsShowDungeonFatal(overlay, 'Dungeon failed to load',
-            'Something went wrong building the 3D scene' +
-            (e && e.message ? ' (' + e.message + ').' : '.') +
-            ' Try reloading Slopsmith.');
-    }
+    // The Quake-1 main menu is the front door; its DESCEND/CONTINUE option
+    // walks the player into the Hub (the 3D lobby).
+    _dsShowMainMenu(overlay, d);
 }
 
 function dsDungeonExit() {
@@ -5669,6 +3824,54 @@ function dsDungeonExit() {
     if (_dsAudio) _dsAudio.stop();
     const overlay = document.getElementById('ds-dungeon-overlay');
     if (overlay) overlay.style.display = 'none';
+}
+
+// Re-enter the dungeon scene after returning from a song. dsPlayMapNode tears
+// the dungeon down (dsDungeonExit) before handing off to playSong, so on return
+// we rebuild it directly — landing the player back in the room they just cleared
+// (the dungeon's start() reads the saved node + _dsRoomJustCleared to play the
+// unseal beat). This re-enters the *dungeon*, not the Hub.
+async function dsResumeDungeon() {
+    if (!_dsTHREE) { await dsDungeonEnter(_dsData); return; }
+    let overlay = document.getElementById('ds-dungeon-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'ds-dungeon-overlay';
+        document.body.appendChild(overlay);
+    }
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;';
+    overlay.style.display = 'flex';
+    if (_dsAudio) _dsAudio.init();
+    _dsStartRun(overlay, _dsData);
+}
+
+// On daily completion: enter the Hub and play the boss celebration in place.
+// The Wall of Fame is now an in-hub station, so the player signs by walking to
+// the WoF tablet — no separate signing room.
+async function dsEnterWof(d, opts) {
+    let overlay = document.getElementById('ds-dungeon-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'ds-dungeon-overlay';
+        document.body.appendChild(overlay);
+    }
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;';
+    overlay.style.display = 'flex';
+    if (!_dsTHREE) {
+        overlay.innerHTML = '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:#60a5fa;font-family:monospace;font-size:1.1rem;letter-spacing:.2em;">LOADING...</div>';
+        try { _dsTHREE = await import('https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.min.js'); }
+        catch (e) { await dsDungeonEnter(d); return; }
+    }
+    if (!_dsWebGLAvailable()) { await dsDungeonEnter(d); return; }
+    if (_dsDungeon) { _dsDungeon.destroy(); _dsDungeon = null; }
+    if (_dsHub) { _dsHub.destroy(); _dsHub = null; }
+    overlay.innerHTML = '';
+    if (_dsAudio) { _dsAudio.init(); _dsAudio.setRoomMotif('hub'); }
+    _dsHub = _dsBuildHub(_dsTHREE, overlay, d);
+    _dsHub.start();
+    if (opts && opts.celebrate && typeof _dsHub.triggerBossCelebration === 'function') {
+        _dsHub.triggerBossCelebration(opts.streak || 0);
+    }
 }
 
 function dsSetPassageSealed(passageId, sealed) {
@@ -5711,11 +3914,7 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
     const RENDER_W = 320, RENDER_H = 200;
     const HW = 6, HH = 3.5, HL = 8, HY = 0.35;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
+    const { renderer, canvas } = _dsRenderTarget(THREE, RENDER_W, RENDER_H);
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x000000, 8, 14);
@@ -5732,27 +3931,7 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
     scene.add(torch2);
 
     function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
+        return _dsStoneBasic(THREE, r, g, b, ru, rv, 0);
     }
 
     const wallTex = stoneTexture(45, 38, 30, 2, 2);
@@ -5763,6 +3942,9 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
     const floorMat = new THREE.MeshLambertMaterial({ map: floorTex });
     const ceilMat = new THREE.MeshLambertMaterial({ map: ceilTex });
     const darkMat = new THREE.MeshLambertMaterial({ map: darkTex });
+    _dsApplyRealTex(THREE, wallMat,  'wall_brick.png',    3, 3, 0x6c645a);
+    _dsApplyRealTex(THREE, floorMat, 'floor_granite.png', 4, 3, 0x5a564f);
+    _dsApplyRealTex(THREE, ceilMat,  'floor_plate.png',   4, 3, 0x3a3732);
 
     scene.add(Object.assign(new THREE.Mesh(new THREE.PlaneGeometry(HW, HL), floorMat), { rotation: { x: -Math.PI / 2 }, position: new THREE.Vector3(0, 0, -HL / 2) }));
     scene.add(Object.assign(new THREE.Mesh(new THREE.PlaneGeometry(HW, HL), ceilMat), { rotation: { x: Math.PI / 2 }, position: new THREE.Vector3(0, HH, -HL / 2) }));
@@ -5896,6 +4078,7 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
     }
 
     function showExitConfirm() {
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         _dsRenderMenu(overlay, {
             title: 'LEAVE THE DAILY?',
             subtitle: 'Exit to the Slopsmith homepage.',
@@ -5950,8 +4133,9 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
         if (destroyed) return;
         state.rafId = requestAnimationFrame(loop);
         torchT += 0.016;
-        torch1.intensity = 1.8 + Math.sin(torchT * 2.7) * 0.3;
-        torch2.intensity = 1.5 + Math.sin(torchT * 3.1 + 1.2) * 0.25;
+        // Quake 10 Hz lightstyle flicker (torchT is seconds → ×1000 for ms).
+        torch1.intensity = 1.8 * (0.72 + _dsSampleLightstyle('fire', torchT * 1000, 0) * 0.32);
+        torch2.intensity = 1.5 * (0.72 + _dsSampleLightstyle('fire', torchT * 1000, 5.5) * 0.30);
         if (errorType === 'offline') {
             retryGlow.intensity = retryHovered
                 ? (1.2 + Math.sin(torchT * 4) * 0.3)
@@ -5975,6 +4159,8 @@ function _dsBuildErrorScene(THREE, overlay, errorType, minVersion) {
         if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
     }
 
+    _dsTextureAllSurfaces(THREE, scene, disposables);
+
     return { start, destroy };
 }
 
@@ -5993,24 +4179,28 @@ function _dsBuildDungeon(THREE, container, d) {
     const state = {
         nodeId: localStorage.getItem('ds_dun_node_' + d.date) || map.start,
         faceIdx: 0,
-        phase: 'idle', // idle | moving | encounter
+        phase: 'idle', // idle | moving | facing | encounter
         moveTween: 0,
         nextId: null,
         rafId: null,
     };
 
     // ── Three.js setup ────────────────────────────────────────────────────────
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(RENDER_W, RENDER_H, false);
-    renderer.setClearColor(0x000000);
-    const canvas = renderer.domElement;
-    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges;';
+    const { renderer, canvas } = _dsRenderTarget(THREE, RENDER_W, RENDER_H);
 
     const scene = new THREE.Scene();
     // Everything except the camera lives under this scaled group (see WS above).
     const world = new THREE.Group();
     world.scale.setScalar(WS);
     scene.add(world);
+    // The persistent floorplan geometry (floor/ceil/walls/rubble, ADR 0012) lives
+    // directly under `world`. The transient *current-room dressing* — signature
+    // prop, torches, doorGlow, the interact prompt — lives under `roomGroup`,
+    // which is repositioned to whichever room the player currently occupies. The
+    // prop/torch builders author their coords in a room-local frame; moving the
+    // group is what places that dressing at the occupied room's center.
+    const roomGroup = new THREE.Group();
+    world.add(roomGroup);
     scene.fog = new THREE.Fog(0x000000, 9 * WS, 14 * WS);
     // Quake default fov is 90 *horizontal*; three.js wants vertical fov. CalcFov
     // (gl_screen.js): fov_y = atan(h / (w / tan(fov_x/2))) → 64° at 320×200.
@@ -6026,399 +4216,146 @@ function _dsBuildDungeon(THREE, container, d) {
     // once distance is scaled by WS. (r155+ PointLight defaults to decay 2.)
     const torch1 = new THREE.PointLight(0xff6622, 2.2, 10 * WS, 0);
     torch1.position.set(-1.6, 1.0, -2);
-    world.add(torch1);
+    roomGroup.add(torch1);
     const torch2 = new THREE.PointLight(0xff6622, 1.8, 10 * WS, 0);
     torch2.position.set(1.6, 1.0, -5);
-    world.add(torch2);
+    roomGroup.add(torch2);
     const doorGlow = new THREE.PointLight(0x1d4ed8, 2, 6 * WS, 0);
     doorGlow.position.set(0, 0.3, -8);
-    world.add(doorGlow);
+    roomGroup.add(doorGlow);
+    // Player-following light (ADR 0012): the per-room torches light the rooms, but
+    // the contiguous corridors / antechamber between them would be pitch black with
+    // only room-local lights. A soft warm lamp tracks the camera so the player can
+    // always see the passage they're walking. Kept dim so room torches still pop.
+    const playerLight = new THREE.PointLight(0xffce96, 1.7, 8.5 * WS, 0);
+    world.add(playerLight);
+
+    // ── Visible torch fire ────────────────────────────────────────────────────
+    // The corridor torches were bare floating PointLights — pools of light with
+    // no source. Give each a free-standing iron torch stand with an animated
+    // flame and rising embers (Quake's flames are a visible particle fire, never
+    // an invisible light). Parented to the light so it follows wherever a theme
+    // repositions the torch; `flamesVisible` hides them in rooms that have their
+    // own fire dressing (boss perimeter stands, rest campfire, mystery glow).
+    const _WHITE = new THREE.Color(0xffffff);
+    const flameDisposables = [];   // shared geometries + per-flame materials
+    const _poleGeo = new THREE.CylinderGeometry(0.035, 0.05, 2.0, 6);
+    const _bowlGeo = new THREE.CylinderGeometry(0.13, 0.08, 0.14, 8);
+    const _coreGeo = new THREE.ConeGeometry(0.1, 0.34, 5);
+    const _tipGeo  = new THREE.ConeGeometry(0.05, 0.2, 4);
+    const _poleMat = new THREE.MeshLambertMaterial({ color: 0x18130f });
+    const _bowlMat = new THREE.MeshLambertMaterial({ color: 0x2a1a10, emissive: 0x160a04 });
+    [_poleGeo, _bowlGeo, _coreGeo, _tipGeo, _poleMat, _bowlMat].forEach(x => flameDisposables.push(x));
+    function makeTorchFlame() {
+        const g = new THREE.Group();
+        // Light sits at world y = 1.0; floor is CY - CH/2 below it.
+        const floorLocalY = (CY - CH / 2) - 1.0;
+        const pole = new THREE.Mesh(_poleGeo, _poleMat);
+        pole.position.y = floorLocalY + 1.0;   // centre of the 2.0-tall pole
+        g.add(pole);
+        const bowl = new THREE.Mesh(_bowlGeo, _bowlMat);
+        bowl.position.y = -0.16;
+        g.add(bowl);
+        const coreMat = new THREE.MeshBasicMaterial({ color: 0xffaa33, transparent: true, opacity: 0.92, fog: false, depthWrite: false });
+        const tipMat  = new THREE.MeshBasicMaterial({ color: 0xffee99, transparent: true, opacity: 0.95, fog: false, depthWrite: false });
+        flameDisposables.push(coreMat, tipMat);
+        const core = new THREE.Mesh(_coreGeo, coreMat); core.position.y = 0.02; g.add(core);
+        const tip  = new THREE.Mesh(_tipGeo, tipMat);   tip.position.y = 0.16;  g.add(tip);
+        // Rising embers — a few additive specks that drift up and recycle.
+        const n = 9, ep = new Float32Array(n * 3), ev = [];
+        for (let i = 0; i < n; i++) {
+            ep[i*3] = (Math.random() - 0.5) * 0.14;
+            ep[i*3+1] = Math.random() * 0.8;
+            ep[i*3+2] = (Math.random() - 0.5) * 0.14;
+            ev.push(0.4 + Math.random() * 0.5);
+        }
+        const eg = new THREE.BufferGeometry();
+        eg.setAttribute('position', new THREE.BufferAttribute(ep, 3));
+        const em = new THREE.PointsMaterial({ color: 0xff7a22, size: 2.2, transparent: true, opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+        flameDisposables.push(eg, em);
+        const embers = new THREE.Points(eg, em);
+        g.add(embers);
+        g._core = core; g._tip = tip; g._embers = embers; g._emberVel = ev;
+        return g;
+    }
+    // (instantiated below, once the corridor constants CY/CH it reads exist)
 
     // ── Procedural stone texture ──────────────────────────────────────────────
     function stoneTexture(r, g, b, ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = r + Math.floor(Math.random() * 18 - 9);
-                ctx.fillStyle = `rgb(${Math.max(0,v)},${Math.max(0,v-3)},${Math.max(0,v-5)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
+        return _dsStoneBasic(THREE, r, g, b, ru, rv);
     }
 
     const wallMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(38, 32, 28, 3, 1) });
-    const floorMat = new THREE.MeshLambertMaterial({ map: stoneTexture(25, 22, 18, 2, 4) });
-    const ceilMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(18, 16, 14, 2, 4) });
+    const floorMat = new THREE.MeshLambertMaterial({ color: 0x5a564f, map: stoneTexture(25, 22, 18, 2, 4) });
+    const ceilMat  = new THREE.MeshLambertMaterial({ color: 0x3a3732, map: stoneTexture(18, 16, 14, 2, 4) });
     const backMat  = new THREE.MeshLambertMaterial({ map: stoneTexture(22, 18, 15, 2, 1) });
+    _dsApplyRealTex(THREE, wallMat,  'wall_stone.png',    4, 2, 0x6c655c);
+    _dsApplyRealTex(THREE, backMat,  'wall_castle.png',   3, 2, 0x6c645a);
+    // floor_granite + floor_plate are applied in buildFloorplan once the spanning
+    // plane's size is known, so the tile density is right. Per-room mood then comes
+    // from setRoomMats() tinting these shared materials (null tint = leave .color).
 
     // ── Corridor geometry ─────────────────────────────────────────────────────
     // Wider corridor (CW=8) so multiple fanned doors at the back wall are visible
     // and turning to face them produces meaningful angle changes.
     const CW = 8, CH = 3, CL = 10, CY = 0.3;
     const EYE = CY * WS;   // camera eye height in world (Quake) units
-    const addPlane = (geo, mat, rx, ry, px, py, pz) => {
-        const m = new THREE.Mesh(geo, mat);
-        m.rotation.set(rx, ry, 0);
-        m.position.set(px, py, pz);
-        world.add(m);
-        return m;
-    };
-    const roomMeshes = {};
-    roomMeshes.floor = addPlane(new THREE.PlaneGeometry(CW, CL), floorMat, -Math.PI/2,  0,       0,      CY-CH/2, -CL/2+1);
-    roomMeshes.ceil  = addPlane(new THREE.PlaneGeometry(CW, CL), ceilMat,   Math.PI/2,  0,       0,      CY+CH/2, -CL/2+1);
-    roomMeshes.wallL = addPlane(new THREE.PlaneGeometry(CL, CH), wallMat,   0,  Math.PI/2,  -CW/2,  CY,      -CL/2+1);
-    roomMeshes.wallR = addPlane(new THREE.PlaneGeometry(CL, CH), wallMat,   0, -Math.PI/2,   CW/2,  CY,      -CL/2+1);
-    roomMeshes.back  = addPlane(new THREE.PlaneGeometry(CW, CH), backMat,   0,  Math.PI,     0,      CY,       1.5);
+    const FLOOR_Y = CY - CH / 2, CEIL_Y = CY + CH / 2;
+    // Now that CY/CH exist, build the standing torch fires (see makeTorchFlame).
+    const flame1 = makeTorchFlame(); torch1.add(flame1);
+    const flame2 = makeTorchFlame(); torch2.add(flame2);
+    const torchFlames = [flame1, flame2];
+    let flamesVisible = true;   // set per-theme in applyRoomTheme
 
-    // Front wall (dark recess; doors are placed against it)
-    roomMeshes.frontWall = addPlane(new THREE.PlaneGeometry(CW, CH),
-        new THREE.MeshLambertMaterial({ color: 0x040404 }),
-        0, 0, 0, CY, -(CL - 0.4));
+    // ── Contiguous floorplan layout constants (ADR 0012) ──────────────────────
+    // World-local units (the world group scales everything × WS). Rooms are deep
+    // so the signature props — authored extending toward −Z (e.g. treasure plinth
+    // at z≈−6.5) — sit near each room's far wall; the player walks forward through
+    // the room to reach the prop and the exits beyond it. Spacing keeps adjacent
+    // rows from overlapping. The vertical frame (FLOOR_Y/CEIL_Y/EYE) matches the
+    // prop builders so dressing sits on the floor without per-prop adjustment.
+    const CELL_X = 12, CELL_Z = 22;     // room-center spacing (lateral, forward)
+    const ROOM_HW = 4.5, ROOM_HD = 7.5; // standard room half-extents
+    const BOSS_HW = 7.0, BOSS_HD = 9.0; // the boss hall is larger
+    const COR_HW = 2.0;                 // corridor half-width
+    const TILE = 1.0;                   // occupancy tile size (world-local)
+    const PLAYER_R = 1.1;               // collision radius (world-local)
 
-    // Doors are rebuilt per-room by rebuildDoors(edges).
+    const roomMeshes = {};   // { floor, ceil } big spanning planes (built in buildFloorplan)
     const doorFrameMat = new THREE.MeshLambertMaterial({ color: 0x080808 });
-    const doorState = []; // [{ frame, fill, fillM, edge, target, x, z }]
+    // Floorplan state (populated by buildFloorplan):
+    const rooms = {};        // id -> { node, x, z, hw, hd, anchor:{x,z} }
+    const corridors = [];    // { aId, bId, ax,bx, aFar,bNear,midZ, mouthX,mouthZ, open, gate }
+    let antechamber = null;  // { x0,x1,z0,z1 } spawn box behind the entrance rooms
+    let wallMesh = null;     // merged wall BufferGeometry mesh (rebuilt on section open)
+    let occ = null;          // { x0, z0, nx, nz, cells:Uint8Array }
+    const rubbleGates = [];  // { corridor, group } live rubble piles (for disposal)
+    const explosions = [];   // active debris/spark bursts being animated
+    let camShake = 0;        // decaying rotational camera-kick from nearby detonations
+    const _floorplanDisposables = []; // geometries/materials/textures to free on destroy
 
     // ── Room theming (per-node-type visual dressing) ──────────────────────────
-    const FORCED_TEX = {
-        wall:  stoneTexture(55, 42, 35, 3, 1),
-        floor: stoneTexture(38, 30, 24, 2, 4),
-        ceil:  stoneTexture(28, 22, 18, 2, 4),
-        back:  stoneTexture(34, 26, 20, 2, 1),
+    // Contiguous floorplan (ADR 0012): walls are one shared merged mesh, so per-
+    // room wall texture swapping is gone — room mood is carried by lighting + prop.
+    // Floor/ceil are a single shared real-textured plane (granite/plate); per-room
+    // mood rides on tinting those shared materials rather than swapping in a
+    // per-theme procedural material, so every room keeps a real texture and fog
+    // bounds the view so it reads as that room's ground. (Replaced the old
+    // themeMats/*StoneTexture procedural-material builders.)
+    const ROOM_FLOOR_TINT = {
+        default: 0x6a635a, forced: 0x6a5848, elite: 0x6e3a34, boss: 0x5a302c,
+        treasure: 0x72603a, rest: 0x5e5a40, mystery: 0x4a3e64, shop: 0x726048,
     };
-    const forcedWallMat  = new THREE.MeshLambertMaterial({ map: FORCED_TEX.wall });
-    const forcedFloorMat = new THREE.MeshLambertMaterial({ map: FORCED_TEX.floor });
-    const forcedCeilMat  = new THREE.MeshLambertMaterial({ map: FORCED_TEX.ceil });
-    const forcedBackMat  = new THREE.MeshLambertMaterial({ map: FORCED_TEX.back });
-
-    // Elite room textures — dark stone with red tint and rust streaks
-    function eliteStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(28,10,10)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 12);
-                ctx.fillStyle = `rgb(${28+v},${8+Math.floor(v/3)},${8+Math.floor(v/4)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        // rust/blood streak accents
-        for (let s = 0; s < 5; s++) {
-            const sx = Math.floor(Math.random() * sz);
-            const sy = Math.floor(Math.random() * sz);
-            const sh = Math.floor(Math.random() * 14 + 4);
-            ctx.fillStyle = `rgba(${120+Math.floor(Math.random()*60)},${18+Math.floor(Math.random()*16)},${8+Math.floor(Math.random()*8)},0.65)`;
-            ctx.fillRect(sx, sy, 2, sh);
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
+    const ROOM_CEIL_TINT = {
+        default: 0x46423c, forced: 0x4a3e30, elite: 0x4a2824, boss: 0x3c201e,
+        treasure: 0x4c4026, rest: 0x403c2c, mystery: 0x322a44, shop: 0x4a4032,
+    };
+    function setRoomMats(type) {
+        const ft = ROOM_FLOOR_TINT[type] != null ? ROOM_FLOOR_TINT[type] : ROOM_FLOOR_TINT.default;
+        const ct = ROOM_CEIL_TINT[type]  != null ? ROOM_CEIL_TINT[type]  : ROOM_CEIL_TINT.default;
+        floorMat.color.setHex(ft);
+        ceilMat.color.setHex(ct);
     }
-    const ELITE_TEX = {
-        wall:  eliteStoneTexture(3, 1),
-        floor: eliteStoneTexture(2, 4),
-        ceil:  eliteStoneTexture(2, 4),
-        back:  eliteStoneTexture(2, 1),
-    };
-    const eliteWallMat  = new THREE.MeshLambertMaterial({ map: ELITE_TEX.wall });
-    const eliteFloorMat = new THREE.MeshLambertMaterial({ map: ELITE_TEX.floor });
-    const eliteCeilMat  = new THREE.MeshLambertMaterial({ map: ELITE_TEX.ceil });
-    const eliteBackMat  = new THREE.MeshLambertMaterial({ map: ELITE_TEX.back });
-
-    // Boss room textures — deep charcoal stone with faint crimson veins
-    function bossStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(18,8,8)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 10);
-                ctx.fillStyle = `rgb(${18+v},${6+Math.floor(v/4)},${6+Math.floor(v/4)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        // crimson vein accents
-        for (let s = 0; s < 4; s++) {
-            const sx = Math.floor(Math.random() * sz);
-            const sy = Math.floor(Math.random() * sz);
-            const sh = Math.floor(Math.random() * 18 + 6);
-            ctx.fillStyle = `rgba(${100+Math.floor(Math.random()*40)},${10+Math.floor(Math.random()*8)},${10+Math.floor(Math.random()*8)},0.5)`;
-            ctx.fillRect(sx, sy, 1, sh);
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 6 - 3);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-    const BOSS_TEX = {
-        wall:  bossStoneTexture(4, 1.5),
-        floor: bossStoneTexture(3, 5),
-        ceil:  bossStoneTexture(3, 5),
-        back:  bossStoneTexture(3, 1.5),
-    };
-    const bossWallMat  = new THREE.MeshLambertMaterial({ map: BOSS_TEX.wall });
-    const bossFloorMat = new THREE.MeshLambertMaterial({ map: BOSS_TEX.floor });
-    const bossCeilMat  = new THREE.MeshLambertMaterial({ map: BOSS_TEX.ceil });
-    const bossBackMat  = new THREE.MeshLambertMaterial({ map: BOSS_TEX.back });
-
-    // Treasure room textures — warm stone with gold/amber veins
-    function treasureStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(58,44,24)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 18);
-                ctx.fillStyle = `rgb(${58+v},${42+Math.floor(v/2)},${22+Math.floor(v/3)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        // gold/amber vein streaks
-        for (let s = 0; s < 6; s++) {
-            const sy = Math.floor(Math.random() * sz);
-            const sw = Math.floor(Math.random() * 18 + 6);
-            ctx.fillStyle = `rgba(${160+Math.floor(Math.random()*60)},${90+Math.floor(Math.random()*40)},${10+Math.floor(Math.random()*20)},0.7)`;
-            ctx.fillRect(Math.floor(Math.random() * sz), sy, sw, 2);
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-    const TREASURE_TEX = {
-        wall:  treasureStoneTexture(3, 1),
-        floor: treasureStoneTexture(2, 4),
-        ceil:  treasureStoneTexture(2, 4),
-        back:  treasureStoneTexture(2, 1),
-    };
-    const treasureWallMat  = new THREE.MeshLambertMaterial({ map: TREASURE_TEX.wall });
-    const treasureFloorMat = new THREE.MeshLambertMaterial({ map: TREASURE_TEX.floor });
-    const treasureCeilMat  = new THREE.MeshLambertMaterial({ map: TREASURE_TEX.ceil });
-    const treasureBackMat  = new THREE.MeshLambertMaterial({ map: TREASURE_TEX.back });
-
-    // Rest room textures — mossy, earthy, warm and weathered
-    function restStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(40,38,28)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 16);
-                const isMoss = Math.random() < 0.18;
-                if (isMoss) {
-                    ctx.fillStyle = `rgb(${32+Math.floor(v/2)},${44+v},${18+Math.floor(v/3)})`;
-                } else {
-                    ctx.fillStyle = `rgb(${40+v},${36+Math.floor(v*0.8)},${24+Math.floor(v/2)})`;
-                }
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        for (let s = 0; s < 4; s++) {
-            const sx = Math.floor(Math.random() * sz);
-            const sy = Math.floor(Math.random() * sz);
-            ctx.fillStyle = 'rgba(50,60,30,0.5)';
-            ctx.fillRect(sx, sy, 2, Math.floor(Math.random() * 12 + 4));
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-    const REST_TEX = {
-        wall:  restStoneTexture(3, 1),
-        floor: restStoneTexture(2, 4),
-        ceil:  restStoneTexture(2, 4),
-        back:  restStoneTexture(2, 1),
-    };
-    const restWallMat  = new THREE.MeshLambertMaterial({ map: REST_TEX.wall });
-    const restFloorMat = new THREE.MeshLambertMaterial({ map: REST_TEX.floor });
-    const restCeilMat  = new THREE.MeshLambertMaterial({ map: REST_TEX.ceil });
-    const restBackMat  = new THREE.MeshLambertMaterial({ map: REST_TEX.back });
-
-    // Mystery room textures — cooler stone with purple tint and arcane sigil trim
-    function mysteryStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(18,12,28)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 12);
-                ctx.fillStyle = `rgb(${16+v},${10+Math.floor(v/2)},${26+v})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        // Arcane sigil marks — cross-rune shapes in faint violet
-        for (let s = 0; s < 3; s++) {
-            const sx = Math.floor(Math.random() * (sz - 14)) + 7;
-            const sy = Math.floor(Math.random() * (sz - 14)) + 7;
-            const alpha = 0.45 + Math.random() * 0.3;
-            ctx.fillStyle = `rgba(${90+Math.floor(Math.random()*40)},${30+Math.floor(Math.random()*20)},${170+Math.floor(Math.random()*40)},${alpha})`;
-            ctx.fillRect(sx - 3, sy, 6, 2);
-            ctx.fillRect(sx, sy - 3, 2, 6);
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-    const MYSTERY_TEX = {
-        wall:  mysteryStoneTexture(3, 1),
-        floor: mysteryStoneTexture(2, 4),
-        ceil:  mysteryStoneTexture(2, 4),
-        back:  mysteryStoneTexture(2, 1),
-    };
-    const mysteryWallMat  = new THREE.MeshLambertMaterial({ map: MYSTERY_TEX.wall });
-    const mysteryFloorMat = new THREE.MeshLambertMaterial({ map: MYSTERY_TEX.floor });
-    const mysteryCeilMat  = new THREE.MeshLambertMaterial({ map: MYSTERY_TEX.ceil });
-    const mysteryBackMat  = new THREE.MeshLambertMaterial({ map: MYSTERY_TEX.back });
-
-    // Shop room textures — lighter warm stone with faint terracotta banner trim
-    function shopStoneTexture(ru, rv) {
-        const sz = 64;
-        const tc = document.createElement('canvas');
-        tc.width = tc.height = sz;
-        const ctx = tc.getContext('2d');
-        ctx.fillStyle = 'rgb(68,56,44)';
-        ctx.fillRect(0, 0, sz, sz);
-        const bw = 16, bh = 8;
-        for (let y = 0; y < sz; y += bh) {
-            const shift = (Math.floor(y / bh) % 2) * (bw / 2);
-            for (let xb = 0; xb <= sz + bw; xb += bw) {
-                const x = (xb + shift) % sz;
-                const v = Math.floor(Math.random() * 22);
-                ctx.fillStyle = `rgb(${66+v},${52+Math.floor(v*2/3)},${38+Math.floor(v/2)})`;
-                ctx.fillRect(x, y, bw - 2, bh - 2);
-            }
-        }
-        // terracotta awning-trim streaks
-        for (let s = 0; s < 4; s++) {
-            const sy2 = Math.floor(Math.random() * sz);
-            const sw = Math.floor(Math.random() * 14 + 5);
-            ctx.fillStyle = `rgba(${150+Math.floor(Math.random()*50)},${65+Math.floor(Math.random()*30)},${28+Math.floor(Math.random()*20)},0.55)`;
-            ctx.fillRect(Math.floor(Math.random() * sz), sy2, sw, 2);
-        }
-        const id = ctx.getImageData(0, 0, sz, sz);
-        for (let i = 0; i < id.data.length; i += 4) {
-            const n = Math.floor(Math.random() * 8 - 4);
-            id.data[i]   = Math.min(255, Math.max(0, id.data[i]   + n));
-            id.data[i+1] = Math.min(255, Math.max(0, id.data[i+1] + n));
-            id.data[i+2] = Math.min(255, Math.max(0, id.data[i+2] + n));
-        }
-        ctx.putImageData(id, 0, 0);
-        const t = new THREE.CanvasTexture(tc);
-        t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(ru, rv);
-        t.minFilter = t.magFilter = THREE.NearestFilter;
-        return t;
-    }
-    const SHOP_TEX = {
-        wall:  shopStoneTexture(3, 1),
-        floor: shopStoneTexture(2, 4),
-        ceil:  shopStoneTexture(2, 4),
-        back:  shopStoneTexture(2, 1),
-    };
-    const shopWallMat  = new THREE.MeshLambertMaterial({ map: SHOP_TEX.wall });
-    const shopFloorMat = new THREE.MeshLambertMaterial({ map: SHOP_TEX.floor });
-    const shopCeilMat  = new THREE.MeshLambertMaterial({ map: SHOP_TEX.ceil });
-    const shopBackMat  = new THREE.MeshLambertMaterial({ map: SHOP_TEX.back });
 
     // Boss room scale factors (throne hall is wider and taller than standard corridor)
     const BW = 12, BH = 4.5;
@@ -6430,17 +4367,16 @@ function _dsBuildDungeon(THREE, container, d) {
         new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
         new THREE.PointLight(0xff4411, 0, 7 * WS, 0),
     ];
-    bossPerimTorches.forEach(l => world.add(l));
+    bossPerimTorches.forEach(l => roomGroup.add(l));
     // Expose for slice 007 boss-clear celebration
     window._dsDungeonBossTorches = bossPerimTorches;
 
-    const DEFAULT_MATS = [roomMeshes.wallL.material, roomMeshes.wallR.material, roomMeshes.floor.material, roomMeshes.ceil.material, roomMeshes.back.material];
     let roomProp = null;
     let campfireLight = null;
 
     function clearRoomProp() {
-        if (roomProp) { world.remove(roomProp); disposeMeshGroup(roomProp); roomProp = null; }
-        if (campfireLight) { world.remove(campfireLight); campfireLight = null; }
+        if (roomProp) { roomGroup.remove(roomProp); disposeMeshGroup(roomProp); roomProp = null; }
+        if (campfireLight) { roomGroup.remove(campfireLight); campfireLight = null; }
     }
 
     function disposeMeshGroup(obj) {
@@ -6451,23 +4387,135 @@ function _dsBuildDungeon(THREE, container, d) {
 
     function buildForcedProp() {
         const g = new THREE.Group();
-        const pedMat = new THREE.MeshLambertMaterial({ color: 0x5a4a3a });
-        const ped = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.35, 0.5), pedMat);
-        ped.position.set(1.5, 0.175, -2.0);
-        g.add(ped);
-        const sleeveMat = new THREE.MeshLambertMaterial({ color: 0x7a5a3a });
-        const sleeve = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.02), sleeveMat);
-        sleeve.position.set(1.5, 0.48, -2.15);
-        sleeve.rotation.y = 0.15;
-        g.add(sleeve);
-        const recMat = new THREE.MeshLambertMaterial({ color: 0x080808 });
-        const rec = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.02, 16), recMat);
-        rec.position.set(1.5, 0.36, -2.0);
-        g.add(rec);
-        const lblMat = new THREE.MeshLambertMaterial({ color: 0xcc3333 });
-        const lbl = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.021, 8), lblMat);
-        lbl.position.set(1.5, 0.371, -2.0);
-        g.add(lbl);
+        const floorY = CY - CH / 2;
+
+        // Materials — black tolex cab/head, brass piping, gold control panel.
+        const cabMat    = new THREE.MeshLambertMaterial({ color: 0x141414 });
+        const grilleMat = new THREE.MeshLambertMaterial({ color: 0x0a0a0a });
+        const coneMat   = new THREE.MeshLambertMaterial({ color: 0x1c1c1c });
+        const pipingMat = new THREE.MeshLambertMaterial({ color: 0xb8a060 });
+        const goldMat   = new THREE.MeshLambertMaterial({ color: 0xc8a020, emissive: 0x2a2000 });
+        const knobMat   = new THREE.MeshLambertMaterial({ color: 0x202020 });
+        const logoMat   = new THREE.MeshLambertMaterial({ color: 0xe8e0d0, emissive: 0x201c14 });
+        const ledMat    = new THREE.MeshLambertMaterial({ color: 0xff3020, emissive: 0xaa1000 });
+
+        const xC = 0, zC = -2.6;
+
+        // ── 4×12 speaker cabinet ──
+        const cabW = 0.70, cabH = 0.78, cabD = 0.42;
+        const cab = new THREE.Mesh(new THREE.BoxGeometry(cabW, cabH, cabD), cabMat);
+        cab.position.set(xC, floorY + cabH / 2, zC);
+        g.add(cab);
+        const cabFront = zC + cabD / 2;
+
+        // Brass/white piping rails around the cab front edge
+        [floorY + 0.02, floorY + cabH - 0.02].forEach(py => {
+            const rail = new THREE.Mesh(new THREE.BoxGeometry(cabW, 0.025, 0.04), pipingMat);
+            rail.position.set(xC, py, cabFront);
+            g.add(rail);
+        });
+        [-cabW / 2 + 0.02, cabW / 2 - 0.02].forEach(px => {
+            const rail = new THREE.Mesh(new THREE.BoxGeometry(0.025, cabH, 0.04), pipingMat);
+            rail.position.set(xC + px, floorY + cabH / 2, cabFront);
+            g.add(rail);
+        });
+
+        // Grille cloth (inset dark panel)
+        const grille = new THREE.Mesh(new THREE.BoxGeometry(0.60, 0.60, 0.02), grilleMat);
+        grille.position.set(xC, floorY + 0.40, cabFront + 0.005);
+        g.add(grille);
+
+        // Four speakers (2×2), cones facing the player
+        [[-0.14, 0.54], [0.14, 0.54], [-0.14, 0.26], [0.14, 0.26]].forEach(([ox, oy]) => {
+            const cone = new THREE.Mesh(new THREE.CylinderGeometry(0.115, 0.115, 0.02, 12), coneMat);
+            cone.rotation.x = Math.PI / 2;
+            cone.position.set(xC + ox, floorY + oy, cabFront + 0.02);
+            g.add(cone);
+            const dust = new THREE.Mesh(new THREE.SphereGeometry(0.03, 6, 4), knobMat);
+            dust.position.set(xC + ox, floorY + oy, cabFront + 0.035);
+            g.add(dust);
+        });
+
+        // Script logo plate at the top of the grille
+        const logo = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.06, 0.012), logoMat);
+        logo.position.set(xC, floorY + 0.70, cabFront + 0.02);
+        g.add(logo);
+
+        // ── Amp head sitting on the cab ──
+        const headW = 0.72, headH = 0.26, headD = 0.34;
+        const headY = floorY + cabH + headH / 2;
+        const head = new THREE.Mesh(new THREE.BoxGeometry(headW, headH, headD), cabMat);
+        head.position.set(xC, headY, zC);
+        g.add(head);
+        const headFront = zC + headD / 2;
+
+        // Piping trim along the head's top edge
+        const headTrim = new THREE.Mesh(new THREE.BoxGeometry(headW + 0.02, 0.025, headD + 0.02), pipingMat);
+        headTrim.position.set(xC, floorY + cabH + headH, zC);
+        g.add(headTrim);
+
+        // Gold control panel + row of knobs + power LED
+        const panel = new THREE.Mesh(new THREE.BoxGeometry(0.66, 0.10, 0.02), goldMat);
+        panel.position.set(xC, headY + 0.03, headFront + 0.005);
+        g.add(panel);
+        for (let i = 0; i < 6; i++) {
+            const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.03, 8), knobMat);
+            knob.rotation.x = Math.PI / 2;
+            knob.position.set(xC - 0.25 + i * 0.10, headY + 0.03, headFront + 0.02);
+            g.add(knob);
+        }
+        const led = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.012), ledMat);
+        led.position.set(xC + 0.30, headY + 0.03, headFront + 0.015);
+        g.add(led);
+
+        // ── Electric guitar on an A-frame stand, beside the stack ──
+        const stand = new THREE.Group();
+        stand.position.set(-0.95, floorY, -2.4);
+        const standMat = new THREE.MeshLambertMaterial({ color: 0x1a1a1a });
+        const legL = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.62, 0.03), standMat);
+        legL.position.set(-0.12, 0.31, 0.0); legL.rotation.z = 0.20; stand.add(legL);
+        const legR = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.62, 0.03), standMat);
+        legR.position.set(0.12, 0.31, 0.0); legR.rotation.z = -0.20; stand.add(legR);
+        const legB = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.60, 0.03), standMat);
+        legB.position.set(0, 0.30, -0.16); legB.rotation.x = -0.28; stand.add(legB);
+        const cradle = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.03, 0.10), standMat);
+        cradle.position.set(0, 0.10, 0.05); stand.add(cradle);
+        const yoke = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.03, 0.04), standMat);
+        yoke.position.set(0, 0.55, 0.0); stand.add(yoke);
+
+        const gtr = new THREE.Group();
+        const bodyMat = new THREE.MeshLambertMaterial({ color: 0xb02828 });
+        const pgMat   = new THREE.MeshLambertMaterial({ color: 0x0c0c0c });
+        const neckMat = new THREE.MeshLambertMaterial({ color: 0xc9a063 });
+        const fbMat   = new THREE.MeshLambertMaterial({ color: 0x2a1a0c });
+        const hwMat   = new THREE.MeshLambertMaterial({ color: 0x303030 });
+        const body = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.40, 0.05), bodyMat);
+        body.position.set(0, 0.20, 0); gtr.add(body);
+        [[-0.15, 0.10], [0.15, 0.10], [-0.15, 0.30], [0.15, 0.30]].forEach(([bx, by]) => {
+            const lobe = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.05, 8), bodyMat);
+            lobe.rotation.x = Math.PI / 2;
+            lobe.position.set(bx, by, 0); gtr.add(lobe);
+        });
+        const pg = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.22, 0.055), pgMat);
+        pg.position.set(0.03, 0.18, 0.004); gtr.add(pg);
+        const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.04, 0.06), hwMat);
+        bridge.position.set(0, 0.07, 0.01); gtr.add(bridge);
+        [0.16, 0.26].forEach(py => {
+            const pu = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.025, 0.06), hwMat);
+            pu.position.set(0, py, 0.01); gtr.add(pu);
+        });
+        const neck = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.58, 0.045), neckMat);
+        neck.position.set(0, 0.69, 0); gtr.add(neck);
+        const fb = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.56, 0.02), fbMat);
+        fb.position.set(0, 0.69, 0.025); gtr.add(fb);
+        const hs = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.035), neckMat);
+        hs.position.set(0, 1.03, 0.005); hs.rotation.x = 0.18; gtr.add(hs);
+        // Seat the guitar in the cradle and lean it back into the yoke
+        gtr.position.set(0, 0.12, 0.05);
+        gtr.rotation.x = -0.12;
+        stand.add(gtr);
+
+        g.add(stand);
         return g;
     }
 
@@ -6501,14 +4549,16 @@ function _dsBuildDungeon(THREE, container, d) {
         guard.rotation.z = Math.PI / 6;
         g.add(guard);
 
-        // Stained altar — stone base with blood-dark top slab
+        // Stained altar — stone base with blood-dark top slab. Centred so the
+        // player walks up to it head-on (the spike trim + embedded sword stay
+        // wall-mounted as side dressing).
         const altarBaseMat = new THREE.MeshLambertMaterial({ color: 0x1a0c0c });
         const altarBase = new THREE.Mesh(new THREE.BoxGeometry(0.70, 0.50, 0.50), altarBaseMat);
-        altarBase.position.set(1.8, floorY + 0.25, -2.2);
+        altarBase.position.set(0, floorY + 0.25, -2.8);
         g.add(altarBase);
         const altarTopMat = new THREE.MeshLambertMaterial({ color: 0x3a0a0a, emissive: 0x1a0000 });
         const altarTop = new THREE.Mesh(new THREE.BoxGeometry(0.74, 0.08, 0.54), altarTopMat);
-        altarTop.position.set(1.8, floorY + 0.54, -2.2);
+        altarTop.position.set(0, floorY + 0.54, -2.8);
         g.add(altarTop);
 
         return g;
@@ -6843,31 +4893,9 @@ function _dsBuildDungeon(THREE, container, d) {
         return g;
     }
 
-    function applyRoomScale(apply) {
-        if (apply) {
-            roomMeshes.floor.scale.set(BW / CW, BH / CH, 1);
-            roomMeshes.floor.position.y = CY - BH / 2;
-            roomMeshes.ceil.scale.set(BW / CW, BH / CH, 1);
-            roomMeshes.ceil.position.y = CY + BH / 2;
-            roomMeshes.wallL.scale.set(BH / CH, BH / CH, 1);
-            roomMeshes.wallL.position.x = -BW / 2;
-            roomMeshes.wallR.scale.set(BH / CH, BH / CH, 1);
-            roomMeshes.wallR.position.x = BW / 2;
-            roomMeshes.back.scale.set(BW / CW, BH / CH, 1);
-            roomMeshes.frontWall.scale.set(BW / CW, BH / CH, 1);
-        } else {
-            roomMeshes.floor.scale.set(1, 1, 1);
-            roomMeshes.floor.position.y = CY - CH / 2;
-            roomMeshes.ceil.scale.set(1, 1, 1);
-            roomMeshes.ceil.position.y = CY + CH / 2;
-            roomMeshes.wallL.scale.set(1, 1, 1);
-            roomMeshes.wallL.position.x = -CW / 2;
-            roomMeshes.wallR.scale.set(1, 1, 1);
-            roomMeshes.wallR.position.x = CW / 2;
-            roomMeshes.back.scale.set(1, 1, 1);
-            roomMeshes.frontWall.scale.set(1, 1, 1);
-        }
-    }
+    // No-op under the contiguous floorplan (ADR 0012): the boss hall is a larger
+    // *room footprint* in the plan, not a rescale of a single shared corridor box.
+    function applyRoomScale(apply) { /* room dimensions are fixed plan geometry */ }
 
     function applyRoomTheme(nodeType, nodeId) {
         clearRoomProp();
@@ -6876,42 +4904,30 @@ function _dsBuildDungeon(THREE, container, d) {
         if (nodeType === 'forced') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = forcedWallMat;
-            roomMeshes.wallR.material = forcedWallMat;
-            roomMeshes.floor.material = forcedFloorMat;
-            roomMeshes.ceil.material  = forcedCeilMat;
-            roomMeshes.back.material  = forcedBackMat;
+            setRoomMats('forced');
             torch1.color.setHex(0xff8844); torch1.intensity = 2.2;
             torch2.color.setHex(0xff8844); torch2.intensity = 1.8;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x1d4ed8);
             roomProp = buildForcedProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'elite') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = eliteWallMat;
-            roomMeshes.wallR.material = eliteWallMat;
-            roomMeshes.floor.material = eliteFloorMat;
-            roomMeshes.ceil.material  = eliteCeilMat;
-            roomMeshes.back.material  = eliteBackMat;
+            setRoomMats('elite');
             torch1.color.setHex(0xff1100); torch1.intensity = 2.2;
             torch2.color.setHex(0xdd0800); torch2.intensity = 1.8;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x660000);
             roomProp = buildEliteProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'boss') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             const bossCleared = nodeId && getCleared().has(nodeId);
             applyRoomScale(true);
-            roomMeshes.wallL.material = bossWallMat;
-            roomMeshes.wallR.material = bossWallMat;
-            roomMeshes.floor.material = bossFloorMat;
-            roomMeshes.ceil.material  = bossCeilMat;
-            roomMeshes.back.material  = bossBackMat;
+            setRoomMats('boss');
             const torchHex = bossCleared ? 0xdd4411 : 0xbb2200;
             const t1i = bossCleared ? 1.8 : 1.0, t2i = bossCleared ? 1.6 : 0.9;
             torch1.color.setHex(torchHex); torch1.intensity = t1i;
@@ -6920,30 +4936,22 @@ function _dsBuildDungeon(THREE, container, d) {
             torch2.position.set( 5.5, CY - BH / 2 + 2.2, -2.5);
             doorGlow.color.setHex(0x660000);
             roomProp = buildBossProp(bossCleared);
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'treasure') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = treasureWallMat;
-            roomMeshes.wallR.material = treasureWallMat;
-            roomMeshes.floor.material = treasureFloorMat;
-            roomMeshes.ceil.material  = treasureCeilMat;
-            roomMeshes.back.material  = treasureBackMat;
+            setRoomMats('treasure');
             torch1.color.setHex(0xffcc44); torch1.intensity = 2.4;
             torch2.color.setHex(0xffaa22); torch2.intensity = 2.0;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0xd4a017);
             roomProp = buildTreasureProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'rest') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = restWallMat;
-            roomMeshes.wallR.material = restWallMat;
-            roomMeshes.floor.material = restFloorMat;
-            roomMeshes.ceil.material  = restCeilMat;
-            roomMeshes.back.material  = restBackMat;
+            setRoomMats('rest');
             // Torches dim to near-nothing — campfire carries the room
             torch1.color.setHex(0x1a0a04); torch1.intensity = 0;
             torch2.color.setHex(0x1a0a04); torch2.intensity = 0;
@@ -6952,54 +4960,49 @@ function _dsBuildDungeon(THREE, container, d) {
             doorGlow.color.setHex(0x6b3a10); doorGlow.intensity = 0.7;
             campfireLight = new THREE.PointLight(0xff5810, 2.6, 9 * WS, 0);
             campfireLight.position.set(0, CY - CH / 2 + 0.45, -3.2);
-            world.add(campfireLight);
+            roomGroup.add(campfireLight);
             roomProp = buildRestProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'mystery') {
             scene.fog.near = 5 * WS; scene.fog.far = 11 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = mysteryWallMat;
-            roomMeshes.wallR.material = mysteryWallMat;
-            roomMeshes.floor.material = mysteryFloorMat;
-            roomMeshes.ceil.material  = mysteryCeilMat;
-            roomMeshes.back.material  = mysteryBackMat;
+            setRoomMats('mystery');
             torch1.color.setHex(0x6622cc); torch1.intensity = 0.22;
             torch2.color.setHex(0x5511aa); torch2.intensity = 0.16;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x8b5cf6);
             roomProp = buildMysteryProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else if (nodeType === 'shop') {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            roomMeshes.wallL.material = shopWallMat;
-            roomMeshes.wallR.material = shopWallMat;
-            roomMeshes.floor.material = shopFloorMat;
-            roomMeshes.ceil.material  = shopCeilMat;
-            roomMeshes.back.material  = shopBackMat;
+            setRoomMats('shop');
             torch1.color.setHex(0xffaa44); torch1.intensity = 2.0;
             torch2.color.setHex(0xff8822); torch2.intensity = 1.7;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0xd4a017);
             roomProp = buildShopProp();
-            world.add(roomProp);
+            roomGroup.add(roomProp);
         } else {
             scene.fog.near = 9 * WS; scene.fog.far = 14 * WS;
             applyRoomScale(false);
-            const [wl, wr, fl, cl, bk] = DEFAULT_MATS;
-            roomMeshes.wallL.material = wl;
-            roomMeshes.wallR.material = wr;
-            roomMeshes.floor.material = fl;
-            roomMeshes.ceil.material  = cl;
-            roomMeshes.back.material  = bk;
+            setRoomMats('default');
             torch1.color.setHex(0xff6622); torch1.intensity = 2.2;
             torch2.color.setHex(0xff6622); torch2.intensity = 1.8;
             torch1.position.set(-1.6, 1.0, -2);
             torch2.position.set( 1.6, 1.0, -5);
             doorGlow.color.setHex(0x1d4ed8);
         }
+        // Room props are rebuilt on every entry, so texture them here (not in the
+        // one-shot floorplan pass). _dsApplyRealTex skips anything already mapped,
+        // and clearRoomProp's traversal disposes these cloned materials next time.
+        if (roomProp) _dsTextureAllSurfaces(THREE, roomProp);
+        // Show the standing torch fires only in the standard corridor themes —
+        // boss/rest/mystery carry their own fire dressing (perimeter stands,
+        // campfire, ethereal altar) and reposition or kill the corridor torches.
+        flamesVisible = !(nodeType === 'boss' || nodeType === 'rest' || nodeType === 'mystery');
     }
 
     // ── HTML overlay layers ───────────────────────────────────────────────────
@@ -7013,24 +5016,38 @@ function _dsBuildDungeon(THREE, container, d) {
     canvasWrap.appendChild(fadeEl);
 
     const encounterEl = document.createElement('div');
-    encounterEl.style.cssText = 'display:none;position:absolute;inset:0;background:rgba(0,0,0,0.9);z-index:5;align-items:center;justify-content:center;padding:16px;overflow-y:auto;';
+    // Docked low with a soft vignette (not a hard full-screen modal) so the room
+    // and the prop you walked up to stay visible behind the encounter — the panel
+    // reads as surfacing *at the campfire / counter / plinth*, in-world.
+    encounterEl.style.cssText = 'display:none;position:absolute;inset:0;background:radial-gradient(ellipse at 50% 38%, rgba(0,0,0,0.18) 0%, rgba(0,0,0,0.74) 78%);z-index:5;align-items:flex-end;justify-content:center;padding:0 16px 40px;overflow-y:auto;';
     canvasWrap.appendChild(encounterEl);
 
     const minimapCanvas = document.createElement('canvas');
-    minimapCanvas.width = 160; minimapCanvas.height = 120;
-    minimapCanvas.style.cssText = 'position:absolute;top:8px;right:8px;z-index:3;border:1px solid #2a2a2a;background:rgba(0,0,0,0.75);';
+    minimapCanvas.width = 640; minimapCanvas.height = 480;
+    minimapCanvas.style.cssText = 'position:absolute;top:8px;right:8px;z-index:3;border:2px solid #2a2a2a;background:rgba(0,0,0,0.75);';
     canvasWrap.appendChild(minimapCanvas);
 
-    const dirLabel = document.createElement('div');
-    dirLabel.style.cssText = 'display:none;opacity:0;transition:opacity .18s ease;position:absolute;top:38%;left:50%;transform:translate(-50%,-50%);color:#ccc;font-family:monospace;font-size:0.9rem;text-align:center;z-index:3;pointer-events:none;text-shadow:0 0 8px #000,0 0 4px #000;letter-spacing:.1em;';
-    canvasWrap.appendChild(dirLabel);
 
     // One-time controls hint (mouselook needs a click to engage Pointer Lock).
     const hintEl = document.createElement('div');
-    hintEl.textContent = 'CLICK TO LOOK · WASD MOVE · SHIFT RUN · E ENTER';
+    hintEl.textContent = 'CLICK TO LOOK · WASD MOVE · WALK UP TO A PROP · E TO USE';
     hintEl.style.cssText = 'position:absolute;bottom:64px;left:50%;transform:translateX(-50%);color:#7a7a7a;font-family:monospace;font-size:0.7rem;letter-spacing:.18em;z-index:4;pointer-events:none;text-shadow:0 0 6px #000;transition:opacity .4s ease;';
     canvasWrap.appendChild(hintEl);
     function hideHint() { if (hintEl) { hintEl.style.opacity = '0'; } }
+
+    // Transient feedback when the player bumps a sealed exit before clearing the
+    // room. Flashed by moveStep/moveForward; fades ~1.6s after the last bump.
+    const sealedEl = document.createElement('div');
+    sealedEl.style.cssText = 'position:absolute;bottom:64px;left:50%;transform:translateX(-50%);color:#e8a04b;font-family:monospace;font-size:0.75rem;letter-spacing:.15em;z-index:5;pointer-events:none;text-shadow:0 0 8px #000;opacity:0;transition:opacity .3s ease;text-align:center;white-space:nowrap;';
+    canvasWrap.appendChild(sealedEl);
+    let _sealedTimer = null;
+    function flashSealed() {
+        const verb = INTERACT_VERB[nodeById(state.nodeId)?.type] || 'finish this room';
+        sealedEl.textContent = `⛔ ${verb} TO UNSEAL THE PATHS`;
+        sealedEl.style.opacity = '1';
+        if (_sealedTimer) clearTimeout(_sealedTimer);
+        _sealedTimer = setTimeout(() => { sealedEl.style.opacity = '0'; }, 1600);
+    }
 
     const exitBtn = document.createElement('button');
     exitBtn.textContent = '☰ MENU';
@@ -7041,8 +5058,12 @@ function _dsBuildDungeon(THREE, container, d) {
     const interactBtn = document.createElement('button');
     interactBtn.textContent = '! ENTER';
     interactBtn.style.cssText = 'display:none;position:absolute;bottom:8px;left:8px;z-index:6;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:0.8rem;padding:10px 14px;cursor:pointer;letter-spacing:.1em;touch-action:manipulation;border-radius:4px;';
-    interactBtn.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') showEncounter(state.nodeId); };
+    interactBtn.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle' && promptArmed && promptNear) startFaceTween(state.nodeId); };
     canvasWrap.appendChild(interactBtn);
+
+    const dunReticle = document.createElement('div');
+    dunReticle.className = 'ds-reticle';
+    canvasWrap.appendChild(dunReticle);
 
     // On-screen nav pad (bottom-right)
     const navPad = document.createElement('div');
@@ -7051,7 +5072,7 @@ function _dsBuildDungeon(THREE, container, d) {
     btnFwd.innerHTML = '▲';
     btnFwd.style.cssText = 'width:96px;height:48px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#aaa;font-family:monospace;font-size:1.1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
     // Touch/no-mouse fallback: hold ▲ to walk forward (toward whatever you face).
-    const _btnFwdHold = (v) => (ev) => { ev.preventDefault(); if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') keys.f = v; };
+    const _btnFwdHold = (v) => (ev) => { ev.preventDefault(); if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.keys.f = v; };
     btnFwd.addEventListener('pointerdown', _btnFwdHold(true));
     btnFwd.addEventListener('pointerup', _btnFwdHold(false));
     btnFwd.addEventListener('pointerleave', _btnFwdHold(false));
@@ -7061,11 +5082,11 @@ function _dsBuildDungeon(THREE, container, d) {
     const btnLeft = document.createElement('button');
     btnLeft.innerHTML = '◀';
     btnLeft.style.cssText = 'width:44px;height:44px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
-    btnLeft.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') yaw += 0.35; };
+    btnLeft.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.yaw += 0.35; };
     const btnRight = document.createElement('button');
     btnRight.innerHTML = '▶';
     btnRight.style.cssText = 'width:44px;height:44px;background:rgba(10,10,10,0.85);border:1px solid #3a3a3a;color:#777;font-family:monospace;font-size:1rem;cursor:pointer;touch-action:manipulation;border-radius:4px;';
-    btnRight.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') yaw -= 0.35; };
+    btnRight.onclick = () => { if (_dsAudio) _dsAudio.init(); if (state.phase === 'idle') qc.yaw -= 0.35; };
     navRow.appendChild(btnLeft);
     navRow.appendChild(btnRight);
     navPad.appendChild(btnFwd);
@@ -7088,44 +5109,515 @@ function _dsBuildDungeon(THREE, container, d) {
         choice:  [0x047857, 0x012a1c],
     };
 
+    // ── Door destination signs ────────────────────────────────────────────────
+    // Each exit shows the room type it leads to (icon + name) so the player knows
+    // whether a door goes to a Rest, Treasure, Elite, etc. before committing.
+    const DOOR_LABEL_NAME = {
+        forced: 'SONG', elite: 'ELITE', boss: 'BOSS', rest: 'REST',
+        shop: 'SHOP', mystery: 'MYSTERY', treasure: 'TREASURE', choice: 'CHOICE',
+    };
+    function makeDoorLabel(type) {
+        const cv = document.createElement('canvas');
+        cv.width = 256; cv.height = 96;
+        const c = cv.getContext('2d');
+        const icon = NODE_TYPE_ICONS[type] || '◇';
+        const name = DOOR_LABEL_NAME[type] || (type || '???').toUpperCase();
+        c.fillStyle = 'rgba(8,8,10,0.78)';
+        c.fillRect(0, 0, 256, 96);
+        c.lineWidth = 4;
+        c.strokeStyle = 'rgba(0,0,0,0.55)';
+        c.strokeRect(2, 2, 252, 92);
+        c.textAlign = 'center';
+        c.font = '44px serif';
+        c.fillStyle = '#ffffff';
+        c.fillText(icon, 128, 50);
+        c.font = 'bold 24px monospace';
+        c.fillStyle = '#e8c040';
+        c.fillText(name, 128, 84);
+        const tex = new THREE.CanvasTexture(cv);
+        tex.minFilter = tex.magFilter = THREE.NearestFilter;
+        const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false });
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 0.5), mat);
+        mesh.renderOrder = 18;
+        return { mesh, tex, mat };
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
     const nodeById = id => (map.nodes || []).find(n => n.id === id);
     const getCleared   = () => new Set(d.cleared_node_ids || []);
     const getAvailable = () => new Set(d.available_node_ids || []);
+    // A room's exits stay sealed until its own encounter is resolved. Clearing a
+    // node always rebuilds the dungeon (dsClearNode -> dsInit), so this reads the
+    // fresh payload and is constant for the life of one room view.
+    const currentCleared = () => getCleared().has(state.nodeId);
 
-    function savePos() { localStorage.setItem('ds_dun_node_' + d.date, state.nodeId); }
+    // Saved position is now a coordinate (ADR 0012): resume where the player stood.
+    function savePos() {
+        try {
+            localStorage.setItem('ds_dun_pos_' + d.date,
+                JSON.stringify({ x: camera.position.x, z: camera.position.z, node: state.nodeId }));
+        } catch (e) {}
+    }
 
-    // ── Door rebuild (per node) ───────────────────────────────────────────────
-    // Each visible exit gets its own door panel fanned across the front wall.
-    // Selecting an exit = camera rotates to face that door. Walking forward =
-    // camera physically moves toward that door's xz position.
-    function rebuildDoors(edges) {
-        for (const ds of doorState) {
-            world.remove(ds.frame);
-            world.remove(ds.fill);
-            ds.frame.geometry.dispose();
-            ds.fill.geometry.dispose();
-            ds.fillM.dispose();
+    // ── In-world interaction zones ────────────────────────────────────────────
+    // Each room's signature prop is an *area you walk up to*. Standing within
+    // INTERACT_RADIUS of the anchor lights a billboard prompt floating over the
+    // prop and arms the Enter action; the encounter no longer auto-opens on room
+    // arrival. Anchors are local coords (× WS for world space) matched to the
+    // positions built in build*Prop() — campfire, counter, plinth, altar, dais.
+    const INTERACT_ANCHOR = {
+        // y is absolute world-local (the prompt renders at y + 0.45); each value
+        // floats the box ~0.1 above that room's central prop. See the prop
+        // builders for the geometry these track.
+        forced:   { x: 0.0, z: -2.6, y: -0.10 },
+        elite:    { x: 0.0, z: -2.8, y: -0.57 },
+        boss:     { x: 0.0, z: -5.4, y: 0.90 },
+        treasure: { x: 0.0, z: -6.5, y: -0.33 },
+        rest:     { x: 0.0, z: -3.2, y: -0.42 },
+        mystery:  { x: 0.0, z: -6.0, y: -0.10 },
+        shop:     { x: 0.0, z: -6.2, y: 0.86 },
+        choice:   { x: 0.0, z: -4.0, y: 0.90 },
+        event:    { x: 0.0, z: -4.0, y: 0.90 },
+    };
+    const INTERACT_VERB = {
+        forced: 'PLAY', elite: 'PLAY', boss: 'CHALLENGE', treasure: 'OPEN',
+        rest: 'REST', mystery: 'INSPECT', shop: 'BROWSE', choice: 'CHOOSE', event: 'ENTER',
+    };
+    const INTERACT_RADIUS = 1.7 * WS;
+
+    // Reusable billboard that floats above the current room's prop.
+    const promptCanvas = document.createElement('canvas');
+    promptCanvas.width = 256; promptCanvas.height = 128;
+    const promptCtx = promptCanvas.getContext('2d');
+    const promptTex = new THREE.CanvasTexture(promptCanvas);
+    promptTex.minFilter = promptTex.magFilter = THREE.NearestFilter;
+    const promptMat = new THREE.MeshBasicMaterial({ map: promptTex, transparent: true, depthTest: false, side: THREE.DoubleSide });
+    const promptMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.75), promptMat);
+    promptMesh.renderOrder = 20;
+    promptMesh.visible = false;
+    roomGroup.add(promptMesh);
+    let promptAnchor = null;   // {x,y,z} local for the current node, or null
+    let promptNear = false;    // player within INTERACT_RADIUS this frame
+    let promptArmed = false;   // node is interactable (available or cleared)
+    // Face-tween state for Skyrim-style camera turn on interact.
+    let faceTween = 0;
+    let faceStartYaw = 0;
+    let faceTargetYaw = 0;
+    let faceStartPitch = 0;
+    let faceTargetPitch = 0;
+
+    function drawPromptCanvas(near) {
+        const c = promptCtx;
+        c.clearRect(0, 0, 256, 128);
+        const n = nodeById(state.nodeId);
+        const icon = NODE_TYPE_ICONS[n?.type] || '◇';
+        const verb = INTERACT_VERB[n?.type] || 'ENTER';
+        c.fillStyle = `rgba(8,8,10,${near ? 0.80 : 0.40})`;
+        c.fillRect(28, 16, 200, 96);
+        c.lineWidth = 3;
+        c.strokeStyle = near ? 'rgba(232,192,64,0.95)' : 'rgba(120,110,80,0.5)';
+        c.strokeRect(28, 16, 200, 96);
+        c.textAlign = 'center';
+        c.font = '42px serif';
+        c.fillText(icon, 128, 62);
+        c.font = 'bold 20px monospace';
+        c.fillStyle = near ? '#e8c040' : '#8a8060';
+        c.fillText(near ? `▲ E · ${verb}` : verb, 128, 98);
+        promptTex.needsUpdate = true;
+    }
+
+    function positionPrompt(nodeType) {
+        const a = INTERACT_ANCHOR[nodeType];
+        promptAnchor = a || null;
+        promptNear = false;
+        if (!a) { promptMesh.visible = false; return; }
+        // Float just above the prop (not so high it leaves the ~64° vertical FOV
+        // when the player is standing right at it).
+        promptMesh.position.set(a.x, a.y + 0.45, a.z);
+        promptMesh.visible = true;
+        drawPromptCanvas(false);
+    }
+
+    function isInteractable() {
+        // The room you're physically standing in is always inspectable — this
+        // matches the legacy auto-open-on-arrival the FPS walk-up replaced.
+        // Whether you can actually act (Play/Bank/Buy) is gated *inside* the
+        // encounter by availability (canPlay etc. in the draw bodies), so a node
+        // you've reached but not yet unlocked still opens and shows its state.
+        // Gating the open itself on availability silently broke deeper nodes
+        // (e.g. mystery) that are current-but-not-in-`available_node_ids`.
+        return !!nodeById(state.nodeId);
+    }
+
+    function isNearProp() {
+        if (!promptAnchor) return false;
+        // promptAnchor is room-local; roomGroup sits at the occupied room's centre.
+        const ax = (roomGroup.position.x + promptAnchor.x) * WS;
+        const az = (roomGroup.position.z + promptAnchor.z) * WS;
+        return Math.hypot(camera.position.x - ax, camera.position.z - az) <= INTERACT_RADIUS;
+    }
+
+    // ── Contiguous floorplan (ADR 0012) ───────────────────────────────────────
+    // Lay every room at its grid position (col→X, row→−Z), connect them with
+    // axis-aligned L-corridors, rasterize the walkable space into an occupancy
+    // grid, and extract walls from that grid. Closed corridors (rooms not yet
+    // reachable) are blocked by rubble gates that explode when the source room is
+    // cleared. Built once in start(); walls + gates change only when a section
+    // opens. Geometry is in world-local units (the world group scales × WS).
+
+    // Backend is authoritative: a corridor A→B is open iff B is "discovered".
+    function discoveredSet() {
+        const s = new Set();
+        (d.available_node_ids || []).forEach(id => s.add(id));
+        (d.cleared_node_ids   || []).forEach(id => s.add(id));
+        (d.committed_node_ids  || []).forEach(id => s.add(id));
+        return s;
+    }
+    function corridorOpen(c) {
+        const disc = discoveredSet();
+        // Entrance corridors (antechamber → a row-0 room) open iff that entrance is
+        // discovered — this is what enforces lane commitment spatially: committing
+        // to one entrance locks the siblings, which then rock over.
+        if (c.aId == null) return disc.has(c.bId);
+        // Inter-room corridors: open once the target is discovered. The source
+        // being cleared is what makes its targets available (backend), so this
+        // encodes "a room's exits stay blocked until it is cleared".
+        return disc.has(c.bId) && (disc.has(c.aId) || nodeById(c.aId)?.row === 0);
+    }
+
+    // Standard stone material for floor/ceil/walls of the plan (themed floor is
+    // swapped per-occupied-room via setRoomMats; walls stay this base material).
+    function _planMat(map_) { const m = new THREE.MeshLambertMaterial({ map: map_ }); _floorplanDisposables.push(m); return m; }
+
+    function _roomExtents(node) {
+        return node.type === 'boss' ? [BOSS_HW, BOSS_HD] : [ROOM_HW, ROOM_HD];
+    }
+    function roomCenter(node) {
+        const cols = (map.nodes || []).map(n => n.col || 0);
+        const colMid = (Math.min(...cols) + Math.max(...cols)) / 2;
+        return { x: ((node.col || 0) - colMid) * CELL_X, z: -((node.row || 0)) * CELL_Z };
+    }
+
+    // Build the layout records (positions/extents/anchors) for every node.
+    function computeLayout() {
+        for (const node of (map.nodes || [])) {
+            const c = roomCenter(node);
+            const [hw, hd] = _roomExtents(node);
+            const a = INTERACT_ANCHOR[node.type] || { x: 0, z: -hd * 0.5, y: -0.1 };
+            rooms[node.id] = { node, x: c.x, z: c.z, hw, hd, anchor: { x: a.x, z: a.z } };
         }
-        doorState.length = 0;
-        if (!edges || !edges.length) return;
-        const N = Math.min(edges.length, 4);
-        const z = -(CL - 0.45);
-        const margin = 1.2;
-        const span = N === 1 ? 0 : Math.min(CW - margin * 2, 5.0);
-        for (let i = 0; i < N; i++) {
-            const x = N === 1 ? 0 : -span / 2 + (i / (N - 1)) * span;
-            const tgt = nodeById(edges[i]);
-            const [col, emv] = DOOR_COL[tgt?.type] || [0x111111, 0x040404];
-            const frame = new THREE.Mesh(new THREE.PlaneGeometry(1.7, 2.5), doorFrameMat);
-            frame.position.set(x, CY, z + 0.01);
-            world.add(frame);
-            const fillM = new THREE.MeshLambertMaterial({ color: col, emissive: emv });
-            const fill = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 2.2), fillM);
-            fill.position.set(x, CY, z + 0.02);
-            world.add(fill);
-            doorState.push({ frame, fill, fillM, edge: edges[i], target: tgt, x, z: z + 0.02 });
+        // Corridors: one per edge. Route as an L (forward from A's far wall, lateral
+        // jog at the mid-row band, forward into B's near wall). Record the tiles it
+        // occupies so the occupancy grid + rubble placement can use them.
+        for (const node of (map.nodes || [])) {
+            const A = rooms[node.id]; if (!A) continue;
+            for (const tid of (node.edges || [])) {
+                const B = rooms[tid]; if (!B) continue;
+                const aFar = A.z - A.hd;        // A's forward (−Z) wall
+                const bNear = B.z + B.hd;        // B's back (+Z) wall
+                const midZ = (aFar + bNear) / 2;
+                corridors.push({
+                    aId: node.id, bId: tid,
+                    ax: A.x, bx: B.x, aFar, bNear, midZ,
+                    mouthX: A.x, mouthZ: aFar - 0.6,    // rubble sits just past A's exit
+                    open: false, gate: null,
+                });
+            }
         }
+        // Entrance corridors: an antechamber behind row 0, connected to each entry
+        // room by a short gated corridor. Locked lanes rock over (commitment).
+        const entries = Object.values(rooms).filter(r => (r.node.row || 0) === 0);
+        if (entries.length) {
+            const ax0 = Math.min(...entries.map(r => r.x - r.hw));
+            const ax1 = Math.max(...entries.map(r => r.x + r.hw));
+            const entryNear = Math.max(...entries.map(r => r.z + r.hd));
+            const acFront = entryNear + 5;       // antechamber's −Z (front) edge
+            antechamber = { x0: ax0, x1: ax1, z0: acFront, z1: acFront + CELL_Z * 0.45 };
+            for (const e of entries) {
+                corridors.push({
+                    aId: null, bId: e.node.id,
+                    ax: e.x, bx: e.x, aFar: acFront, bNear: e.z + e.hd, midZ: (acFront + e.z + e.hd) / 2,
+                    mouthX: e.x, mouthZ: e.z + e.hd + 0.6,
+                    open: false, gate: null,
+                });
+            }
+        }
+    }
+
+    // Rasterize rooms + open corridors + the antechamber into the occupancy grid.
+    function buildOccupancy() {
+        const xs = [], zs = [];
+        for (const id in rooms) { const r = rooms[id]; xs.push(r.x - r.hw, r.x + r.hw); zs.push(r.z - r.hd, r.z + r.hd); }
+        if (antechamber) { xs.push(antechamber.x0, antechamber.x1); zs.push(antechamber.z0, antechamber.z1); }
+        const pad = 4;
+        const x0 = Math.min(...xs) - pad, x1 = Math.max(...xs) + pad;
+        const z0 = Math.min(...zs) - pad, z1 = Math.max(...zs) + pad;
+        const nx = Math.ceil((x1 - x0) / TILE), nz = Math.ceil((z1 - z0) / TILE);
+        const cells = new Uint8Array(nx * nz);
+        occ = { x0, z0, nx, nz, cells };
+        const mark = (xa, xb, za, zb) => {
+            const ia = Math.max(0, Math.floor((Math.min(xa, xb) - x0) / TILE));
+            const ib = Math.min(nx - 1, Math.floor((Math.max(xa, xb) - x0) / TILE));
+            const ja = Math.max(0, Math.floor((Math.min(za, zb) - z0) / TILE));
+            const jb = Math.min(nz - 1, Math.floor((Math.max(za, zb) - z0) / TILE));
+            for (let j = ja; j <= jb; j++) for (let i = ia; i <= ib; i++) cells[j * nx + i] = 1;
+        };
+        for (const id in rooms) { const r = rooms[id]; mark(r.x - r.hw, r.x + r.hw, r.z - r.hd, r.z + r.hd); }
+        if (antechamber) mark(antechamber.x0, antechamber.x1, antechamber.z0, antechamber.z1);
+        // Legs overlap their endpoints by OV so the occupancy connects cleanly to
+        // rooms/antechamber despite tile rounding (otherwise a 1-tile wall seam can
+        // wall off an open passage).
+        const OV = COR_HW;
+        for (const c of corridors) {
+            if (!c.open) continue;
+            mark(c.ax - COR_HW, c.ax + COR_HW, Math.min(c.aFar, c.midZ) - OV, Math.max(c.aFar, c.midZ) + OV); // leg from A
+            mark(Math.min(c.ax, c.bx) - COR_HW - OV, Math.max(c.ax, c.bx) + COR_HW + OV, c.midZ - COR_HW, c.midZ + COR_HW); // lateral jog
+            mark(c.bx - COR_HW, c.bx + COR_HW, Math.min(c.midZ, c.bNear) - OV, Math.max(c.midZ, c.bNear) + OV); // leg into B
+        }
+    }
+
+    function tileWalkable(x, z) {
+        if (!occ) return true;
+        const i = Math.floor((x - occ.x0) / TILE), j = Math.floor((z - occ.z0) / TILE);
+        if (i < 0 || j < 0 || i >= occ.nx || j >= occ.nz) return false;
+        return occ.cells[j * occ.nx + i] === 1;
+    }
+
+    // Extract wall quads from the occupancy boundary into one merged geometry.
+    function buildWalls() {
+        if (wallMesh) { world.remove(wallMesh); wallMesh.geometry.dispose(); wallMesh = null; }
+        if (!occ) return;
+        const { x0, z0, nx, nz, cells } = occ;
+        const pos = [], norm = [], uv = [];
+        const H = CH;
+        const pushQuad = (ax, az, bx, bz, nxv, nzv) => {
+            // vertical wall quad from (ax,az) to (bx,bz), floor→ceil
+            const y0 = FLOOR_Y, y1 = CEIL_Y;
+            const len = Math.hypot(bx - ax, bz - az);
+            const v = [ax, y0, az,  bx, y0, bz,  bx, y1, bz,  ax, y0, az,  bx, y1, bz,  ax, y1, az];
+            for (let k = 0; k < 6; k++) norm.push(nxv, 0, nzv);
+            pos.push(...v);
+            uv.push(0, 0, len, 0, len, H, 0, 0, len, H, 0, H);
+        };
+        for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) {
+            if (cells[j * nx + i]) continue; // only solid cells emit faces (toward walkable neighbours)
+            const wx = x0 + i * TILE, wz = z0 + j * TILE;
+            const walk = (ii, jj) => (ii >= 0 && jj >= 0 && ii < nx && jj < nz && cells[jj * nx + ii] === 1);
+            if (walk(i - 1, j)) pushQuad(wx, wz, wx, wz + TILE, 1, 0);             // face +X (toward walkable on −X)
+            if (walk(i + 1, j)) pushQuad(wx + TILE, wz + TILE, wx + TILE, wz, -1, 0);
+            if (walk(i, j - 1)) pushQuad(wx + TILE, wz, wx, wz, 0, 1);
+            if (walk(i, j + 1)) pushQuad(wx, wz + TILE, wx + TILE, wz + TILE, 0, -1);
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+        geo.setAttribute('normal', new THREE.Float32BufferAttribute(norm, 3));
+        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+        wallMesh = new THREE.Mesh(geo, wallMat);
+        world.add(wallMesh);
+    }
+
+    // ── Rubble gates ──────────────────────────────────────────────────────────
+    const _rockGeos = [
+        new THREE.DodecahedronGeometry(0.55, 0),
+        new THREE.DodecahedronGeometry(0.8, 0),
+        new THREE.IcosahedronGeometry(0.7, 0),
+        new THREE.BoxGeometry(0.9, 0.7, 0.8),
+    ];
+    _rockGeos.forEach(g => _floorplanDisposables.push(g));
+    // One shared, real-textured rubble material. noAutoTex: we apply the stone
+    // texture explicitly here, so the surface-texturing post-pass must skip it
+    // (it would otherwise clone it per-mesh before the async map lands).
+    const _rubbleMat = new THREE.MeshLambertMaterial({ color: 0x5a524a });
+    _rubbleMat.userData.noAutoTex = true;
+    _floorplanDisposables.push(_rubbleMat);
+    _dsApplyRealTex(THREE, _rubbleMat, 'wall_stone.png', 1, 1, 0x5a524a);
+    // A rubble pile is now ONE merged mesh per gate (was 11 separate rock meshes
+    // → ~143 draw calls across the 13 sealed corridors at spawn). The 11 boulders
+    // are baked into a single BufferGeometry (position/normal/uv carried through
+    // so the stone texture still maps); detonateGate() spawns transient debris.
+    const _rubbleTmp = { m: new THREE.Matrix4(), p: new THREE.Vector3(), q: new THREE.Quaternion(), e: new THREE.Euler(), s: new THREE.Vector3() };
+    function makeRubble() {
+        const span = COR_HW * 2 + 0.6, n = 11;
+        const pos = [], norm = [], uv = [];
+        for (let k = 0; k < n; k++) {
+            const sc = 0.6 + Math.random() * 0.9;
+            _rubbleTmp.p.set((Math.random() - 0.5) * span, FLOOR_Y + Math.random() * 1.6, (Math.random() - 0.5) * 1.6);
+            _rubbleTmp.e.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+            _rubbleTmp.q.setFromEuler(_rubbleTmp.e);
+            _rubbleTmp.s.setScalar(sc);
+            _rubbleTmp.m.compose(_rubbleTmp.p, _rubbleTmp.q, _rubbleTmp.s);
+            let g2 = _rockGeos[k % _rockGeos.length].clone();   // never mutate the shared base
+            if (g2.index) { const t = g2.toNonIndexed(); g2.dispose(); g2 = t; }
+            g2.applyMatrix4(_rubbleTmp.m);   // transforms position AND normal
+            const P = g2.attributes.position.array, N = g2.attributes.normal.array;
+            const U = g2.attributes.uv ? g2.attributes.uv.array : null;
+            for (let i = 0; i < P.length; i++) pos.push(P[i]);
+            for (let i = 0; i < N.length; i++) norm.push(N[i]);
+            if (U) for (let i = 0; i < U.length; i++) uv.push(U[i]);
+            else for (let i = 0, c = P.length / 3; i < c; i++) uv.push(0, 0);
+            g2.dispose();
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+        geo.setAttribute('normal', new THREE.Float32BufferAttribute(norm, 3));
+        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+        return new THREE.Mesh(geo, _rubbleMat);
+    }
+    // Place a rubble pile in each closed corridor's mouth; remove from open ones.
+    function refreshGates() {
+        for (const c of corridors) {
+            const open = corridorOpen(c);
+            c.open = open;
+            if (open && c.gate) { roomGroup_removeGate(c); }
+            else if (!open && !c.gate) {
+                const g = makeRubble();
+                g.position.set(c.mouthX, 0, c.mouthZ + 0.4);
+                world.add(g);
+                c.gate = g;
+                rubbleGates.push({ corridor: c, group: g });
+            }
+        }
+    }
+    function roomGroup_removeGate(c) {
+        if (!c.gate) return;
+        world.remove(c.gate);
+        c.gate.traverse(o => { if (o.isMesh && o.geometry && _rockGeos.indexOf(o.geometry) < 0) o.geometry.dispose(); });
+        const idx = rubbleGates.findIndex(rg => rg.corridor === c);
+        if (idx >= 0) rubbleGates.splice(idx, 1);
+        c.gate = null;
+    }
+
+    // ── Explosion VFX ─────────────────────────────────────────────────────────
+    // Detonate the rubble blocking a corridor: fling the boulders outward as
+    // debris, spit sparks, flash a light, boom. Replaces ADR 0010's door-unseal.
+    function detonateGate(c) {
+        if (!c.gate) { c.open = true; return; }
+        const gate = c.gate;
+        const origin = gate.position.clone();
+        const pieces = [];
+        world.remove(gate);                    // detach the merged pile once
+        if (gate.geometry) gate.geometry.dispose();   // its merged geo is transient
+        // Spawn individual debris boulders to fling — shared _rockGeos + _rubbleMat
+        // (so the explosion cleanup's dispose-guard leaves them alone).
+        const span = COR_HW * 2 + 0.6;
+        for (let i = 0; i < 11; i++) {
+            const rock = new THREE.Mesh(_rockGeos[i % _rockGeos.length], _rubbleMat);
+            rock.scale.setScalar(0.6 + Math.random() * 0.9);
+            rock.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+            rock.position.set(
+                origin.x + (Math.random() - 0.5) * span,
+                origin.y + FLOOR_Y + Math.random() * 1.6,
+                origin.z + (Math.random() - 0.5) * 1.6,
+            );
+            world.add(rock);
+            pieces.push({
+                mesh: rock,
+                vx: (Math.random() - 0.5) * 26,
+                vy: 6 + Math.random() * 16,
+                vz: (Math.random() - 0.5) * 26,
+                spin: new THREE.Vector3((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12),
+            });
+        }
+        // Spark burst (additive points).
+        const sn = 40, sp = new Float32Array(sn * 3), sv = [];
+        for (let i = 0; i < sn; i++) {
+            sp[i*3] = origin.x; sp[i*3+1] = origin.y + 0.8; sp[i*3+2] = origin.z;
+            sv.push({ x: (Math.random()-0.5)*34, y: 4 + Math.random()*22, z: (Math.random()-0.5)*34 });
+        }
+        const sg = new THREE.BufferGeometry();
+        sg.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+        const sm = new THREE.PointsMaterial({ color: 0xffb347, size: 3.2, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+        const sparks = new THREE.Points(sg, sm);
+        world.add(sparks);
+        // Flash light.
+        const flash = new THREE.PointLight(0xffd28a, 6, 9 * WS, 0);
+        flash.position.copy(origin).setY(origin.y + 1);
+        world.add(flash);
+        explosions.push({ pieces, sparks, sparkVel: sv, flash, t: 0, dur: 1.5 });
+        const idx = rubbleGates.findIndex(rg => rg.corridor === c);
+        if (idx >= 0) rubbleGates.splice(idx, 1);
+        c.gate = null;
+        c.open = true;
+        if (_dsAudio && _dsAudio.playBoom) _dsAudio.playBoom();
+        else if (_dsAudio && _dsAudio.playDoorOpen) _dsAudio.playDoorOpen();
+        // Camera kick: scale by proximity (origin is world-local, camera is in
+        // world units → divide by WS to compare). Near blasts shake hard, far
+        // ones barely. Take the max so simultaneous gates don't stack to nausea.
+        const pd = Math.hypot(origin.x - camera.position.x / WS, origin.z - camera.position.z / WS);
+        camShake = Math.max(camShake, 0.018 + 0.045 * Math.max(0, 1 - pd / 14));
+    }
+
+    function tickExplosions(dt) {
+        for (let e = explosions.length - 1; e >= 0; e--) {
+            const ex = explosions[e];
+            ex.t += dt;
+            const k = ex.t / ex.dur;
+            ex.pieces.forEach(p => {
+                p.vy -= 38 * dt;          // gravity
+                p.mesh.position.x += p.vx * dt;
+                p.mesh.position.y += p.vy * dt;
+                p.mesh.position.z += p.vz * dt;
+                if (p.mesh.position.y < FLOOR_Y + 0.2) { p.mesh.position.y = FLOOR_Y + 0.2; p.vy *= -0.3; p.vx *= 0.6; p.vz *= 0.6; }
+                p.mesh.rotation.x += p.spin.x * dt; p.mesh.rotation.y += p.spin.y * dt; p.mesh.rotation.z += p.spin.z * dt;
+            });
+            const arr = ex.sparks.geometry.attributes.position.array;
+            ex.sparkVel.forEach((v, i) => { v.y -= 30 * dt; arr[i*3] += v.x*dt; arr[i*3+1] += v.y*dt; arr[i*3+2] += v.z*dt; });
+            ex.sparks.geometry.attributes.position.needsUpdate = true;
+            ex.sparks.material.opacity = Math.max(0, 1 - k * 1.4);
+            if (ex.flash) ex.flash.intensity = Math.max(0, 6 * (1 - k * 2.2));
+            if (k >= 1) {
+                ex.pieces.forEach(p => { world.remove(p.mesh); if (_rockGeos.indexOf(p.mesh.geometry) < 0) p.mesh.geometry.dispose(); });
+                world.remove(ex.sparks); ex.sparks.geometry.dispose(); ex.sparks.material.dispose();
+                if (ex.flash) world.remove(ex.flash);
+                explosions.splice(e, 1);
+            }
+        }
+    }
+
+    // Build the entire plan: layout, occupancy, floor/ceil planes, walls, gates.
+    function buildFloorplan() {
+        computeLayout();
+        corridors.forEach(c => { c.open = corridorOpen(c); });  // open states BEFORE rasterizing
+        buildOccupancy();
+        // Big spanning floor + ceiling (cheap; fog + walls bound what is seen).
+        const fw = (occ.nx + 2) * TILE, fd = (occ.nz + 2) * TILE;
+        const cx = occ.x0 + occ.nx * TILE / 2, cz = occ.z0 + occ.nz * TILE / 2;
+        const floorGeo = new THREE.PlaneGeometry(fw, fd);
+        const ceilGeo = new THREE.PlaneGeometry(fw, fd);
+        _floorplanDisposables.push(floorGeo, ceilGeo);
+        roomMeshes.floor = new THREE.Mesh(floorGeo, floorMat);
+        roomMeshes.floor.rotation.x = -Math.PI / 2; roomMeshes.floor.position.set(cx, FLOOR_Y, cz);
+        world.add(roomMeshes.floor);
+        roomMeshes.ceil = new THREE.Mesh(ceilGeo, ceilMat);
+        roomMeshes.ceil.rotation.x = Math.PI / 2; roomMeshes.ceil.position.set(cx, CEIL_Y, cz);
+        world.add(roomMeshes.ceil);
+        // Real floor/ceil textures sized to the spanning plane (~one tile / 2 units),
+        // applied here (not at material creation) because the plane size is known now.
+        const _ruF = Math.max(2, Math.round(fw / 2)), _rvF = Math.max(2, Math.round(fd / 2));
+        _dsApplyRealTex(THREE, floorMat, 'floor_granite.png', _ruF, _rvF, null);
+        _dsApplyRealTex(THREE, ceilMat,  'floor_plate.png',   _ruF, _rvF, null);
+        buildWalls();
+        refreshGates();
+    }
+
+    // Recompute gate/occupancy state after the payload's cleared/available sets
+    // change, detonating any corridors that just opened. `justClearedId` (optional)
+    // scopes the explosion to that room's exits so only the relevant rocks blow.
+    function syncSections(justClearedId) {
+        const toOpen = corridors.filter(c => !c.open && corridorOpen(c));
+        const toClose = corridors.filter(c => c.open && !corridorOpen(c));
+        let exploded = false;
+        for (const c of toOpen) {
+            if (!justClearedId || c.aId === justClearedId) { detonateGate(c); exploded = true; }
+            else c.open = true; // opened off-screen (e.g. on load); no boom
+        }
+        for (const c of toClose) { c.open = false; } // sibling lanes seal silently
+        // Rebuild occupancy + walls so the newly-open passages are walkable and the
+        // sealed ones are walled. Drop rubble on any freshly-closed corridors.
+        buildOccupancy();
+        buildWalls();
+        refreshGates();
+        return exploded;
     }
 
     // Per-room ambient tint by current node type — gives each room a distinct
@@ -7136,205 +5628,153 @@ function _dsBuildDungeon(THREE, container, d) {
         treasure: 0x382810, choice:   0x102a1c,
     };
     function applyRoomTint(nodeType) {
-        ambientLight.color.setHex(TYPE_TINT[nodeType] || 0x221109);
+        const tint = TYPE_TINT[nodeType] || 0x221109;
+        ambientLight.color.setHex(tint);
+        // Tint the fog to a darkened version of the room mood instead of pure
+        // black: distant corridor geometry recedes into a dim coloured haze
+        // (readable depth + reinforced mood) rather than vanishing into a void,
+        // while staying dark enough to keep hiding the rest of the map.
+        scene.fog.color.setHex(tint).multiplyScalar(0.5);
     }
 
-    // ── Quake-style first-person controls ─────────────────────────────────────
-    // Control scheme ported from mrdoob/three-quake (src/in_web.js + pmove.js):
-    // Pointer-Lock mouselook with Quake's view-angle math, and WASD movement with
-    // Quake ground physics (PM_Friction + PM_Accelerate). The corridor is a real
-    // walkable box; reaching a doorway triggers the node transition that used to
-    // be an arrow-key selection.
-    const DEG2RAD = Math.PI / 180;
-    // Authentic Quake: angle delta = mouse * sensitivity(3) * m_yaw/m_pitch(0.022).
-    const LOOK_SENS = 0.022 * 3 * DEG2RAD;
-    const PITCH_MAX = 80 * DEG2RAD;            // Quake clamps pitch to ~±80°
-    // Literal Quake values — the world is sized to Quake units (WS), so these are
-    // used 1:1, not scaled. sv_maxspeed 320, sv_accelerate 10, sv_friction 4,
-    // sv_stopspeed 100.
-    const MOVE_MAXSPEED = 320, MOVE_ACCEL = 10, MOVE_FRICTION = 4;
-    const MOVE_STOPSPEED = 100;
-    // Run model: walk at cl_forwardspeed(200); +speed multiplies by
-    // cl_movespeedkey(2.0), capped at sv_maxspeed(320).
-    const MOVE_WALKSPEED = 200;
-    const RUN_MULT = 2.0;                       // cl_movespeedkey
-    // View bob — literal Quake V_CalcBob: cl_bob 0.02, cl_bobcycle 0.6, cl_bobup 0.5.
-    const CL_BOB = 0.02, CL_BOBCYCLE = 0.6, CL_BOBUP = 0.5;
-    // View roll — literal Quake V_CalcRoll: cl_rollangle 2°, cl_rollspeed 200.
-    const CL_ROLLANGLE = 2.0, CL_ROLLSPEED = 200;
-    // Interior collision bounds, in world (Quake) units — the small geometry
-    // literals × WS. Far wall (Z_FAR) holds the doors; Z_BACK is the recess behind
-    // the spawn; X_LIMIT keeps the player off the side walls.
-    const X_LIMIT = (CW / 2 - 0.5) * WS, Z_BACK = 1.0 * WS, Z_FAR = -(CL - 0.45) * WS, DOOR_HALF = 0.7 * WS;
-
-    let yaw = 0, pitch = 0;                     // radians; yaw 0 faces the doors (-z)
-    const vel = { x: 0, z: 0 };                 // floor-plane velocity (units/sec)
-    const keys = { f: false, b: false, l: false, r: false, run: false };
-    let mxAccum = 0, myAccum = 0;
-    let bobTime = 0, viewRoll = 0;              // V_CalcBob accumulator; current roll (rad)
+    // ── Quake-style first-person controls (ADR 0010) over the contiguous plan ──
+    // Pointer-Lock mouselook + WASD Quake ground physics. Collision is now against
+    // the occupancy grid (ADR 0012): the player walks the whole dungeon freely;
+    // closed corridors are walled off by rubble until their source room is cleared.
+    const qc = _dsQuakeController(camera, { eye: EYE });
     let pointerLocked = false;
-    camera.rotation.order = 'YXZ';
+    let _blockedThisFrame = false;
 
-    function resetView() {
-        yaw = 0; pitch = 0; vel.x = 0; vel.z = 0;
-        mxAccum = 0; myAccum = 0; bobTime = 0; viewRoll = 0;
-        keys.f = keys.b = keys.l = keys.r = keys.run = false;
-        camera.position.set(0, EYE, 0);
-        camera.rotation.set(0, 0, 0);
+    function resetView() { qc.reset(); }
+
+    // Walkability with the player's radius: centre + 4 cardinal probes must all be
+    // on a walkable tile. Camera coords are × WS; the grid is in world-local units.
+    function canStand(wx, wz) {
+        const x = wx / WS, z = wz / WS, r = PLAYER_R;
+        return tileWalkable(x, z) && tileWalkable(x + r, z) && tileWalkable(x - r, z)
+            && tileWalkable(x, z + r) && tileWalkable(x, z - r);
     }
 
-    function selectedDoor() {
-        if (!doorState.length) return null;
-        return doorState[state.faceIdx % doorState.length];
+    // Which room rectangle contains a world point (or null if in a corridor).
+    function roomAt(wx, wz) {
+        const x = wx / WS, z = wz / WS;
+        for (const id in rooms) {
+            const r = rooms[id];
+            if (x >= r.x - r.hw && x <= r.x + r.hw && z >= r.z - r.hd && z <= r.z + r.hd) return id;
+        }
+        return null;
     }
 
-    // Door the player is looking at most directly (smallest yaw difference) —
-    // drives the highlight + label, so with free mouselook the labelled door is
-    // the one in your gaze, not merely the nearest by x.
-    function nearestDoorIdx() {
-        let best = 0, bestDiff = Infinity;
-        for (let i = 0; i < doorState.length; i++) {
-            const d = doorState[i];
-            const yawTo = Math.atan2(-(d.x * WS - camera.position.x), -(d.z * WS - camera.position.z));
-            let diff = Math.abs(yaw - yawTo);
-            while (diff > Math.PI) diff = Math.abs(diff - 2 * Math.PI);
-            if (diff < bestDiff) { bestDiff = diff; best = i; }
+    function nearestClosedGate(wx, wz) {
+        let best = Infinity;
+        for (const c of corridors) {
+            if (c.open) continue;
+            best = Math.min(best, Math.hypot(wx / WS - c.mouthX, wz / WS - c.mouthZ));
         }
         return best;
     }
 
-    // One Quake ground-move step: friction, then accelerate, then integrate and
-    // collide against the corridor. Walking into a door opening enters that node.
+    // One Quake ground-move step with separated-axis collision against the plan.
     function moveStep(dt) {
-        const fwd = (keys.f ? 1 : 0) - (keys.b ? 1 : 0);
-        const strafe = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
-        const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
-        // forward = (-sinY, -cosY); right = (cosY, -sinY)
-        let wx = -sinY * fwd + cosY * strafe;
-        let wz = -cosY * fwd - sinY * strafe;
-        const wlen = Math.hypot(wx, wz);
-        let wishspeed = 0;
-        if (wlen > 0) {
-            wx /= wlen; wz /= wlen;
-            // +speed (Shift) scales wishspeed by cl_movespeedkey, capped at maxspeed.
-            wishspeed = Math.min(keys.run ? MOVE_WALKSPEED * RUN_MULT : MOVE_WALKSPEED, MOVE_MAXSPEED);
-        }
+        const w = qc.wishDir();
+        qc.accelerate(dt, w.wx, w.wz, w.wishspeed);
+        const nx = camera.position.x + qc.vel.x * dt;
+        const nz = camera.position.z + qc.vel.z * dt;
+        _blockedThisFrame = false;
+        const wishing = Math.abs(qc.vel.x) + Math.abs(qc.vel.z) > 1;
+        if (canStand(nx, camera.position.z)) camera.position.x = nx;
+        else { qc.vel.x = 0; _blockedThisFrame = wishing; }
+        if (canStand(camera.position.x, nz)) camera.position.z = nz;
+        else { qc.vel.z = 0; _blockedThisFrame = wishing; }
+        // Bumping a wall next to a still-rocked passage explains why it won't open.
+        if (_blockedThisFrame && nearestClosedGate(camera.position.x, camera.position.z) < 2.6) flashSealed();
+        camera.position.y = EYE + qc.viewBobRoll(dt);
 
-        // PM_Friction
-        const speed = Math.hypot(vel.x, vel.z);
-        if (speed > 0.0001) {
-            const control = speed < MOVE_STOPSPEED ? MOVE_STOPSPEED : speed;
-            const newspeed = Math.max(0, speed - control * MOVE_FRICTION * dt) / speed;
-            vel.x *= newspeed; vel.z *= newspeed;
-        } else { vel.x = 0; vel.z = 0; }
-
-        // PM_Accelerate
-        if (wishspeed > 0) {
-            const add = wishspeed - (vel.x * wx + vel.z * wz);
-            if (add > 0) {
-                const accel = Math.min(MOVE_ACCEL * dt * wishspeed, add);
-                vel.x += accel * wx; vel.z += accel * wz;
-            }
-        }
-
-        let nx = camera.position.x + vel.x * dt;
-        let nz = camera.position.z + vel.z * dt;
-
-        if (nz <= Z_FAR + 0.55 * WS) {
-            let entered = -1;
-            for (let i = 0; i < doorState.length; i++) {
-                if (Math.abs(nx - doorState[i].x * WS) <= DOOR_HALF) { entered = i; break; }
-            }
-            if (entered >= 0) { state.faceIdx = entered; enterDoor(); return; }
-            nz = Z_FAR + 0.55 * WS; vel.z = 0;  // solid wall between doors
-        }
-        if (nz > Z_BACK) { nz = Z_BACK; vel.z = 0; }
-        if (nx < -X_LIMIT) { nx = -X_LIMIT; vel.x = 0; }
-        if (nx >  X_LIMIT) { nx =  X_LIMIT; vel.x = 0; }
-        camera.position.x = nx;
-        camera.position.z = nz;
-
-        // View bob — literal Quake V_CalcBob (view.js): cycle phase advances with
-        // real time (asymmetric via cl_bobup), amplitude = speed × cl_bob, clamped.
-        bobTime += dt;
-        let cycle = (bobTime - Math.floor(bobTime / CL_BOBCYCLE) * CL_BOBCYCLE) / CL_BOBCYCLE;
-        if (cycle < CL_BOBUP) cycle = Math.PI * cycle / CL_BOBUP;
-        else cycle = Math.PI + Math.PI * (cycle - CL_BOBUP) / (1 - CL_BOBUP);
-        const gs = Math.hypot(vel.x, vel.z);
-        let bob = gs * CL_BOB;
-        bob = bob * 0.3 + bob * 0.7 * Math.sin(cycle);
-        bob = Math.max(-7, Math.min(4, bob));
-        camera.position.y = EYE + bob;
-
-        // View roll — direct port of V_CalcRoll: bank into lateral velocity.
-        let side = vel.x * cosY + vel.z * (-sinY);   // dot(velocity, right)
-        const sign = side < 0 ? -1 : 1;
-        side = Math.abs(side);
-        const rollDeg = (side < CL_ROLLSPEED ? side * CL_ROLLANGLE / CL_ROLLSPEED : CL_ROLLANGLE) * sign;
-        viewRoll = -rollDeg * DEG2RAD;   // negative: camera banks toward the strafe
+        // The room we're standing in drives theme / light / motif / commit.
+        const here = roomAt(camera.position.x, camera.position.z);
+        if (here && here !== state.nodeId) enterRoom(here);
     }
 
-    // Begin the walk-through transition for the currently-aligned door.
-    function enterDoor() {
-        const sel = selectedDoor();
-        if (!sel || state.phase !== 'idle') return;
-        yaw = Math.atan2(-(sel.x * WS - camera.position.x), -(sel.z * WS - camera.position.z));
-        moveForward();
-    }
-
-    // ── Enter a node (rebuild doors + tint + room theme) ──────────────────────
-    function enterNode(nodeId) {
+    // ── Occupy a room ─────────────────────────────────────────────────────────
+    // No teardown: reposition the dressing group to this room's centre, re-theme
+    // lights + prop + motif, and commit the lane if this is a fresh available pick.
+    function enterRoom(nodeId) {
         state.nodeId = nodeId;
-        state.faceIdx = 0;
         const n = nodeById(nodeId);
-        rebuildDoors(n?.edges || []);
+        const r = rooms[nodeId];
+        if (r) roomGroup.position.set(r.x, 0, r.z);
         applyRoomTint(n?.type);
         applyRoomTheme(n?.type, nodeId);
+        positionPrompt(n?.type);
         if (_dsAudio) _dsAudio.setRoomMotif(n?.type);
+        maybeCommit(nodeId);
         updateSelection();
+        savePos();
+    }
+    const enterNode = enterRoom;   // legacy alias
+
+    // POST a lane commitment the first time the player physically steps into an
+    // available, uncommitted room; refresh sections from the response (sibling
+    // lanes that just locked drop rubble).
+    let _committing = false;
+    function maybeCommit(nodeId) {
+        const avail = new Set(d.available_node_ids || []);
+        const committed = new Set(d.committed_node_ids || []);
+        const cleared = new Set(d.cleared_node_ids || []);
+        if (_committing || committed.has(nodeId) || cleared.has(nodeId) || !avail.has(nodeId)) return;
+        // Only commit when the player is *physically* inside the room — not when
+        // enterRoom runs to preview a room's dressing from the antechamber.
+        if (roomAt(camera.position.x, camera.position.z) !== nodeId) return;
+        _committing = true;
+        fetch('/api/plugins/the_daily/mark', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                install_id: dsInstallId(), node_id: nodeId, action: 'commit',
+                debug_no_save: !!d.debug_no_save,
+                cleared_node_ids: d.cleared_node_ids || [],
+                committed_node_ids: d.committed_node_ids || [],
+            }),
+        }).then(r => r.text()).then(t => {
+            _committing = false;
+            const res = t ? JSON.parse(t) : {};
+            ['cleared_node_ids', 'available_node_ids', 'locked_node_ids', 'committed_node_ids'].forEach(k => {
+                if (res[k]) d[k] = res[k];
+            });
+            syncSections();
+            updateSelection();
+        }).catch(() => { _committing = false; });
     }
 
-    // ── Selection update (highlight the faced door; no door rebuild) ──────────
+    // ── HUD / affordance refresh (no doors any more) ──────────────────────────
     function updateSelection() {
-        const sel = selectedDoor();
-        const multiExit = doorState.length > 1;
-
-        // Highlight selected door, dim others
-        doorState.forEach((ds, i) => {
-            const isSel = sel && i === (state.faceIdx % doorState.length);
-            const [col, emv] = DOOR_COL[ds.target?.type] || [0x111111, 0x040404];
-            ds.fillM.color.setHex(isSel ? col : 0x1a1a1a);
-            ds.fillM.emissive.setHex(isSel ? emv : 0x040404);
-        });
-
-        if (sel) {
-            const [col] = DOOR_COL[sel.target?.type] || [0x1d4ed8];
-            doorGlow.color.setHex(col);
-            doorGlow.position.set(sel.x * 0.6, 0.4, sel.z * 0.7);
-            doorGlow.visible = true;
-        } else {
-            doorGlow.visible = false;
-        }
-
-        btnFwd.style.opacity   = sel ? '1' : '0.3';
-        btnLeft.style.opacity  = multiExit ? '1' : '0.2';
-        btnRight.style.opacity = multiExit ? '1' : '0.2';
-
-        if (sel?.target) {
-            const fw = sel.target;
-            const icon = NODE_TYPE_ICONS[fw.type] || '●';
-            const lane = fw.lane ? dsLaneLabel(fw.lane) : (fw.type || '');
-            dirLabel.style.display = 'block';
-            dirLabel.innerHTML = `<div style="font-size:1.3rem;margin-bottom:3px;">${icon}</div><div>${esc(lane.toUpperCase())}</div>`;
-        } else {
-            dirLabel.style.display = 'none';
-        }
-
-        const av = getAvailable(), cl = getCleared();
-        interactBtn.style.display = (av.has(state.nodeId) || cl.has(state.nodeId)) ? 'block' : 'none';
-
+        promptArmed = isInteractable();
+        if (!promptArmed) { interactBtn.style.display = 'none'; promptNear = false; }
+        btnFwd.style.opacity = '1';
+        btnLeft.style.opacity = '1';
+        btnRight.style.opacity = '1';
         updateHUD();
         drawMinimap();
+    }
+
+    // Clear the room the player is standing in *in place*: merge the fresh
+    // server-recomputed state into the payload, close any open encounter, and
+    // detonate the rubble blocking this room's exits (ADR 0012). Returns false if
+    // the cleared node isn't the current room (caller does a full rebuild).
+    function clearCurrentRoom(nodeId, newState) {
+        if (!newState || nodeId !== state.nodeId) return false;
+        ['cleared_node_ids', 'available_node_ids', 'locked_node_ids', 'committed_node_ids'].forEach(k => {
+            if (newState[k]) d[k] = newState[k];
+        });
+        if (typeof newState.boss_revealed !== 'undefined') d.boss_revealed = newState.boss_revealed;
+        if (newState.inventory) d.inventory = newState.inventory;
+        if (typeof newState.is_complete !== 'undefined') d.is_complete = newState.is_complete;
+        if (newState.progress) d.progress = newState.progress;
+        if (encActive || state.phase === 'encounter') window._dsDungeonDismiss();
+        syncSections(nodeId);
+        applyRoomTheme(nodeById(nodeId)?.type, nodeId);  // refresh cleared-room dressing
+        updateSelection();
+        savePos();
+        return true;
     }
 
     function updateHUD() {
@@ -7367,32 +5807,554 @@ function _dsBuildDungeon(THREE, container, d) {
         const rs = nodes.map(n => n.row || 0), cs = nodes.map(n => n.col || 0);
         const minR = Math.min(...rs), maxR = Math.max(...rs);
         const minC = Math.min(...cs), maxC = Math.max(...cs);
-        const pad = 12;
+        const pad = 28;
         const nx = n => pad + ((n.col||0) - minC) / Math.max(1, maxC - minC) * (MW - pad*2);
         const ny = n => pad + ((n.row||0) - minR) / Math.max(1, maxR - minR) * (MH - pad*2);
 
         const cl = getCleared(), av = getAvailable();
 
-        mctx.lineWidth = 1;
+        // Edges colored by whether their corridor is actually walkable: open
+        // (rock-gate blown) reads amber, sealed reads dim red — so the map answers
+        // "which way can I go from here?" at a glance, not just the topology.
+        const corridorFor = (aId, bId) => (corridors || []).find(c =>
+            (c.aId === aId && c.bId === bId) || (c.aId === bId && c.bId === aId));
         nodes.forEach(n => (n.edges || []).forEach(tid => {
             const t = nodeById(tid);
             if (!t) return;
-            mctx.strokeStyle = 'rgba(70,70,70,0.7)';
+            const cor = corridorFor(n.id, tid);
+            const open = cor ? cor.open : (cl.has(n.id) || cl.has(tid));
+            mctx.strokeStyle = open ? 'rgba(232,176,90,0.85)' : 'rgba(150,60,55,0.45)';
+            mctx.lineWidth = open ? 6.4 : 4;
             mctx.beginPath(); mctx.moveTo(nx(n), ny(n)); mctx.lineTo(nx(t), ny(t)); mctx.stroke();
+            // Sealed-edge marker
+            if (!open) {
+                mctx.font = '22px monospace';
+                mctx.fillStyle = 'rgba(150,60,55,0.65)';
+                mctx.textAlign = 'center';
+                mctx.textBaseline = 'middle';
+                mctx.fillText('⊗', (nx(n) + nx(t)) / 2, (ny(n) + ny(t)) / 2);
+            }
         }));
+
+        // Current-room inbound highlight — brightens the reachable edges from
+        // the player's standing node so "where can I go from here?" answers
+        // itself without scanning all amber lines.
+        const curN = nodeById(state.nodeId);
+        if (curN) {
+            (curN.edges || []).forEach(tid => {
+                const t = nodeById(tid);
+                if (!t) return;
+                const cor = corridorFor(curN.id, tid);
+                const open = cor ? cor.open : (cl.has(curN.id) || cl.has(tid));
+                if (open) {
+                    mctx.strokeStyle = 'rgba(255,210,120,0.55)';
+                    mctx.lineWidth = 10;
+                    mctx.beginPath(); mctx.moveTo(nx(curN), ny(curN)); mctx.lineTo(nx(t), ny(t)); mctx.stroke();
+                }
+            });
+        }
 
         nodes.forEach(n => {
             const x = nx(n), y = ny(n), isCur = n.id === state.nodeId;
-            mctx.beginPath();
-            mctx.arc(x, y, isCur ? 5 : 3, 0, Math.PI * 2);
-            mctx.fillStyle = isCur ? '#ffd700' : cl.has(n.id) ? '#15803d' : av.has(n.id) ? '#1d4ed8' : '#1c1c1c';
+            const isBoss = n.type === 'boss';
+            const r = isCur ? 20 : isBoss ? 18 : 12;
+            const known = isCur || cl.has(n.id) || av.has(n.id);
+            // Hue = room type; opacity = discovery state (undiscovered rooms dim).
+            mctx.globalAlpha = known ? 1 : 0.34;
+            mctx.beginPath(); mctx.arc(x, y, r, 0, Math.PI * 2);
+            mctx.fillStyle = _dsMapNodeColor(n.type);
             mctx.fill();
-            if (isCur) { mctx.strokeStyle = '#fff'; mctx.lineWidth = 1.5; mctx.stroke(); }
+            mctx.globalAlpha = 1;
+            if (isCur) {                       // current room: pulsing white ring
+                const pulse = state.phase === 'idle' ? 0.55 + 0.45 * Math.sin(performance.now() * 0.004) : 1;
+                mctx.strokeStyle = `rgba(255,255,255,${pulse.toFixed(2)})`; mctx.lineWidth = 6; mctx.stroke();
+            } else if (cl.has(n.id)) {         // cleared: green tick ring
+                mctx.strokeStyle = '#15803d'; mctx.lineWidth = 6; mctx.stroke();
+            } else if (av.has(n.id)) {         // available next step: faint white ring
+                mctx.strokeStyle = 'rgba(255,255,255,0.7)'; mctx.lineWidth = 4; mctx.stroke();
+            }
+            if (isBoss) {                      // boss always gets a red outline landmark
+                mctx.strokeStyle = '#e0484c'; mctx.lineWidth = 6;
+                mctx.beginPath(); mctx.arc(x, y, r + 8, 0, Math.PI * 2); mctx.stroke();
+            }
+
+            // Node type label — abbreviation on discovered nodes, '?' on undiscovered
+            {
+                const abbr = known
+                    ? ({boss:'B',elite:'E',shop:'$',rest:'R',treasure:'T',mystery:'?',choice:'C',event:'V',forced:'F',song:'S'})[n.type] || '?'
+                    : '?';
+                mctx.font = '18px monospace';
+                mctx.fillStyle = isCur ? '#000' : known ? '#ddd' : 'rgba(255,255,255,0.34)';
+                mctx.textAlign = 'center';
+                mctx.textBaseline = 'middle';
+                mctx.fillText(abbr, x, y);
+            }
         });
+
+        // Live player marker (ADR 0012): geometry now matches the DAG, so the
+        // player's world position maps straight onto the minimap's col/row space.
+        if (occ) {
+            const cols = nodes.map(n => n.col || 0);
+            const colMid = (Math.min(...cols) + Math.max(...cols)) / 2;
+            const pcol = camera.position.x / WS / CELL_X + colMid;
+            const prow = -camera.position.z / WS / CELL_Z;
+            const px = nx({ col: pcol }), py = ny({ row: prow });
+            mctx.save();
+            mctx.translate(px, py);
+            mctx.rotate(-qc.yaw);
+            mctx.shadowColor = 'rgba(255,255,255,0.6)';
+            mctx.shadowBlur = 24;
+            mctx.fillStyle = '#ffffff';
+            mctx.beginPath(); mctx.moveTo(0, 20); mctx.lineTo(16, -16); mctx.lineTo(-16, -16); mctx.closePath(); mctx.fill();
+            mctx.shadowColor = 'transparent';
+            mctx.shadowBlur = 0;
+            mctx.restore();
+        }
+    }
+
+    // ── Diegetic encounter surface ────────────────────────────────────────────
+    // Song nodes render their encounter *in the world* on a canvas-textured plane
+    // that materialises in front of the player at the prop, rather than as a DOM
+    // overlay. Buttons are hit-tested with a raycaster against the surface UV —
+    // the same technique the WoF / Shop / Archive rooms use. Rest / treasure / shop
+    // are multi-option, async, stateful flows and still use the docked DOM panel.
+    const DIEGETIC_TYPES = new Set(['forced', 'elite', 'boss', 'choice', 'mystery', 'rest', 'treasure', 'shop']);
+    const encRaycaster = new THREE.Raycaster();
+    const encMouse = new THREE.Vector2();
+    // Layout is authored in a 512×320 coordinate space, but the backing canvas is
+    // supersampled (× ENC_SS) and the texture uses LinearFilter so small text stays
+    // legible when the surface is drawn large on high-DPI displays (NearestFilter +
+    // a 512-wide canvas turned fine text into an unreadable pixel mush).
+    const ENC_W = 512, ENC_H = 320, ENC_SS = 3;
+    const encCanvas = document.createElement('canvas');
+    encCanvas.width = ENC_W * ENC_SS; encCanvas.height = ENC_H * ENC_SS;
+    const encCtx = encCanvas.getContext('2d');
+    const encTex = new THREE.CanvasTexture(encCanvas);
+    encTex.minFilter = encTex.magFilter = THREE.LinearFilter;
+    encTex.generateMipmaps = false;
+    const encMat = new THREE.MeshBasicMaterial({ map: encTex, transparent: true, depthTest: false, side: THREE.DoubleSide });
+    const encMesh = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 1.625), encMat);
+    encMesh.renderOrder = 30;
+    encMesh.visible = false;
+    world.add(encMesh);
+    let encHits = [];        // [{x1,y1,x2,y2, action}] in UV space
+    let encActive = false;   // diegetic encounter currently showing
+    let encNodeId = null;
+    let encData = null;  // async payload for rest/treasure: null=loading, {…}|{error}
+
+    const _encRect = (px, py, w, h, action) =>
+        ({ x1: px / ENC_W, x2: (px + w) / ENC_W, y1: 1 - (py + h) / ENC_H, y2: 1 - py / ENC_H, action });
+    const _encTrim = (s, n) => { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+    // Width-aware trim: shrink to fit `maxPx` using the ctx's current font,
+    // appending an ellipsis only when something was actually dropped. Use this
+    // instead of a fixed char count when horizontal room is known, so strings
+    // fill the available width rather than being clipped at a conservative guess.
+    const _encTrimW = (ctx, s, maxPx) => {
+        s = String(s == null ? '' : s);
+        if (ctx.measureText(s).width <= maxPx) return s;
+        let lo = 0, hi = s.length;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (ctx.measureText(s.slice(0, mid) + '…').width <= maxPx) lo = mid; else hi = mid - 1;
+        }
+        return s.slice(0, lo) + '…';
+    };
+
+    function _encSongOptions(node) {
+        const songMap = Object.fromEntries((d.songs || []).map(s => [s.cf_id, s]));
+        if (node.type === 'choice') return (node.cf_ids || []).map((id, i) => ({ label: `Option ${i + 1}`, song: songMap[id] }));
+        if (node.type === 'mystery') {
+            const pool = node.cf_pool || [];
+            const idx = dsStableIndex(`${dsInstallId()}:${d.date}:${node.id}`, pool.length);
+            return [{ label: 'Mystery revealed', song: songMap[pool[idx]] }];
+        }
+        if (node.type === 'boss') return [{ label: 'Boss', song: songMap[node.cf_id], boss: true }];
+        return [{ label: 'Song', song: songMap[node.cf_id] }];
+    }
+
+    function drawEncounterCanvas() {
+        const ctx = encCtx, W = ENC_W, H = ENC_H;
+        ctx.setTransform(ENC_SS, 0, 0, ENC_SS, 0, 0);  // draw in 512×320 space, render supersampled
+        ctx.clearRect(0, 0, W, H);
+        encHits = [];
+        const node = nodeById(encNodeId);
+        if (!node) return;
+        const [col] = DOOR_COL[node.type] || [0x1d4ed8];
+        const border = '#' + col.toString(16).padStart(6, '0');
+        ctx.fillStyle = 'rgba(6,7,10,0.93)';
+        ctx.fillRect(8, 8, W - 16, H - 16);
+        ctx.lineWidth = 5; ctx.strokeStyle = border;
+        ctx.strokeRect(8, 8, W - 16, H - 16);
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.font = '28px serif';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(NODE_TYPE_ICONS[node.type] || '◇', 26, 52);
+        ctx.font = 'bold 20px monospace'; ctx.fillStyle = '#9aa4b2';
+        ctx.fillText((node.type || '').toUpperCase(), 66, 49);
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(26, 66); ctx.lineTo(W - 26, 66); ctx.stroke();
+
+        if (node.type === 'rest') _encDrawRestBody(ctx, node);
+        else if (node.type === 'treasure') _encDrawTreasureBody(ctx, node);
+        else if (node.type === 'shop') _encDrawShopBody(ctx, node);
+        else _encDrawSongBody(ctx, node);
+        encTex.needsUpdate = true;
+    }
+
+    function _encWrapText(ctx, text, x, y, maxW, lineH, maxLines) {
+        const words = String(text == null ? '' : text).split(/\s+/);
+        let line = '', yy = y, used = 1;
+        for (const w of words) {
+            const test = line ? line + ' ' + w : w;
+            if (ctx.measureText(test).width > maxW && line) {
+                if (used >= maxLines) { ctx.fillText(line + '…', x, yy); return; }
+                ctx.fillText(line, x, yy); yy += lineH; line = w; used++;
+            } else line = test;
+        }
+        if (line) ctx.fillText(line, x, yy);
+    }
+
+    function _encDrawLeaveButton(ctx, label, action) {
+        const W = ENC_W, H = ENC_H;
+        const cbw = 168, cbh = 38, cbx = (W - cbw) / 2, cby = H - cbh - 16;
+        ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(cbx, cby, cbw, cbh);
+        ctx.strokeStyle = 'rgba(255,255,255,0.16)'; ctx.lineWidth = 2; ctx.strokeRect(cbx, cby, cbw, cbh);
+        ctx.fillStyle = '#c2cad6'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
+        ctx.fillText(label, W / 2, cby + cbh / 2 + 5); ctx.textAlign = 'left';
+        encHits.push(_encRect(cbx, cby, cbw, cbh, action));
+    }
+
+    function _encDrawRestBody(ctx, node) {
+        const W = ENC_W, H = ENC_H;
+        ctx.fillStyle = '#7fd6a0'; ctx.font = 'bold 14px monospace';
+        ctx.fillText('LINER NOTES', 38, 98);
+        const data = encData;
+        const isErr = !!(data && data.error);
+        const notes = data == null ? 'Resting…' : isErr ? 'Failed to load rest node.' : (data.notes || 'No notes available.');
+        ctx.fillStyle = isErr ? '#f87171' : '#d4dce8'; ctx.font = '16px monospace';
+        _encWrapText(ctx, notes, 38, 126, W - 76, 23, 4);
+        const canAct = data != null && !isErr;
+        const bw = 210, bh = 44, bx = (W - bw) / 2, by1 = H - bh * 2 - 30;
+        ctx.fillStyle = canAct ? '#2e7d4f' : '#243a30'; ctx.fillRect(bx, by1, bw, bh);
+        ctx.fillStyle = canAct ? '#fff' : '#566'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
+        ctx.fillText('💰 BANK PROGRESS', W / 2, by1 + bh / 2 + 5); ctx.textAlign = 'left';
+        if (canAct) encHits.push(_encRect(bx, by1, bw, bh, () => dsBankProgress(node.id)));
+        _encDrawLeaveButton(ctx, '🏃 SKIP', () => dsClearNode(node.id));
+    }
+
+    const _encTitleCase = s => String(s || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+    // Render any scalar/object/array value to readable text — never "[object Object]".
+    function _encScalar(v) {
+        if (v == null) return '';
+        if (Array.isArray(v)) return v.map(_encScalar).filter(Boolean).join(', ');
+        if (typeof v === 'object') {
+            if (v.title || v.artist) return [v.title, v.artist].filter(Boolean).join(' — ');
+            return Object.values(v).map(_encScalar).filter(Boolean).join(' ');
+        }
+        return String(v);
+    }
+
+    // Treasure peeks all share the {type, ...} shape but differ in payload; format
+    // each into a one-line human summary. Generic fallback skips the redundant
+    // `type` key and stringifies nested values safely.
+    function _encFormatPeek(payload) {
+        if (payload == null) return 'Reward claimed.';
+        if (typeof payload === 'string') return payload;
+        if (typeof payload !== 'object') return String(payload);
+        const songStr = s => [s && s.title, s && s.artist].filter(Boolean).join(' — ') || 'Unknown song';
+        switch (payload.type) {
+            case 'boss_song': {
+                const s = payload.song || {};
+                return `Boss: ${songStr(s)}${s.tuning ? ` (${s.tuning})` : ''}`;
+            }
+            case 'tomorrow_modifier':
+                return `Tomorrow: ${[payload.modifier_icon, payload.modifier_label].filter(Boolean).join(' ')}` +
+                       (payload.day_name ? ` — "${payload.day_name}"` : '');
+            case 'tomorrow_lanes': {
+                const lanes = Object.values(payload.lanes || {});
+                return lanes.length ? `Tomorrow's lanes: ${lanes.join(', ')}` : 'No lane data.';
+            }
+            case 'next_two_days': {
+                const days = (payload.days || []).map(d => `${d.date}: ${d.day_name}`);
+                return days.length ? days.join('   ·   ') : 'No upcoming data.';
+            }
+            case 'pool_glimpse': {
+                const songs = (payload.songs || []).map(songStr);
+                return songs.length ? songs.join(',  ') : 'No songs.';
+            }
+            case 'mystery_event':
+                return payload.hint || 'A special event awaits.';
+            default:
+                return Object.entries(payload)
+                    .filter(([k]) => k !== 'type')
+                    .map(([k, v]) => `${k}: ${_encScalar(v)}`)
+                    .join('   ·   ') || 'Reward claimed.';
+        }
+    }
+
+    function _encDrawTreasureBody(ctx, node) {
+        const W = ENC_W;
+        const data = encData;
+        if (data == null) {
+            ctx.fillStyle = '#d4dce8'; ctx.font = '16px monospace';
+            ctx.fillText('Examining the hoard…', 38, 126);
+            return;
+        }
+        if (data.error) {
+            ctx.fillStyle = '#f87171'; ctx.font = '16px monospace';
+            ctx.fillText('Failed to load treasure.', 38, 126);
+            _encDrawLeaveButton(ctx, '✕ LEAVE', () => window._dsDungeonDismiss());
+            return;
+        }
+        if (data.chosen) {
+            ctx.fillStyle = '#f0c14b'; ctx.font = 'bold 14px monospace';
+            ctx.fillText('CLAIMED', 38, 98);
+            const chosenLabel = (data.options || []).find(o => o.type === data.chosen)?.label
+                || _encTitleCase(data.chosen);
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 23px monospace';
+            ctx.fillText(_encTrim(String(chosenLabel), 28), 38, 130);
+            let summary = '';
+            try { summary = _encFormatPeek(data.payload); } catch (e) { /* ignore */ }
+            ctx.fillStyle = '#d2b45a'; ctx.font = '15px monospace';
+            _encWrapText(ctx, summary || 'Reward claimed.', 38, 160, W - 76, 22, 4);
+            _encDrawLeaveButton(ctx, '🏃 LEAVE', () => dsClearNode(node.id));
+            return;
+        }
+        ctx.fillStyle = '#f0c14b'; ctx.font = 'bold 14px monospace';
+        ctx.fillText('CHOOSE A GLIMPSE', 38, 98);
+        const opts = (data.options || []).slice(0, 3);
+        const bw = W - 76, bh = 46;
+        let y = 114;
+        opts.forEach((opt) => {
+            ctx.fillStyle = 'rgba(240,193,75,0.10)'; ctx.fillRect(38, y, bw, bh);
+            ctx.strokeStyle = 'rgba(240,193,75,0.45)'; ctx.lineWidth = 2; ctx.strokeRect(38, y, bw, bh);
+            ctx.fillStyle = '#f4e0a0'; ctx.font = 'bold 17px monospace'; ctx.textAlign = 'center';
+            ctx.fillText(_encTrim(opt.label || opt.type, 34), W / 2, y + bh / 2 + 6); ctx.textAlign = 'left';
+            encHits.push(_encRect(38, y, bw, bh, () => _encChooseTreasure(node.id, opt.type)));
+            y += bh + 10;
+        });
+        _encDrawLeaveButton(ctx, '🏃 SKIP', () => dsClearNode(node.id));
+    }
+
+    function _loadTreasureEncounter(nodeId) {
+        fetch(dsApiUrl(`/api/plugins/the_daily/treasure/${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } })
+            .then(r => r.text())
+            .then(t => { if (!encActive || encNodeId !== nodeId) return; encData = t ? JSON.parse(t) : {}; drawEncounterCanvas(); })
+            .catch(() => { if (!encActive || encNodeId !== nodeId) return; encData = { error: true }; drawEncounterCanvas(); });
+    }
+
+    function _encChooseTreasure(nodeId, type) {
+        encData = null; drawEncounterCanvas();  // "examining…" while the choice posts
+        fetch(dsApiUrl(`/api/plugins/the_daily/treasure/${encodeURIComponent(nodeId)}`), {
+            method: 'POST',
+            headers: { 'X-Install-Id': dsInstallId(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ peek_type: type }),
+        })
+            .then(() => { if (!encActive || encNodeId !== nodeId) return; _loadTreasureEncounter(nodeId); })
+            .catch(() => { if (!encActive || encNodeId !== nodeId) return; encData = { error: true }; drawEncounterCanvas(); });
+    }
+
+    function _encDrawShopBody(ctx, node) {
+        const W = ENC_W, H = ENC_H;
+        const data = encData;
+        if (data == null) {
+            ctx.fillStyle = '#d4dce8'; ctx.font = '16px monospace';
+            ctx.fillText('Browsing the stall…', 38, 126);
+            return;
+        }
+        if (data.error) {
+            ctx.fillStyle = '#f87171'; ctx.font = '16px monospace';
+            _encWrapText(ctx, String(data.error), 38, 126, W - 76, 23, 3);
+            _encDrawLeaveButton(ctx, '✕ LEAVE', () => window._dsDungeonDismiss());
+            return;
+        }
+        ctx.fillStyle = '#f0c14b'; ctx.font = 'bold 14px monospace';
+        ctx.fillText("TODAY'S OFFER", 38, 98);
+        ctx.textAlign = 'right'; ctx.fillStyle = '#e8c040'; ctx.font = 'bold 16px monospace';
+        ctx.fillText(`🪙 ${data.tokens != null ? data.tokens : 0}`, W - 38, 98); ctx.textAlign = 'left';
+        const offer = new Set((data.discount && data.discount.items) || []);
+        let items = (data.items || []).filter(i => offer.has(i.id));
+        if (!items.length) items = (data.items || []);
+        items = items.slice(0, 2);
+        const rowH = 74;
+        let y = 110;
+        items.forEach((item) => {
+            ctx.fillStyle = 'rgba(255,255,255,0.04)'; ctx.fillRect(26, y, W - 52, rowH - 8);
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 18px monospace';
+            ctx.fillText(_encTrim(item.name, 28), 38, y + 26);
+            ctx.fillStyle = '#a3adbd'; ctx.font = '13px monospace';
+            ctx.fillText(_encTrim(item.description || item.type || '', 42), 38, y + 46);
+            const cost = item.discounted_cost != null ? item.discounted_cost : item.cost;
+            ctx.fillStyle = '#e8c040'; ctx.font = 'bold 15px monospace';
+            ctx.fillText(`🪙 ${cost}`, 38, y + 64);
+            const owned = item.owned, afford = item.affordable, busy = data._buying;
+            const bw = 140, bh = 46, bx = W - 26 - bw - 10, by = y + (rowH - 8) / 2 - bh / 2;
+            let label, fill, action;
+            if (owned) { label = 'OWNED'; fill = '#243a30'; action = null; }
+            else if (busy) { label = '…'; fill = '#2a2a2a'; action = null; }
+            else if (afford) { label = 'BUY'; fill = '#2f6fc2'; action = () => _encBuyShop(node.id, item.id); }
+            else { label = 'NEED 🪙'; fill = '#3a2a2a'; action = null; }
+            ctx.fillStyle = fill; ctx.fillRect(bx, by, bw, bh);
+            ctx.fillStyle = action ? '#fff' : '#8a93a3'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
+            ctx.fillText(label, bx + bw / 2, by + bh / 2 + 6); ctx.textAlign = 'left';
+            if (action) encHits.push(_encRect(bx, by, bw, bh, action));
+            y += rowH;
+        });
+        if (data._err) {
+            ctx.fillStyle = '#f87171'; ctx.font = '13px monospace'; ctx.textAlign = 'center';
+            ctx.fillText(_encTrim(data._err, 46), W / 2, H - 66); ctx.textAlign = 'left';
+        }
+        _encDrawLeaveButton(ctx, '🏃 LEAVE', () => dsClearNode(node.id));
+    }
+
+    function _loadShopEncounter(nodeId) {
+        fetch(dsApiUrl(`/api/plugins/the_daily/shop?node_id=${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } })
+            .then(r => r.text())
+            .then(t => { if (!encActive || encNodeId !== nodeId) return; encData = t ? JSON.parse(t) : {}; drawEncounterCanvas(); })
+            .catch(() => { if (!encActive || encNodeId !== nodeId) return; encData = { error: 'Failed to load shop.' }; drawEncounterCanvas(); });
+    }
+
+    function _encBuyShop(nodeId, itemId) {
+        if (encData) { encData._buying = true; encData._err = null; }
+        drawEncounterCanvas();
+        fetch(dsApiUrl('/api/plugins/the_daily/shop/buy'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Install-Id': dsInstallId() },
+            body: JSON.stringify({ item_id: itemId, node_id: nodeId }),
+        })
+            .then(r => r.text())
+            .then(t => {
+                if (!encActive || encNodeId !== nodeId) return;
+                const res = t ? JSON.parse(t) : {};
+                if (res.error) { if (encData) { encData._buying = false; encData._err = res.error; } drawEncounterCanvas(); return; }
+                if (res.effect && res.effect.rerolled) { dsLoadToday(); return; }
+                _loadShopEncounter(nodeId);  // refresh items + token balance
+            })
+            .catch(() => { if (!encActive || encNodeId !== nodeId) return; if (encData) { encData._buying = false; encData._err = 'Purchase failed.'; } drawEncounterCanvas(); });
+    }
+
+    function _encDrawSongBody(ctx, node) {
+        const W = ENC_W, H = ENC_H;
+        const cleared = new Set(d.cleared_node_ids || []);
+        const available = new Set(d.available_node_ids || []);
+        const canPlay = available.has(encNodeId) || cleared.has(encNodeId);
+        const opts = _encSongOptions(node).slice(0, 3);
+        const rowH = opts.length > 1 ? 80 : 96;
+        let y = 84;
+        opts.forEach((o) => {
+            const song = o.song;
+            ctx.fillStyle = 'rgba(255,255,255,0.04)';
+            ctx.fillRect(26, y, W - 52, rowH - 12);
+            if (!song) {
+                ctx.fillStyle = '#f87171'; ctx.font = '17px monospace';
+                ctx.fillText('Song missing from payload.', 38, y + 40);
+            } else {
+                const title = (o.boss && !d.boss_revealed) ? '???' : (song.title || '');
+                const local = song.has_locally && song.local_filename;
+                const bw = 138, bh = 46, bx = W - 26 - bw - 10, by = y + (rowH - 10) / 2 - bh / 2;
+                ctx.fillStyle = '#9fb4ff'; ctx.font = 'bold 14px monospace';
+                ctx.fillText(_encTrim(o.label.toUpperCase(), 30), 38, y + 26);
+                // Title shares the button's vertical band, so trim it to the gap
+                // left of the button; the meta line sits below the button and gets
+                // the full panel width.
+                ctx.fillStyle = '#fff'; ctx.font = 'bold 24px monospace';
+                ctx.fillText(_encTrimW(ctx, title, bx - 38 - 12), 38, y + 54);
+                ctx.fillStyle = '#b6c0ce'; ctx.font = '16px monospace';
+                const meta = `${song.artist || ''} · ${song.tuning || '—'}${song.duration ? ' · ' + dsFmtDuration(song.duration) : ''}`;
+                ctx.fillText(_encTrimW(ctx, meta, W - 26 - 38), 38, y + 78);
+                let label, fill, action;
+                if (local && canPlay) { label = '▶ PLAY'; fill = '#2f6fc2'; action = () => dsPlayMapNode(node.id, song.cf_id, song.local_filename); }
+                else if (!local) { label = 'GET'; fill = '#2f6fc2'; action = () => dsAcquire(song.cf_id, node.id, song.cf_url, null); }
+                else { label = 'LOCKED'; fill = '#26262a'; action = null; }
+                ctx.fillStyle = fill; ctx.fillRect(bx, by, bw, bh);
+                ctx.fillStyle = action ? '#fff' : '#8a93a3'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
+                ctx.fillText(label, bx + bw / 2, by + bh / 2 + 6); ctx.textAlign = 'left';
+                if (action) encHits.push(_encRect(bx, by, bw, bh, action));
+            }
+            y += rowH;
+        });
+        _encDrawLeaveButton(ctx, '✕ LEAVE', () => window._dsDungeonDismiss());
+    }
+
+    function _loadRestEncounter(nodeId) {
+        fetch(dsApiUrl(`/api/plugins/the_daily/rest/${encodeURIComponent(nodeId)}`),
+            { headers: { 'X-Install-Id': dsInstallId() } })
+            .then(r => r.text())
+            .then(t => {
+                if (!encActive || encNodeId !== nodeId) return;
+                encData = t ? JSON.parse(t) : {};
+                drawEncounterCanvas();
+            })
+            .catch(() => {
+                if (!encActive || encNodeId !== nodeId) return;
+                encData = { error: true };
+                drawEncounterCanvas();
+            });
+    }
+
+    function showEncounterDiegetic(nodeId) {
+        const node = nodeById(nodeId);
+        encNodeId = nodeId;
+        encActive = true;
+        encData = null;
+        state.phase = 'encounter';
+        // Release the mouse so the OS cursor can click the in-world surface.
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+        // Materialise the panel a short distance ahead of the player's view, at
+        // eye level, facing them. Placed once on open and left static (the camera
+        // is frozen during the encounter) so it reads as a thing in the world.
+        const fwdX = -Math.sin(qc.yaw), fwdZ = -Math.cos(qc.yaw), dist = 2.4;
+        encMesh.position.set(camera.position.x / WS + fwdX * dist, CY + 0.12, camera.position.z / WS + fwdZ * dist);
+        encMesh.rotation.set(0, qc.yaw, 0);
+        encMesh.visible = true;
+        drawEncounterCanvas();
+        // Rest/treasure/shop nodes load their state asynchronously, then redraw.
+        if (node && node.type === 'rest') _loadRestEncounter(nodeId);
+        else if (node && node.type === 'treasure') _loadTreasureEncounter(nodeId);
+        else if (node && node.type === 'shop') _loadShopEncounter(nodeId);
+    }
+
+    // ── Face-tween (Skyrim-style camera turn) ──────────────────────────────────
+    function startFaceTween(nodeId) {
+        const n = nodeById(nodeId);
+        const a = n ? INTERACT_ANCHOR[n.type] : null;
+        if (!a) { showEncounter(nodeId); return; }
+        // Prop world position (roomGroup + anchor, scaled by WS).
+        const pw = (roomGroup.position.x + a.x) * WS;
+        const pz = (roomGroup.position.z + a.z) * WS;
+        const cx = camera.position.x, cz = camera.position.z;
+        // Target yaw (shortest-path wrapped).
+        const rawYaw = Math.atan2(cx - pw, cz - pz);
+        let dy = rawYaw - qc.yaw;
+        while (dy > Math.PI) dy -= 2 * Math.PI;
+        while (dy < -Math.PI) dy += 2 * Math.PI;
+        faceStartYaw = qc.yaw;
+        faceTargetYaw = qc.yaw + dy;
+        // Pitch to center the encounter panel both x and y. The panel always
+        // spawns at local Y = CY + 0.12 (slightly above eye level), at a fixed
+        // distance of 2.4 local units ahead of the camera. Compute the angle so
+        // the panel lands in the middle of the view vertically.
+        const panelWorldY = (CY + 0.12) * WS;
+        const encDist = 2.4 * WS;
+        const rawPitch = -Math.atan2(panelWorldY - camera.position.y, encDist);
+        const PITCH_LIMIT = 80 * Math.PI / 180;
+        faceStartPitch = qc.pitch;
+        faceTargetPitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, rawPitch));
+        faceTween = 0;
+        state.phase = 'facing';
+        // Clear any accumulated mouse deltas so the view doesn't snap on return.
+        while (qc.mxAccum.length) qc.mxAccum.shift();
+        while (qc.myAccum.length) qc.myAccum.shift();
     }
 
     // ── Encounter ─────────────────────────────────────────────────────────────
     function showEncounter(nodeId) {
+        const route = nodeById(nodeId);
+        // Song + rest nodes render in-world; treasure/shop use the docked DOM panel.
+        if (route && DIEGETIC_TYPES.has(route.type)) { showEncounterDiegetic(nodeId); return; }
         state.phase = 'encounter';
         // Release the mouse so the DOM encounter panel is clickable.
         if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
@@ -7419,275 +6381,379 @@ function _dsBuildDungeon(THREE, container, d) {
 
     window._dsDungeonDismiss = function () {
         encounterEl.style.display = 'none';
+        encMesh.visible = false;
+        encActive = false;
+        encNodeId = null;
         state.phase = 'idle';
         updateSelection();
     };
 
-    // ── Movement ──────────────────────────────────────────────────────────────
-    function moveForward() {
-        if (state.phase !== 'idle') return;
-        const sel = selectedDoor();
-        if (!sel) return;
-        state.nextId = sel.edge;
-        state.moveStartX = camera.position.x;
-        state.moveStartZ = camera.position.z;
-        state.moveTargetX = sel.x * WS;        // door coords are local; camera is world
-        state.moveTargetZ = sel.z * WS;
-        state.phase = 'moving';
-        state.moveTween = 0;
-        state._lastStep = -1;
-    }
-
     // ── RAF loop ──────────────────────────────────────────────────────────────
     const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
     let prevTime = performance.now();
+
+    // Live diagnostics for the Quake-feel tuning workflow (and the headless
+    // harness, which can read this instead of eyeballing screenshots). Lightweight
+    // — renderer.info is already tracked by three; the rest are cheap reads. Lives
+    // on window so it's inspectable from the console; nulled on destroy.
+    const diag = { fps: 0, dt: 0, _acc: 0, _n: 0, phase: 'idle', node: null, sealed: true,
+        yaw: 0, pitch: 0, speed: 0, vel: { x: 0, z: 0 }, pos: { x: 0, y: 0, z: 0 },
+        keys: null, doors: 0, tris: 0, calls: 0 };
+    window.__DS_DUNGEON_DIAG__ = diag;
 
     function loop(now) {
         state.rafId = requestAnimationFrame(loop);
         const dt = Math.min((now - prevTime) / 1000, 0.1);
         prevTime = now;
 
-        const flicker = Math.sin(now * 0.0023) * 0.4 + Math.sin(now * 0.0071) * 0.2;
+        // Keep the warm follow-lamp on the camera (positions are world-local; the
+        // world group applies × WS, the camera is in world units).
+        playerLight.position.set(camera.position.x / WS, camera.position.y / WS + 0.4, camera.position.z / WS);
+
+        // Quake 10 Hz lightstyle flicker — choppy stepped fire, not a smooth
+        // sine. Two desynced phases so the torches never pulse in lockstep.
+        const ls1 = _dsSampleLightstyle('fire', now, 0);
+        const ls2 = _dsSampleLightstyle('fire', now, 7.3);
         if (roomProp && roomProp._altarGlow) {
-            // Mystery room: faint purple torches + slow ethereal altar pulse
-            torch1.intensity = 0.22 + Math.abs(flicker) * 0.08;
-            torch2.intensity = 0.16 + Math.abs(flicker) * 0.06;
+            // Mystery room: faint candle-sputter purple torches + ethereal pulse
+            torch1.intensity = 0.16 + _dsSampleLightstyle('candle', now, 0) * 0.12;
+            torch2.intensity = 0.12 + _dsSampleLightstyle('candle', now, 5) * 0.10;
             roomProp._altarGlow.intensity = 1.0 + Math.sin(now * 0.0008) * 0.4 + Math.sin(now * 0.0031) * 0.15;
         } else if (!campfireLight) {
-            torch1.intensity = 2.0 + flicker;
-            torch2.intensity = 1.6 + flicker * 0.7;
+            torch1.intensity = 2.0 * (0.74 + ls1 * 0.30);
+            torch2.intensity = 1.6 * (0.74 + ls2 * 0.30);
         }
         if (campfireLight) {
-            const fireFlicker = Math.sin(now * 0.0031) * 0.7 + Math.sin(now * 0.0089) * 0.4 + Math.sin(now * 0.0163) * 0.2;
-            campfireLight.intensity = 2.6 + fireFlicker;
+            // Busier fire-style flicker for the campfire than the wall torches.
+            campfireLight.intensity = 2.6 * (0.72 + _dsSampleLightstyle('fire', now, 3.1) * 0.34);
+        }
+        // Animate the visible torch fires (corridor themes only). Flame body
+        // flickers in scale + tints to its torch's colour; embers drift upward.
+        for (let fi = 0; fi < torchFlames.length; fi++) {
+            const fl = torchFlames[fi];
+            const tl = fi === 0 ? torch1 : torch2;
+            const lit = flamesVisible && tl.intensity > 0.05;
+            if (fl.visible !== lit) fl.visible = lit;
+            if (!lit) continue;
+            const sy = 0.8 + (fi === 0 ? ls1 : ls2) * 0.28;
+            fl._core.scale.set(0.92 + Math.sin(now * 0.02 + fi) * 0.12, sy, 0.92 + Math.cos(now * 0.017 + fi) * 0.12);
+            fl._tip.scale.set(0.9, sy * 1.15, 0.9);
+            fl._core.material.color.copy(tl.color);
+            fl._tip.material.color.copy(tl.color).lerp(_WHITE, 0.55);
+            fl._embers.material.color.copy(tl.color);
+            const ep = fl._embers.geometry.attributes.position, arr = ep.array, ev = fl._emberVel;
+            for (let i = 0; i < ev.length; i++) {
+                let y = arr[i*3+1] + ev[i] * dt;
+                if (y > 1.0) { y = 0; arr[i*3] = (Math.random()-0.5)*0.14; arr[i*3+2] = (Math.random()-0.5)*0.14; }
+                arr[i*3+1] = y;
+            }
+            ep.needsUpdate = true;
         }
 
         if (state.phase === 'idle') {
-            // Apply accumulated Pointer-Lock mouse deltas to view angles (Quake).
-            if (mxAccum !== 0 || myAccum !== 0) {
-                yaw   -= mxAccum * LOOK_SENS;
-                pitch -= myAccum * LOOK_SENS;
-                if (pitch >  PITCH_MAX) pitch =  PITCH_MAX;
-                if (pitch < -PITCH_MAX) pitch = -PITCH_MAX;
-                mxAccum = 0; myAccum = 0;
+            qc.applyLook();   // consume accumulated Pointer-Lock mouse deltas
+            moveStep(dt);     // free walk + occupancy collision + room detection
+            // Footsteps while actually moving across the plan.
+            const spd = Math.hypot(qc.vel.x, qc.vel.z);
+            if (spd > 30) {
+                state._stepAcc = (state._stepAcc || 0) + spd * dt;
+                if (state._stepAcc > 220) { state._stepAcc = 0; if (_dsAudio) _dsAudio.playFootstep(0.5); }
             }
-            moveStep(dt);   // may transition to 'moving' when a doorway is entered
-            // Highlight whichever door the player is lined up with.
-            if (state.phase === 'idle' && doorState.length) {
-                const ni = nearestDoorIdx();
-                if (ni !== (state.faceIdx % doorState.length)) { state.faceIdx = ni; updateSelection(); }
-                // The dir label is screen-pinned, so only reveal it while the
-                // player is actually looking toward that door (free mouselook).
-                const sel = doorState[state.faceIdx % doorState.length];
-                if (sel && dirLabel.style.display !== 'none') {
-                    const yawToDoor = Math.atan2(-(sel.x - camera.position.x), -(sel.z - camera.position.z));
-                    let diff = yaw - yawToDoor;
-                    while (diff >  Math.PI) diff -= 2 * Math.PI;
-                    while (diff < -Math.PI) diff += 2 * Math.PI;
-                    dirLabel.style.opacity = Math.abs(diff) < 0.5 ? '1' : '0';
+            // In-world prop interaction: billboard faces the player, lights up and
+            // arms Enter once you've walked into the prop's zone.
+            if (promptMesh.visible) {
+                // Yaw-billboard: prompt's front face turns to the camera. The mesh
+                // is under roomGroup (at the occupied room's centre), so its world
+                // xz is (roomGroup.position + local) × WS.
+                const mwx = (roomGroup.position.x + promptMesh.position.x) * WS;
+                const mwz = (roomGroup.position.z + promptMesh.position.z) * WS;
+                promptMesh.rotation.y = Math.atan2(camera.position.x - mwx, camera.position.z - mwz);
+                const near = promptArmed && isNearProp();
+                if (near !== promptNear) {
+                    promptNear = near;
+                    drawPromptCanvas(near);
+                    interactBtn.style.display = near ? 'block' : 'none';
                 }
+                // Attract pulse while armed but not yet reached; steady once near.
+                promptMat.opacity = !promptArmed ? 0.5
+                    : promptNear ? 1
+                    : 0.78 + Math.sin(now * 0.005) * 0.18;
             }
-        } else if (state.phase === 'moving') {
-            // Walk-through transition: ~1.4s glide to the chosen door, then the
-            // encounter overlay covers the canvas while the new room is built.
-            state.moveTween = Math.min(state.moveTween + dt / 1.4, 1);
-            const t = easeInOutCubic(state.moveTween);
-            camera.position.x = state.moveStartX + (state.moveTargetX - state.moveStartX) * t;
-            camera.position.z = state.moveStartZ + (state.moveTargetZ - state.moveStartZ) * t;
-            camera.position.y = EYE + Math.sin(t * Math.PI * 4) * 1.3;
-            var stepIdx = Math.floor(state.moveTween * 4);
-            if (stepIdx > (state._lastStep || -1)) {
-                state._lastStep = stepIdx;
-                if (_dsAudio) _dsAudio.playFootstep(0.5 + (stepIdx / 4) * 0.3);
-            }
-            if (state.moveTween >= 1) {
-                state.phase = 'encounter';
-                if (_dsAudio) _dsAudio.playDoorOpen();
-                if (_dsAudio) _dsAudio.setRoomMotif(nodeById(state.nextId)?.type);
-                showEncounter(state.nextId);
-                enterNode(state.nextId);
-                state.nextId = null;
-                resetView();
-                savePos();
-            }
+        } else if (state.phase === 'facing') {
+            faceTween = Math.min(faceTween + dt / 0.35, 1);
+            const t = easeInOutCubic(faceTween);
+            qc.yaw = faceStartYaw + (faceTargetYaw - faceStartYaw) * t;
+            qc.pitch = faceStartPitch + (faceTargetPitch - faceStartPitch) * t;
+            if (faceTween >= 1) showEncounter(state.nodeId);
         }
 
+        tickExplosions(dt);  // advance any in-flight rubble detonations
+
         // Roll only applies to free movement; scripted walk/encounter stay level.
-        camera.rotation.set(pitch, yaw, state.phase === 'idle' ? viewRoll : 0);
+        // Detonation camera-shake: decaying random jitter layered on the view
+        // angles. Purely visual (rotation is rebuilt from qc each frame, so this
+        // never corrupts collision/position). ~6 Hz settle.
+        camShake = Math.max(0, camShake - dt * 0.14);
+        const shP = (Math.random() - 0.5) * camShake;
+        const shY = (Math.random() - 0.5) * camShake;
+        const shR = (Math.random() - 0.5) * camShake * 1.6;
+        camera.rotation.set(qc.pitch + shP, qc.yaw + shY, (state.phase === 'idle' ? qc.viewRoll : 0) + shR);
         renderer.render(scene, camera);
+
+        // ── Diagnostics snapshot (post-render so renderer.info is current) ──
+        diag._acc += dt; diag._n++;
+        if (diag._acc >= 0.5) { diag.fps = Math.round(diag._n / diag._acc); diag._acc = 0; diag._n = 0; }
+        diag.dt = +(dt * 1000).toFixed(1);          // ms
+        diag.phase = state.phase;
+        diag.node = state.nodeId;
+        diag.sealed = !currentCleared();
+        diag.yaw = +qc.yaw.toFixed(3); diag.pitch = +qc.pitch.toFixed(3);
+        diag.speed = Math.round(Math.hypot(qc.vel.x, qc.vel.z));
+        diag.vel = { x: Math.round(qc.vel.x), z: Math.round(qc.vel.z) };
+        diag.pos = { x: Math.round(camera.position.x), y: Math.round(camera.position.y), z: Math.round(camera.position.z) };
+        diag.keys = qc.keys;
+        diag.doors = corridors.filter(c => !c.open).length;   // rocked passages remaining
+        // Real scene complexity, captured before the post-FX quad reset info (see
+        // _dsInstallPostFx). Falls back to live info if the post pass isn't active.
+        const _si = renderer.__dsSceneInfo;
+        diag.tris = _si ? _si.triangles : renderer.info.render.triangles;
+        diag.calls = _si ? _si.calls : renderer.info.render.calls;
+
+        // Throttled minimap refresh (~8 fps) — keeps the pulse alive while standing still.
+        const _mmLast = state._lastMinimapDraw || 0;
+        if (now - _mmLast > 120) {
+            state._lastMinimapDraw = now;
+            drawMinimap();
+        }
     }
 
     // ── Input (Quake controls) ──────────────────────────────────────────────────
     // WASD / arrows move (mouse turns), so left/right strafe rather than cycle.
-    function setMoveKey(e, down) {
-        switch (e.key) {
-            case 'w': case 'W': case 'ArrowUp':    keys.f = down; return true;
-            case 's': case 'S': case 'ArrowDown':  keys.b = down; return true;
-            case 'a': case 'A': case 'ArrowLeft':  keys.l = down; return true;
-            case 'd': case 'D': case 'ArrowRight': keys.r = down; return true;
-            case 'Shift': keys.run = down; return true;   // +speed (run)
-        }
-        return false;
-    }
+    const setMoveKey = (e, down) => qc.setMoveKey(e, down);
     const onKey = (e) => {
         if (_dsAudio) _dsAudio.init();
         if (state.phase === 'encounter') {
             if (e.key === 'Escape') { window._dsDungeonDismiss(); e.preventDefault(); }
             return;
         }
+        if (state.phase === 'facing') {
+            if (e.key === 'Escape') { state.phase = 'idle'; e.preventDefault(); }
+            return;
+        }
         if (e.key === 'Escape') {
             if (pointerLocked && document.exitPointerLock) document.exitPointerLock();
             _dsShowPauseMenu(d); e.preventDefault(); return;
         }
-        // Interact with the current room (open its encounter) — only when offered.
+        // Interact with the current room's prop — only when standing at it.
         if ((e.key === 'Enter' || e.key === 'e' || e.key === 'E') &&
-            state.phase === 'idle' && interactBtn.style.display !== 'none') {
-            showEncounter(state.nodeId); e.preventDefault(); return;
+            state.phase === 'idle' && promptArmed && promptNear) {
+            startFaceTween(state.nodeId); e.preventDefault(); return;
         }
         if (setMoveKey(e, true)) { hideHint(); e.preventDefault(); }
     };
     const onKeyUp = (e) => { if (setMoveKey(e, false)) e.preventDefault(); };
     const onMouseMove = (e) => {
         if (!pointerLocked || state.phase !== 'idle') return;
-        mxAccum += e.movementX || 0;
-        myAccum += e.movementY || 0;
+        qc.addMouse(e.movementX, e.movementY);
     };
     const onPointerLockChange = () => {
         pointerLocked = (document.pointerLockElement === canvas);
-        if (pointerLocked) hideHint();
+        if (pointerLocked) { hideHint(); dunReticle.classList.add('ds-reticle-on'); }
+        else { dunReticle.classList.remove('ds-reticle-on'); }
     };
-    const onBlur = () => { keys.f = keys.b = keys.l = keys.r = keys.run = false; };
+    const onBlur = () => { qc.clearKeys(); };
     window.addEventListener('keydown', onKey);
     window.addEventListener('keyup', onKeyUp);
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('pointerlockchange', onPointerLockChange);
     window.addEventListener('blur', onBlur);
-    canvas.addEventListener('click', () => {
+    canvas.addEventListener('click', (e) => {
         if (_dsAudio) _dsAudio.init();
+        // While a diegetic encounter is open, a click hit-tests its in-world
+        // buttons via the raycaster instead of (re)acquiring pointer lock.
+        if (encActive && encMesh.visible) {
+            const rect = canvas.getBoundingClientRect();
+            encMouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            encMouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            encRaycaster.setFromCamera(encMouse, camera);
+            const hits = encRaycaster.intersectObject(encMesh);
+            if (hits.length && hits[0].uv) {
+                const ux = hits[0].uv.x, uy = hits[0].uv.y;
+                for (const h of encHits) {
+                    if (ux >= h.x1 && ux <= h.x2 && uy >= h.y1 && uy <= h.y2) { h.action(); return; }
+                }
+            }
+            return;
+        }
         if (state.phase === 'idle' && !pointerLocked && canvas.requestPointerLock) canvas.requestPointerLock();
     });
 
     // ── Public API ────────────────────────────────────────────────────────────
-    function start() {
-        const hasExits = id => { const n = nodeById(id); return n && n.edges && n.edges.length > 0; };
-
-        if (map.shape === 'sts' && !localStorage.getItem('ds_dun_node_' + d.date)) {
-            const cl = getCleared();
-            const committed = new Set(d.committed_node_ids || []);
-            if (!cl.size && !committed.size) {
-                // Fresh STS: run the RAF loop first so the corridor renders behind the picker
-                enterNode(state.nodeId);
-                resetView();
-                prevTime = performance.now();
-                state.rafId = requestAnimationFrame(loop);
-                showLanePicker();
-                return;
-            }
-            const frontier = [...map.nodes].reverse().find(n => cl.has(n.id) && hasExits(n.id));
-            if (frontier) { state.nodeId = frontier.id; savePos(); }
-            else {
-                const row0committed = map.nodes.find(n => n.row === 0 && committed.has(n.id));
-                if (row0committed) { state.nodeId = row0committed.id; savePos(); }
-            }
+    // Pick the world spawn point: the saved coordinate if any, else the antechamber
+    // in front of the entrance rooms (so the player walks into row 0 themselves).
+    function spawnPoint() {
+        try {
+            const saved = JSON.parse(localStorage.getItem('ds_dun_pos_' + d.date) || 'null');
+            if (saved && typeof saved.x === 'number') return { x: saved.x, z: saved.z };
+        } catch (e) {}
+        if (antechamber) {
+            return { x: ((antechamber.x0 + antechamber.x1) / 2) * WS, z: ((antechamber.z0 + antechamber.z1) / 2) * WS };
         }
-
-        if (!hasExits(state.nodeId)) {
-            // Dead-end saved pos — back up to last cleared node with exits, or map.start
-            const cl = getCleared();
-            const frontier = [...map.nodes].reverse().find(n => cl.has(n.id) && hasExits(n.id));
-            state.nodeId = frontier?.id || map.start;
-            savePos();
-        }
-        enterNode(state.nodeId);
-        resetView();
-        prevTime = performance.now();
-        state.rafId = requestAnimationFrame(loop);
+        return { x: 0, z: 0 };
     }
 
-    function showLanePicker() {
-        const nodes = map.nodes || [];
-        const row0ids = new Set(nodes.filter(n => n.row === 0 && (n.edges || []).length > 0).map(n => n.id));
+    // Drop the player into a room at its near (back) edge, facing into the
+    // dungeon. enterRoom themes it and — since the camera is now inside the rect —
+    // commits the lane (locking siblings, which rock over).
+    function placeInRoom(nodeId) {
+        const r = rooms[nodeId];
+        resetView();
+        if (r) {
+            camera.position.x = r.x * WS;
+            camera.position.z = (r.z + r.hd * 0.6) * WS;   // just inside the near wall
+            camera.position.y = EYE;
+        }
+        qc.yaw = 0;
+        enterRoom(nodeId);
+        savePos();
+    }
+
+    // Pre-start path picker (ADR 0012): instead of walking the antechamber to the
+    // lane you want, choose your starting entrance up front. Pauses the dungeon
+    // (phase 'encounter' freezes movement) until a path is picked.
+    function showPathPicker(entranceIds) {
+        state.phase = 'encounter';
+        if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
         const songMap = Object.fromEntries((d.songs || []).map(s => [s.cf_id, s]));
-
-        // SVG layout — same projection as dsMapView
-        const maxRow = Math.max(...nodes.map(n => n.row || 0));
-        const maxCol = Math.max(1, ...nodes.map(n => n.col || 0));
-        const w = 640, h = Math.max(260, (maxRow + 1) * 80);
-        const px = n => 60 + ((n.col || 0) / maxCol) * (w - 120);
-        const py = n => 36 + ((n.row || 0) / maxRow) * (h - 72);
-
-        const typeStroke = { forced:'#93c5fd', elite:'#f6d365', rest:'#94a3b8', shop:'#c4b5fd', mystery:'#f8a14b', treasure:'#fcd34d', boss:'#f87171' };
-
-        const svgEdges = nodes.flatMap(n => (n.edges || []).map(tid => {
-            const t = nodes.find(x => x.id === tid);
-            return t ? `<line x1="${px(n)}" y1="${py(n)}" x2="${px(t)}" y2="${py(t)}" stroke="rgba(148,163,184,.15)" stroke-width="2"/>` : '';
-        })).join('');
-
-        const svgNodes = nodes.map(n => {
-            const x = px(n), y = py(n);
-            const isStart = row0ids.has(n.id);
-            const stroke = isStart ? '#60a5fa' : (typeStroke[n.type] || '#374151');
-            const fill   = isStart ? '#1d4ed8' : '#111827';
-            const r      = isStart ? 22 : 16;
-            const icon   = NODE_TYPE_ICONS[n.type] || '●';
-            const op     = isStart ? '1' : '0.45';
-
-            if (isStart) {
-                const song = songMap[n.cf_id];
-                const label = song ? esc(song.title.slice(0, 18)) + (song.title.length > 18 ? '…' : '') : '';
-                const localDot = song?.has_locally ? `<circle cx="${x+r-4}" cy="${y-r+4}" r="5" fill="#22c55e"/>` : '';
-                return `<g onclick="window._dsPickLane('${n.id}')" style="cursor:pointer;">
-                    <circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="3"/>
-                    <text x="${x}" y="${y+5}" text-anchor="middle" fill="white" font-size="15">${icon}</text>
-                    ${localDot}
-                    ${label ? `<text x="${x}" y="${y+r+13}" text-anchor="middle" fill="#93c5fd" font-size="9" font-family="monospace">${label}</text>` : ''}
-                </g>`;
-            }
-            return `<g opacity="${op}">
-                <circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="2"/>
-                <text x="${x}" y="${y+5}" text-anchor="middle" fill="white" font-size="13">${icon}</text>
-            </g>`;
+        const opts = entranceIds.map((id, i) => {
+            const n = nodeById(id);
+            const icon = NODE_TYPE_ICONS[n?.type] || '◇';
+            const song = songMap[n?.cf_id];
+            const title = song ? esc(_encTrim(song.title, 28)) : (n?.type || '').toUpperCase();
+            const sub = song ? esc(_encTrim([song.artist, song.tuning].filter(Boolean).join(' · '), 34)) : 'Choose this path';
+            const local = song && song.has_locally;
+            return `<button class="ds-path-opt" data-id="${id}" style="display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:#0c0c0c;border:1px solid #1d4ed8;border-radius:12px;padding:12px 14px;margin:6px 0;color:#d4dce8;font-family:monospace;cursor:pointer;">
+                <span style="font-size:1.6rem;width:32px;text-align:center;">${icon}</span>
+                <span style="flex:1;min-width:0;">
+                    <span style="display:block;font-size:0.6rem;letter-spacing:.14em;color:#3a78c9;">PATH ${i + 1}</span>
+                    <span style="display:block;font-weight:bold;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title}</span>
+                    <span style="display:block;font-size:0.72rem;color:#8a93a3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${sub}</span>
+                </span>
+                ${local ? '<span style="color:#22c55e;font-size:0.7rem;">● OWNED</span>' : ''}
+            </button>`;
         }).join('');
-
+        encounterEl.style.alignItems = 'center';
         encounterEl.style.display = 'flex';
         encounterEl.innerHTML = `
-            <div style="background:#080808;border:3px solid #1d4ed8;max-width:600px;width:100%;padding:16px;max-height:92vh;overflow-y:auto;">
-                <div style="font-family:monospace;color:#3a78c9;font-size:0.75rem;letter-spacing:.12em;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #1a1a1a;">⚔ CHOOSE YOUR PATH</div>
-                <svg viewBox="0 0 ${w} ${h}" style="width:100%;display:block;margin-bottom:8px;">${svgEdges}${svgNodes}</svg>
-                <div style="font-family:monospace;font-size:0.65rem;color:#444;text-align:center;letter-spacing:.08em;">TAP A GLOWING NODE TO BEGIN</div>
+            <div style="background:#080808;border:3px solid #1d4ed8;border-radius:12px;max-width:460px;width:100%;padding:18px;max-height:90vh;overflow-y:auto;">
+                <div style="font-family:monospace;color:#3a78c9;font-size:0.75rem;letter-spacing:.12em;margin-bottom:6px;">⚔ CHOOSE YOUR STARTING PATH</div>
+                <div style="font-family:monospace;color:#555;font-size:0.65rem;margin-bottom:10px;">You commit to this lane — the others seal behind you.</div>
+                ${opts}
             </div>`;
+        encounterEl.querySelectorAll('.ds-path-opt').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (_dsAudio) _dsAudio.init();
+                const id = btn.getAttribute('data-id');
+                encounterEl.style.display = 'none';
+                encounterEl.style.alignItems = 'flex-end';   // restore encounter docking
+                encounterEl.innerHTML = '';
+                state.phase = 'idle';
+                placeInRoom(id);
+            });
+        });
+    }
 
-        window._dsPickLane = function (nodeId) {
-            encounterEl.style.display = 'none';
-            state.phase = 'idle';
-            enterNode(nodeId);
-            savePos();
-            resetView();
-            showEncounter(nodeId);
-        };
-        state.phase = 'encounter';
+    function start() {
+        buildFloorplan();                 // lay out the whole contiguous dungeon
+        _dsTextureAllSurfaces(THREE, scene, _floorplanDisposables);   // give every solid surface a real texture
+        // Reset the controller FIRST (it parks the camera at the origin), then
+        // place the player at the spawn point — order matters (ADR 0012).
+        resetView();
+        const sp = spawnPoint();
+        camera.position.x = sp.x;
+        camera.position.z = sp.z;
+        camera.position.y = EYE;
+        qc.yaw = 0;   // face into the dungeon (−Z) on spawn
+        prevTime = performance.now();
+        state.rafId = requestAnimationFrame(loop);
+
+        // Fresh run (nothing committed/cleared): let the player PICK their starting
+        // path up front rather than walking the antechamber to it (ADR 0012). With
+        // a single open entrance, just drop them in; with several, show the picker.
+        const committed = new Set(d.committed_node_ids || []);
+        const cleared = new Set(d.cleared_node_ids || []);
+        const avail = new Set(d.available_node_ids || []);
+        const entranceIds = (map.nodes || [])
+            .filter(n => (n.row || 0) === 0 && rooms[n.id] && avail.has(n.id))
+            .map(n => n.id);
+        // "Fresh" is purely a progress signal — not saved position — so a player
+        // who previewed but didn't pick still gets the picker on reload.
+        const fresh = !committed.size && !cleared.size;
+
+        if (fresh && entranceIds.length > 1) {
+            enterRoom(entranceIds[0]);   // preview dressing/HUD behind the picker
+            showPathPicker(entranceIds);
+            return;                       // picker drives placement + commit
+        }
+        if (fresh && entranceIds.length === 1) {
+            placeInRoom(entranceIds[0]);
+        } else {
+            // Resume: saved coord or in-progress day — occupy whatever room we land in.
+            const here = roomAt(camera.position.x, camera.position.z) || map.start;
+            enterRoom(here);
+        }
+
+        // Returning from a song that cleared a room: detonate that room's exit
+        // rubble on arrival so song rooms get the same blow-open beat as in-place
+        // clears (ADR 0012). Backend payload already reflects the clear.
+        if (_dsRoomJustCleared) {
+            const just = _dsRoomJustCleared;
+            _dsRoomJustCleared = null;
+            syncSections(just);
+        }
     }
 
     function destroy() {
         if (state.rafId) cancelAnimationFrame(state.rafId);
+        if (_sealedTimer) { clearTimeout(_sealedTimer); _sealedTimer = null; }
         window.removeEventListener('keydown', onKey);
         window.removeEventListener('keyup', onKeyUp);
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('pointerlockchange', onPointerLockChange);
         window.removeEventListener('blur', onBlur);
         if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+        if (dunReticle.parentNode) dunReticle.parentNode.removeChild(dunReticle);
         window._dsDungeonDismiss = null;
         window._dsDungeonBossTorches = null;
+        window.__DS_DUNGEON_DIAG__ = null;
         clearRoomProp();
-        bossPerimTorches.forEach(l => world.remove(l));
-        rebuildDoors([]); // dispose any remaining door geometry/materials
+        roomGroup.remove(promptMesh);
+        promptMesh.geometry.dispose();
+        promptMat.dispose();
+        promptTex.dispose();
+        world.remove(encMesh);
+        encMesh.geometry.dispose();
+        encMat.dispose();
+        encTex.dispose();
+        bossPerimTorches.forEach(l => roomGroup.remove(l));
+        world.remove(playerLight);
+        torchFlames.forEach(fl => { if (fl.parent) fl.parent.remove(fl); });
+        flameDisposables.forEach(x => x.dispose());
+        // Floorplan geometry: walls, big floor/ceil, rubble gates, in-flight bursts.
+        if (wallMesh) { world.remove(wallMesh); wallMesh.geometry.dispose(); }
+        if (roomMeshes.floor) world.remove(roomMeshes.floor);
+        if (roomMeshes.ceil) world.remove(roomMeshes.ceil);
+        rubbleGates.forEach(rg => { world.remove(rg.group); });
+        explosions.forEach(ex => {
+            ex.pieces.forEach(p => world.remove(p.mesh));
+            if (ex.sparks) { world.remove(ex.sparks); ex.sparks.geometry.dispose(); ex.sparks.material.dispose(); }
+            if (ex.flash) world.remove(ex.flash);
+        });
         renderer.dispose();
-        [wallMat, floorMat, ceilMat, backMat, doorFrameMat,
-         forcedWallMat, forcedFloorMat, forcedCeilMat, forcedBackMat,
-         eliteWallMat, eliteFloorMat, eliteCeilMat, eliteBackMat,
-         bossWallMat, bossFloorMat, bossCeilMat, bossBackMat,
-         treasureWallMat, treasureFloorMat, treasureCeilMat, treasureBackMat,
-         mysteryWallMat, mysteryFloorMat, mysteryCeilMat, mysteryBackMat].forEach(m => m.dispose());
+        // Base materials + their textures and the floorplan-specific disposables
+        // (rock geos/mats, plane geos, post-pass cloned surface materials).
+        [wallMat, floorMat, ceilMat, backMat, doorFrameMat].forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+        _floorplanDisposables.forEach(x => { try { x.dispose(); } catch (e) {} });
     }
 
     // Refresh the dungeon's view without rebuilding it. Caller has mutated `d`
@@ -7696,12 +6762,14 @@ function _dsBuildDungeon(THREE, container, d) {
     // an encounter is open, re-populate its panel so the new song state shows.
     function refresh() {
         updateSelection();
-        if (state.phase === 'encounter') {
+        if (encActive) {
+            drawEncounterCanvas();
+        } else if (state.phase === 'encounter') {
             const panel = document.getElementById('ds-map-panel');
             if (panel) dsOpenNode(state.nodeId);
         }
     }
 
     function setAmbientVolume(v) { if (_dsAudio) _dsAudio.setAmbientVol(v); }
-    return { start, destroy, refresh, setAmbientVolume, setSfxVolume: function(v) { if (_dsAudio) _dsAudio.setSfxVol(v); } };
+    return { start, destroy, refresh, clearCurrentRoom, setAmbientVolume, setSfxVolume: function(v) { if (_dsAudio) _dsAudio.setSfxVol(v); } };
 }

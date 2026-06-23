@@ -6,6 +6,7 @@ import json
 from datetime import date, datetime
 from types import SimpleNamespace
 import importlib.util
+from _routes_test_helper import make_context
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -23,7 +24,7 @@ def _make_app_with_routes(base_dir: Path, supabase_url: str = "https://example.s
     # Freeze today's date
     os.environ["THE_DAILY_TEST_TODAY"] = "2026-04-24"
     app = FastAPI()
-    routes.setup(app, {"config_dir": base_dir, "meta_db": SimpleNamespace(conn=None)})
+    routes.setup(app, make_context(base_dir))
     return app, routes
 
 def test_sign_leaderboard_success(monkeypatch):

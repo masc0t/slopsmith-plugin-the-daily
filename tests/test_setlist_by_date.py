@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from _routes_test_helper import make_context
+
 
 def _load_routes_module(_base_dir: Path):
     path = Path(__file__).resolve().parents[1] / 'routes.py'
@@ -29,7 +31,7 @@ def _make_app(base_dir: Path, supabase_url: str = ""):
     meta_conn.execute("CREATE TABLE IF NOT EXISTS songs (filename TEXT, title TEXT, artist TEXT)")
     meta_conn.commit()
     app = FastAPI()
-    routes.setup(app, {"config_dir": base_dir, "meta_db": SimpleNamespace(conn=meta_conn)})
+    routes.setup(app, make_context(base_dir, SimpleNamespace(conn=meta_conn)))
     return app, routes, meta_conn
 
 

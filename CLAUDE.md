@@ -130,29 +130,24 @@ python publish_pool.py --stamp 2026-05-15       # explicit future stamp
 # verifies anonymous GET + content hash, then runs preview spot-check.
 ```
 
-### Running map render tests (no server)
-
-Open `test-map-render.html` in a browser to verify:
-- Icon mapping for all node types (forced, elite, treasure, rest, shop, choice, mystery, boss)
-- Lane label generation (standard, drop, flat, sprint, marathon, decade_*)
-- SVG lane classes (`lane-standard`, `lane-drop`, etc.) are applied
-- Act labels are present when nodes have an `act` property
-- Default lane falls back to `lane-standard`
+### Running tests
 
 ```bash
-# Open directly
-start test-map-render.html        # Windows
-open test-map-render.html         # macOS
-xdg-open test-map-render.html    # Linux
+npm test            # backend coverage (pytest/unittest) + frontend smoke
+npm run test:python # backend route tests only (this is what CI runs)
+npm run test:e2e    # Playwright dungeon smoke (tests/playwright/dungeon-smoke.spec.js)
 ```
 
-### Verifying visuals locally
+The Daily is a 3D dungeon (no 2D fallback). Frontend automated testing is the
+Playwright **dungeon smoke** spec — it serves the test page over real HTTP
+(localStorage needs a non-opaque origin), enters via `dsDungeonEnter`, and
+asserts the Quake-1 main menu renders, keyboard nav works, the OPTIONS sliders
+adjust, and no console errors occur. It imports three.js from a CDN, so it
+**skips** when offline. See [tests/E2E_TESTING.md](tests/E2E_TESTING.md).
 
-1. **CSS variables**: Edit `:root` lane colors in `screen.html` — all lane styling updates from one place
-2. **Lane legend**: Toggle `#ds-lane-legend` visibility in DevTools to verify color circles use `var(--lane-*)`
-3. **Map nodes**: Inspect SVG `<g>` elements for `lane-standard`, `lane-drop`, etc. classes
-4. **Keyboard nav**: Click a map node, then use Arrow keys to move between available nodes
-5. **Screen reader**: Check `ds-live-region` announces focused nodes; lane legend has `role="region"`
+For interactive dungeon debugging (walking, encounters, screenshots) use the
+ad-hoc harnesses under `.scratch/dungeon-debug/` over real HTTP — see the
+`reference-dungeon-headless-harness` memory.
 
 `reset_today.py` reads `CONFIG_DIR` from env, defaulting to `~/.local/share/rocksmith-cdlc`. On Windows that path won't exist — pass `CONFIG_DIR=...` matching what Slopsmith uses on this machine.
 
@@ -165,12 +160,20 @@ xdg-open test-map-render.html    # Linux
 - **All dates are UTC.** `_get_today()` uses `datetime.utcnow().date()`. The daily rolls at 00:00 UTC for every install regardless of timezone. Don't reintroduce `date.today()` — it breaks the global determinism guarantee across timezones.
 - **`day_number` is anchored to `_EPOCH = date(2026, 4, 22)` UTC.** Don't bump this — it would renumber every past day in every user's UI.
 - **The Supabase anon key is public on purpose.** Don't rotate it as if it leaked. If abuse becomes a problem, add a Postgres RLS policy or rate-limit at the edge instead.
-## The Daily MVP Roadmap
+## Frontend = 3D dungeon only
 
-- Finalize CSS-driven styling for map lanes and acts (Option A): move lane colors and act-label styling into CSS variables and lane-<name> classes.
-- Add lightweight map render tests (no server): a small harness that asserts icon mapping, act labels presence, and lane classes.
-- Extend preview workflow with a deterministic test path to produce stable snapshots for comparison.
-- Improve accessibility (ARIA labels, keyboard navigation) and add a short legend for lane colors.
-- Document how to run deterministic previews and how to verify visuals locally.
-- Document how to run deterministic previews and how to verify visuals locally.
-- Extend doc with quick-start for MVP tests (map render harness and HTML test page).
+The legacy 2D UI (setlist + SVG node-graph map, the complete page, the
+leaderboard/Wall-of-Fame tab, and the full-screen passport and shop pages) was
+**removed entirely**. `dsDungeonEnabled()` is always true and the only DOM view
+outside the 3D overlay is the initial loading spinner; everything else is a
+diegetic dungeon room (Hub, WoF Room, Shop Room, Hall of Records, Archive).
+
+When working on the player-facing experience, edit the dungeon builders in
+`screen.js` (`dsDungeonEnter` → `_dsBuildHub` / `_dsBuildDungeon` / room
+builders) — there is no 2D `dsRender`/`dsMapView`/`dsShow('setlist')` path to
+fall back to. Shared, still-live helpers reused by the 3D rooms: the encounter
+panel (`dsOpenNode` and its tree), the shop-item system (`dsRenderShopItem`,
+`dsLoadShop`, `dsBuyItem`, `dsRefreshTokens`, equip/refund), acquisition
+(`dsAcquire`/`dsCapture*`), and song launching (`dsPlayMapNode`/`dsPlay`).
+The Quake-1 main menu (`_dsShowMainMenu`) is the front door; QUIT and the Hub
+exit-door return to the host library via `showScreen('home')`.

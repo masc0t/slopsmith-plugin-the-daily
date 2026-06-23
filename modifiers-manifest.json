@@ -2281,6 +2281,737 @@
           "fn": "_title_track"
         }
       ]
+    },
+    {
+      "date": "2026-06-23",
+      "min_plugin_version": null,
+      "active": [
+        {
+          "id": "e_standard",
+          "label": "Standard Issue",
+          "description": "E Standard tuning only",
+          "icon": "\ud83c\udfb8",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "e standard"
+            ]
+          }
+        },
+        {
+          "id": "drop_day",
+          "label": "Drop Day",
+          "description": "Any Drop tuning (Drop D, Drop C, etc.)",
+          "icon": "\u2b07\ufe0f",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "drop"
+            ]
+          }
+        },
+        {
+          "id": "flat_earth",
+          "label": "Flat Earth",
+          "description": "Half-step-down tunings",
+          "icon": "\ud83c\udf0d",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "eb",
+              "ab",
+              "db"
+            ]
+          }
+        },
+        {
+          "id": "artist_takeover",
+          "label": "One Artist Takeover",
+          "description": "All songs by the same artist",
+          "icon": "\ud83c\udfa4",
+          "type": "identity",
+          "key": "artist",
+          "min_pool": 50
+        },
+        {
+          "id": "decade_night",
+          "label": "Decade Night",
+          "description": "All songs from the same era",
+          "icon": "\ud83d\udcc5",
+          "type": "identity",
+          "key": "decade"
+        },
+        {
+          "id": "throwback",
+          "label": "Throwback",
+          "description": "Classic era songs (pre-1985)",
+          "icon": "\ud83d\udcfb",
+          "type": "filter",
+          "predicate": {
+            "op": "year_between",
+            "min": 0,
+            "max": 1984
+          }
+        },
+        {
+          "id": "new_blood",
+          "label": "New Blood",
+          "description": "Songs added to CF in the last 60 days",
+          "icon": "\ud83c\udd95",
+          "type": "filter",
+          "fn": "_is_new_blood"
+        },
+        {
+          "id": "blindside",
+          "label": "Blindside",
+          "description": "Song titles hidden until you play them",
+          "icon": "\ud83d\ude48",
+          "type": "ui"
+        },
+        {
+          "id": "vintage_chart",
+          "label": "Vintage Chart",
+          "description": "CDLC uploaded to CF over 2 years ago",
+          "icon": "\ud83d\udcdc",
+          "type": "filter",
+          "fn": "_is_vintage_upload"
+        },
+        {
+          "id": "discography",
+          "label": "Discography",
+          "description": "Same artist, each song from a different album",
+          "icon": "\ud83d\udcda",
+          "type": "composite",
+          "rules": [
+            "identity:artist",
+            "unique:album"
+          ]
+        },
+        {
+          "id": "time_machine",
+          "label": "Time Machine",
+          "description": "One song per decade, oldest to newest",
+          "icon": "\u23f3",
+          "type": "composite",
+          "rules": [
+            "unique:decade",
+            "order:year"
+          ]
+        },
+        {
+          "id": "counterclockwise",
+          "label": "Counterclockwise",
+          "description": "Setlist ordered newest release to oldest",
+          "icon": "\ud83d\udd04",
+          "type": "ordering",
+          "key": "_key_year_desc"
+        },
+        {
+          "id": "alphabet_soup",
+          "label": "Alphabet Soup",
+          "description": "Song titles in alphabetical order",
+          "icon": "\ud83d\udd24",
+          "type": "ordering",
+          "key": "_key_title_lower"
+        },
+        {
+          "id": "title_chain",
+          "label": "Title Chain",
+          "description": "Each title starts with the last word of the previous",
+          "icon": "\ud83d\udd17",
+          "type": "sequence",
+          "fn": "_title_chains"
+        },
+        {
+          "id": "one_word",
+          "label": "One Word",
+          "description": "All song titles are a single word",
+          "icon": "1\ufe0f\u20e3",
+          "type": "filter",
+          "predicate": {
+            "op": "field_len_gte",
+            "field": "title",
+            "n": 1
+          }
+        },
+        {
+          "id": "verbose",
+          "label": "Verbose",
+          "description": "Titles must be five words or longer",
+          "icon": "\ud83d\udcdc",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "title",
+            "words": [
+              " ",
+              "  ",
+              "   ",
+              "    ",
+              "     "
+            ]
+          }
+        },
+        {
+          "id": "number_station",
+          "label": "Number Station",
+          "description": "Every title contains a number",
+          "icon": "\ud83d\udd22",
+          "type": "filter",
+          "predicate": {
+            "op": "field_has_digit",
+            "field": "title"
+          }
+        },
+        {
+          "id": "punctuated",
+          "label": "Punctuated",
+          "description": "Titles with question marks, exclamations, or parentheses",
+          "icon": "\u2753",
+          "type": "filter",
+          "predicate": {
+            "op": "field_has_nonalnum",
+            "field": "title"
+          }
+        },
+        {
+          "id": "witching_hour",
+          "label": "Witching Hour",
+          "description": "Dark themes: death, fire, blood, ghosts",
+          "icon": "\ud83d\udd6f\ufe0f",
+          "type": "filter",
+          "fn": "_witching_hour"
+        },
+        {
+          "id": "love_letter",
+          "label": "Love Letter",
+          "description": "Titles about love, heartbreak, or longing",
+          "icon": "\ud83d\udc8c",
+          "type": "filter",
+          "fn": "_love_letter"
+        },
+        {
+          "id": "shared_letter",
+          "label": "Shared Letter",
+          "description": "Every artist name starts with the same letter",
+          "icon": "\ud83c\udd70\ufe0f",
+          "type": "identity",
+          "key": "_key_artist_first_letter",
+          "min_pool": 8
+        },
+        {
+          "id": "palette_swap",
+          "label": "Palette Swap",
+          "description": "Each song in a different tuning family from the last",
+          "icon": "\ud83c\udfa8",
+          "type": "sequence",
+          "fn": "_tuning_family_diff"
+        },
+        {
+          "id": "dealers_choice",
+          "label": "Dealer's Choice",
+          "description": "A random modifier is picked and kept secret",
+          "icon": "\ud83c\udccf",
+          "type": "meta"
+        },
+        {
+          "id": "double_trouble",
+          "label": "Double Trouble",
+          "description": "Two modifiers stack for this setlist",
+          "icon": "\u2660\ufe0f",
+          "type": "meta",
+          "count": 2
+        },
+        {
+          "id": "leap_year",
+          "label": "Leap Year",
+          "description": "Songs released exactly 10, 20, 30, or 40 years ago today",
+          "icon": "\ud83e\udd98",
+          "type": "filter",
+          "fn": "_is_anniversary_year"
+        },
+        {
+          "id": "prime_time",
+          "label": "Prime Time",
+          "description": "Songs released in a prime-numbered year",
+          "icon": "\ud83d\udd31",
+          "type": "filter",
+          "fn": "_prime_time"
+        },
+        {
+          "id": "typecast",
+          "label": "Typecast",
+          "description": "Every title starts with the same letter",
+          "icon": "\ud83d\udd20",
+          "type": "identity",
+          "key": "_key_title_first_letter",
+          "min_pool": 8
+        },
+        {
+          "id": "bookends",
+          "label": "Bookends",
+          "description": "First and last song are by the same artist",
+          "icon": "\ud83d\udcda",
+          "type": "structural",
+          "shape": "bookend",
+          "key": "artist"
+        },
+        {
+          "id": "escalating_era",
+          "label": "Escalating Era",
+          "description": "Each song newer than the last, no duplicates by year",
+          "icon": "\ud83e\ude9c",
+          "type": "composite",
+          "rules": [
+            "unique:year",
+            "order:year"
+          ]
+        },
+        {
+          "id": "compound_word",
+          "label": "Compound Word",
+          "description": "Every title is exactly two words",
+          "icon": "\ud83d\udd17",
+          "type": "filter",
+          "predicate": {
+            "op": "word_count",
+            "field": "title",
+            "n": 2
+          }
+        },
+        {
+          "id": "rorschach",
+          "label": "Rorschach",
+          "description": "Titles contain body parts: heart, eye, hand, blood, bone",
+          "icon": "\ud83d\udc41\ufe0f",
+          "type": "filter",
+          "fn": "_rorschach"
+        },
+        {
+          "id": "weather_report",
+          "label": "Weather Report",
+          "description": "Titles reference weather or sky: rain, storm, sun, moon, cloud",
+          "icon": "\u26c8\ufe0f",
+          "type": "filter",
+          "fn": "_weather_report"
+        },
+        {
+          "id": "color_wheel",
+          "label": "Color Wheel",
+          "description": "Every title contains a color",
+          "icon": "\ud83c\udf08",
+          "type": "filter",
+          "fn": "_color_wheel"
+        },
+        {
+          "id": "motion_picture",
+          "label": "Motion Picture",
+          "description": "Titles with verbs of movement: run, fly, fall, dance, walk",
+          "icon": "\ud83c\udfc3",
+          "type": "filter",
+          "fn": "_motion_picture"
+        },
+        {
+          "id": "reanimated",
+          "label": "Reanimated",
+          "description": "Same album appeared in a prior daily in the last 30 days",
+          "icon": "\ud83e\udddf",
+          "type": "meta"
+        },
+        {
+          "id": "secret_handshake",
+          "label": "Secret Handshake",
+          "description": "All songs share a hidden attribute; guess what it is to complete",
+          "icon": "\ud83e\udd1d",
+          "type": "meta"
+        },
+        {
+          "id": "rival_camps",
+          "label": "Rival Camps",
+          "description": "Two artists only, alternating songs",
+          "icon": "\u2694\ufe0f",
+          "type": "structural",
+          "shape": "alternating",
+          "key": "artist"
+        },
+        {
+          "id": "sundown",
+          "label": "Sundown",
+          "description": "Titles reference endings: last, final, end, goodbye, over",
+          "icon": "\ud83c\udf05",
+          "type": "filter",
+          "fn": "_sundown"
+        },
+        {
+          "id": "title_track",
+          "label": "Title Track",
+          "description": "Song title matches the album title",
+          "icon": "\ud83c\udfaf",
+          "type": "filter",
+          "fn": "_title_track"
+        }
+      ]
+    },
+    {
+      "date": "2026-06-24",
+      "min_plugin_version": null,
+      "active": [
+        {
+          "id": "e_standard",
+          "label": "Standard Issue",
+          "description": "E Standard tuning only",
+          "icon": "\ud83c\udfb8",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "e standard"
+            ]
+          }
+        },
+        {
+          "id": "drop_day",
+          "label": "Drop Day",
+          "description": "Any Drop tuning (Drop D, Drop C, etc.)",
+          "icon": "\u2b07\ufe0f",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "drop"
+            ]
+          }
+        },
+        {
+          "id": "flat_earth",
+          "label": "Flat Earth",
+          "description": "Half-step-down tunings",
+          "icon": "\ud83c\udf0d",
+          "type": "filter",
+          "predicate": {
+            "op": "field_keywords",
+            "field": "tuning",
+            "words": [
+              "eb",
+              "ab",
+              "db"
+            ]
+          }
+        },
+        {
+          "id": "artist_takeover",
+          "label": "One Artist Takeover",
+          "description": "All songs by the same artist",
+          "icon": "\ud83c\udfa4",
+          "type": "identity",
+          "key": "artist",
+          "min_pool": 50
+        },
+        {
+          "id": "decade_night",
+          "label": "Decade Night",
+          "description": "All songs from the same era",
+          "icon": "\ud83d\udcc5",
+          "type": "identity",
+          "key": "decade"
+        },
+        {
+          "id": "throwback",
+          "label": "Throwback",
+          "description": "Classic era songs (pre-1985)",
+          "icon": "\ud83d\udcfb",
+          "type": "filter",
+          "predicate": {
+            "op": "year_between",
+            "min": 0,
+            "max": 1984
+          }
+        },
+        {
+          "id": "new_blood",
+          "label": "New Blood",
+          "description": "Songs added to CF in the last 60 days",
+          "icon": "\ud83c\udd95",
+          "type": "filter",
+          "fn": "_is_new_blood"
+        },
+        {
+          "id": "blindside",
+          "label": "Blindside",
+          "description": "Song titles hidden until you play them",
+          "icon": "\ud83d\ude48",
+          "type": "ui"
+        },
+        {
+          "id": "vintage_chart",
+          "label": "Vintage Chart",
+          "description": "CDLC uploaded to CF over 2 years ago",
+          "icon": "\ud83d\udcdc",
+          "type": "filter",
+          "fn": "_is_vintage_upload"
+        },
+        {
+          "id": "discography",
+          "label": "Discography",
+          "description": "Same artist, each song from a different album",
+          "icon": "\ud83d\udcda",
+          "type": "composite",
+          "rules": [
+            "identity:artist",
+            "unique:album"
+          ]
+        },
+        {
+          "id": "time_machine",
+          "label": "Time Machine",
+          "description": "One song per decade, oldest to newest",
+          "icon": "\u23f3",
+          "type": "composite",
+          "rules": [
+            "unique:decade",
+            "order:year"
+          ]
+        },
+        {
+          "id": "counterclockwise",
+          "label": "Counterclockwise",
+          "description": "Setlist ordered newest release to oldest",
+          "icon": "\ud83d\udd04",
+          "type": "ordering",
+          "key": "_key_year_desc"
+        },
+        {
+          "id": "alphabet_soup",
+          "label": "Alphabet Soup",
+          "description": "Song titles in alphabetical order",
+          "icon": "\ud83d\udd24",
+          "type": "ordering",
+          "key": "_key_title_lower"
+        },
+        {
+          "id": "title_chain",
+          "label": "Title Chain",
+          "description": "Each title starts with the last word of the previous",
+          "icon": "\ud83d\udd17",
+          "type": "sequence",
+          "fn": "_title_chains"
+        },
+        {
+          "id": "one_word",
+          "label": "One Word",
+          "description": "All song titles are a single word",
+          "icon": "1\ufe0f\u20e3",
+          "type": "filter",
+          "fn": "_filter_one_word"
+        },
+        {
+          "id": "verbose",
+          "label": "Verbose",
+          "description": "Titles must be five words or longer",
+          "icon": "\ud83d\udcdc",
+          "type": "filter",
+          "fn": "_filter_five_words"
+        },
+        {
+          "id": "number_station",
+          "label": "Number Station",
+          "description": "Every title contains a number",
+          "icon": "\ud83d\udd22",
+          "type": "filter",
+          "predicate": {
+            "op": "field_has_digit",
+            "field": "title"
+          }
+        },
+        {
+          "id": "punctuated",
+          "label": "Punctuated",
+          "description": "Titles with question marks, exclamations, or parentheses",
+          "icon": "\u2753",
+          "type": "filter",
+          "fn": "_filter_has_punct"
+        },
+        {
+          "id": "witching_hour",
+          "label": "Witching Hour",
+          "description": "Dark themes: death, fire, blood, ghosts",
+          "icon": "\ud83d\udd6f\ufe0f",
+          "type": "filter",
+          "fn": "_witching_hour"
+        },
+        {
+          "id": "love_letter",
+          "label": "Love Letter",
+          "description": "Titles about love, heartbreak, or longing",
+          "icon": "\ud83d\udc8c",
+          "type": "filter",
+          "fn": "_love_letter"
+        },
+        {
+          "id": "shared_letter",
+          "label": "Shared Letter",
+          "description": "Every artist name starts with the same letter",
+          "icon": "\ud83c\udd70\ufe0f",
+          "type": "identity",
+          "key": "_key_artist_first_letter",
+          "min_pool": 8
+        },
+        {
+          "id": "palette_swap",
+          "label": "Palette Swap",
+          "description": "Each song in a different tuning family from the last",
+          "icon": "\ud83c\udfa8",
+          "type": "sequence",
+          "fn": "_tuning_family_diff"
+        },
+        {
+          "id": "dealers_choice",
+          "label": "Dealer's Choice",
+          "description": "A random modifier is picked and kept secret",
+          "icon": "\ud83c\udccf",
+          "type": "meta"
+        },
+        {
+          "id": "double_trouble",
+          "label": "Double Trouble",
+          "description": "Two modifiers stack for this setlist",
+          "icon": "\u2660\ufe0f",
+          "type": "meta",
+          "count": 2
+        },
+        {
+          "id": "leap_year",
+          "label": "Leap Year",
+          "description": "Songs released exactly 10, 20, 30, or 40 years ago today",
+          "icon": "\ud83e\udd98",
+          "type": "filter",
+          "fn": "_is_anniversary_year"
+        },
+        {
+          "id": "prime_time",
+          "label": "Prime Time",
+          "description": "Songs released in a prime-numbered year",
+          "icon": "\ud83d\udd31",
+          "type": "filter",
+          "fn": "_prime_time"
+        },
+        {
+          "id": "typecast",
+          "label": "Typecast",
+          "description": "Every title starts with the same letter",
+          "icon": "\ud83d\udd20",
+          "type": "identity",
+          "key": "_key_title_first_letter",
+          "min_pool": 8
+        },
+        {
+          "id": "bookends",
+          "label": "Bookends",
+          "description": "First and last song are by the same artist",
+          "icon": "\ud83d\udcda",
+          "type": "structural",
+          "shape": "bookend",
+          "key": "artist"
+        },
+        {
+          "id": "escalating_era",
+          "label": "Escalating Era",
+          "description": "Each song newer than the last, no duplicates by year",
+          "icon": "\ud83e\ude9c",
+          "type": "composite",
+          "rules": [
+            "unique:year",
+            "order:year"
+          ]
+        },
+        {
+          "id": "compound_word",
+          "label": "Compound Word",
+          "description": "Every title is exactly two words",
+          "icon": "\ud83d\udd17",
+          "type": "filter",
+          "fn": "_filter_two_words"
+        },
+        {
+          "id": "rorschach",
+          "label": "Rorschach",
+          "description": "Titles contain body parts: heart, eye, hand, blood, bone",
+          "icon": "\ud83d\udc41\ufe0f",
+          "type": "filter",
+          "fn": "_rorschach"
+        },
+        {
+          "id": "weather_report",
+          "label": "Weather Report",
+          "description": "Titles reference weather or sky: rain, storm, sun, moon, cloud",
+          "icon": "\u26c8\ufe0f",
+          "type": "filter",
+          "fn": "_weather_report"
+        },
+        {
+          "id": "color_wheel",
+          "label": "Color Wheel",
+          "description": "Every title contains a color",
+          "icon": "\ud83c\udf08",
+          "type": "filter",
+          "fn": "_color_wheel"
+        },
+        {
+          "id": "motion_picture",
+          "label": "Motion Picture",
+          "description": "Titles with verbs of movement: run, fly, fall, dance, walk",
+          "icon": "\ud83c\udfc3",
+          "type": "filter",
+          "fn": "_motion_picture"
+        },
+        {
+          "id": "reanimated",
+          "label": "Reanimated",
+          "description": "Same album appeared in a prior daily in the last 30 days",
+          "icon": "\ud83e\udddf",
+          "type": "meta"
+        },
+        {
+          "id": "secret_handshake",
+          "label": "Secret Handshake",
+          "description": "All songs share a hidden attribute; guess what it is to complete",
+          "icon": "\ud83e\udd1d",
+          "type": "meta"
+        },
+        {
+          "id": "rival_camps",
+          "label": "Rival Camps",
+          "description": "Two artists only, alternating songs",
+          "icon": "\u2694\ufe0f",
+          "type": "structural",
+          "shape": "alternating",
+          "key": "artist"
+        },
+        {
+          "id": "sundown",
+          "label": "Sundown",
+          "description": "Titles reference endings: last, final, end, goodbye, over",
+          "icon": "\ud83c\udf05",
+          "type": "filter",
+          "fn": "_sundown"
+        },
+        {
+          "id": "title_track",
+          "label": "Title Track",
+          "description": "Song title matches the album title",
+          "icon": "\ud83c\udfaf",
+          "type": "filter",
+          "fn": "_title_track"
+        }
+      ]
     }
   ]
 }

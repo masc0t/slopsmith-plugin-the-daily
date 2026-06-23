@@ -59,14 +59,17 @@ _Avoid_: required version, minimum version, version constraint
 
 ### Dungeon
 
-**Dungeon**: The full-screen first-person 3D map view that is the primary interface for The Daily. Replaces the SVG map. Built with ThreeJS in a Doom-era 90s aesthetic (low-res pixelated render target, procedurally generated wall textures). The Dungeon is the Daily Setlist expressed as a game — navigating it is how a player progresses through their nodes for the day.
+**Dungeon**: The full-screen first-person 3D map view that is the primary interface for The Daily. Replaces the SVG map. Built with ThreeJS in a Doom-era 90s aesthetic (low-res pixelated render target, procedurally generated wall textures). The Dungeon is the Daily Setlist expressed as a game — navigating it is how a player progresses through their nodes for the day. Since ADR 0012 the entire map is **one contiguous walkable floorplan**: every Room is placed at its grid position and connected by real Corridors, walls are extracted from an occupancy grid, and the player walks the whole dungeon under Quake controls rather than teleporting between standalone Rooms.
 _Avoid_: map view, map panel, 3D map
 
-**Room**: The 3D representation of a map node inside the Dungeon. Each Room has a type (forced, elite, mystery, boss, choice, rest, treasure, shop) conveyed by a glowing icon on the door. The player moves from Room to Room by advancing through corridors. The terms "node" (backend/data) and "Room" (frontend/presentation) refer to the same entity at different layers.
+**Room**: The 3D representation of a map node inside the Dungeon — a walkable chamber at the node's grid position (`col`→lateral, `row`→forward depth), holding that node type's signature prop. Each Room has a type (forced, elite, mystery, boss, choice, rest, treasure, shop). The "current Room" is whichever Room rectangle contains the player; it drives the HUD, audio motif, lighting tint, and lane commitment. The terms "node" (backend/data) and "Room" (frontend/presentation) refer to the same entity at different layers.
 _Avoid_: node (in frontend/UI contexts), tile, cell
 
-**Corridor**: The tunnel between two connected Rooms. Always rendered as a straight passage regardless of the actual DAG topology — the 3D layout is a cosmetic projection of the graph, not a spatially accurate map.
+**Corridor**: The walkable passage connecting two Rooms in the contiguous floorplan, routed as axis-aligned L-segments between their centers (ADR 0012). A Corridor is **open** iff its target Room is discovered (`available ∪ cleared ∪ committed`); a closed Corridor is physically blocked by a Rubble Gate. Since ADR 0012 the layout encodes DAG topology — it is no longer a cosmetic projection.
 _Avoid_: edge, path, hallway
+
+**Rubble Gate**: The pile of boulders blocking a closed Corridor (ADR 0012, replacing ADR 0010's sealed door). When the source Room is cleared, the Rubble Gates on its now-open exits **detonate** — debris, sparks, a light flash, a boom — and the passage becomes walkable. Committing to a lane drops Rubble Gates on the sibling entrances (a quiet rockfall, not an explosion) to lock them.
+_Avoid_: door, gate (bare), sealed exit
 
 **Encounter**: The full-screen overlay that opens when the player arrives at a Room. Surfaces song/node info and available actions (play, download, bank, shop). The Dungeon pauses behind it. Dismissing the Encounter resumes navigation.
 _Avoid_: node panel, song panel, interaction panel
@@ -85,6 +88,26 @@ _Avoid_: portal, exit, link
 
 **Archive**: The antechamber reached through the Hub's History Passage. Contains a single diegetic calendar device (e.g. a pedestal-mounted dial) for picking a past UTC date. Selecting a date loads that day's Daily Setlist as a fully-cleared dungeon — same dungeon code path as the present day, with the Wall of Fame Passage already unsealed. The Archive is the input device; the loaded dungeon is the viewer.
 _Avoid_: history view, calendar screen, past dailies page
+
+### Acquisition
+
+**Acquisition**: A player obtaining the playable PSARC for a song so its Room becomes playable — the transition from a listed song to `has_locally: true`.
+_Avoid_: download, install, fetch
+
+**Host URL**: The direct file-host link (Dropbox, Google Drive, OneDrive, Mega, Mediafire, …) where a song's PSARC actually lives, as distinct from its CustomsForge listing (`cf_url`).
+_Avoid_: download link, file URL, mirror
+
+**Capture**: The desktop app learning a Host URL by observing the player's *own* manual download inside its embedded webview — the only sanctioned way to obtain a Host URL, since automated CustomsForge access is forbidden.
+_Avoid_: scrape, harvest, resolve
+
+**Unlock**: The first successful Capture of a song's Host URL, after which every later player Acquires that song silently from the shared cache.
+_Avoid_: cache hit, prefetch, seed
+
+**Reported Item**: A song flagged untrustworthy because its Host URL yielded a non-PSARC file (e.g. a `.zip`); it is never silently fetched, and its Room is auto-completed so a path is never trapped by un-acquirable content.
+_Avoid_: blocked song, banned song, flagged
+
+**Manual Floor**: The always-available fallback Acquisition path — the player downloads from CustomsForge by hand and a folder-watch auto-rescans — used whenever silent fetch is unavailable or fails.
+_Avoid_: manual mode, legacy download, fallback
 
 ### Leaderboard
 
@@ -109,6 +132,10 @@ _Avoid_: mark, play, finish
 - An **Algorithm-parameterized Modifier** is referenced by name in a **Modifier Stamp** and implemented in plugin code
 - A **Modifier Stamp** may carry **min_plugin_version**; if the plugin is too old, no **Daily Setlist** is served
 - A **Completion** accumulates against a **Daily Setlist**; when count equals `song_count`, the player may sign the **Wall of Fame** and a **Streak** is computed
+- A **Room** becomes playable through **Acquisition** of its song's PSARC
+- **Acquisition** resolves a song's **Host URL** from the **Unlock** cache and silently fetches it; on a miss or failure it falls back to the **Manual Floor**, where a human **Capture** on CustomsForge both downloads the song and re-populates the cache
+- The first **Capture** of a song **Unlocks** it for every later player
+- A song whose **Host URL** yields a non-PSARC file becomes a **Reported Item**, and its **Room** is auto-completed rather than fetched
 
 ## Example dialogue
 
@@ -126,3 +153,5 @@ _Avoid_: mark, play, finish
 - "modifier" alone is overloaded — it can mean a single modifier entry, the modifier type, or the modifier system generally. Qualify as needed.
 - "daily" is used colloquially for both the plugin itself and a specific Daily Setlist — the latter should always be "Daily Setlist" in technical contexts.
 - "pool" without qualification could mean the Song Pool or the `songs_pool.json` bundled file — prefer "Song Pool" and "Bundled Pool" respectively.
+- "download" is overloaded — the **Encounter**'s download action, a **Capture** (learning a Host URL), and an **Acquisition** (obtaining the file) are distinct steps; prefer the specific term.
+- `cf_url` is the CustomsForge *listing* page, never a **Host URL** — the two must not be conflated; one CDLC has exactly one `cf_url` but its Host URL is provider-specific and may change when the author re-uploads.

@@ -14,15 +14,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from plugins.the_daily import routes
 
+from _routes_test_helper import make_context
+
 
 class TestEndpointRegistration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = FastAPI()
-        self.mock_context = {
-            "meta_db": MagicMock(),
-            "config_dir": Path(self.tmp.name),
-        }
+        self.mock_context = make_context(Path(self.tmp.name), MagicMock())
         routes.setup(self.app, self.mock_context)
         self.client = TestClient(self.app)
 
