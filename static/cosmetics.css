@@ -1,0 +1,48 @@
+/* Lane coloring for map nodes */
+.ds-svg-lane-group.lane-standard circle { stroke: var(--lane-standard); }
+.ds-svg-lane-group.lane-drop circle { stroke: var(--lane-drop); }
+.ds-svg-lane-group.lane-flat circle { stroke: var(--lane-flat); }
+.ds-svg-lane-group.lane-sprint circle { stroke: var(--lane-sprint); }
+.ds-svg-lane-group.lane-marathon circle { stroke: var(--lane-marathon); }
+
+/* Flair pack — flair-glow */
+.daily-root.flair-glow .daily-leaderboard-row.is-self {
+    box-shadow: 0 0 8px rgba(232, 192, 64, 0.4);
+}
+
+/* Map theme — theme-papercraft */
+.daily-root.theme-papercraft .daily-map-svg {
+    background-color: #f5e6c8;
+    filter: sepia(0.2);
+}
+.daily-root.theme-papercraft .daily-map-svg .map-node {
+    stroke: #5a3a1a;
+}
+.daily-root.theme-papercraft .daily-map-svg .map-edge {
+    stroke: #8a6a4a;
+    stroke-dasharray: 4 2;
+}
+
+/* Lane skin — skin-neonsprint */
+.daily-root.skin-neonsprint {
+    --lane-sprint: #ff00aa;
+}
+
+/* Calendar art — per-month classes */
+.daily-root .passport-cell.month-1  { background-color: #1a2a3a; }
+.daily-root .passport-cell.month-2  { background-color: #2a1a3a; }
+.daily-root .passport-cell.month-3  { background-color: #1a3a2a; }
+.daily-root .passport-cell.month-4  { background-color: #3a2a1a; }
+.daily-root .passport-cell.month-5  { background-color: #2a3a1a; }
+.daily-root .passport-cell.month-6  { background-color: #1a3a3a; }
+.daily-root .passport-cell.month-7  { background-color: #3a1a2a; }
+.daily-root .passport-cell.month-8  { background-color: #3a3a1a; }
+.daily-root .passport-cell.month-9  { background-color: #2a2a3a; }
+.daily-root .passport-cell.month-10 { background-color: #2a3a2a; }
+.daily-root .passport-cell.month-11 { background-color: #3a2a2a; }
+.daily-root .passport-cell.month-12 { background-color: #1a1a3a; }
+
+/* Calendar art — calendar-art-pastel */
+.daily-root.calendar-art-pastel .passport-cell {
+    background-blend-mode: multiply;
+}

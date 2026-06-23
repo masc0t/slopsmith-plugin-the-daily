@@ -1,0 +1,14 @@
+{
+  "name": "the_daily-tests",
+  "version": "0.1.0",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.20.0",
+    "jsdom": "^22.1.0"
+  },
+  "scripts": {
+    "test": "npm run test:python && npm run test:e2e",
+    "test:python": "python -m coverage run -m unittest discover tests && python -m coverage report --include=routes.py",
+    "test:e2e": "npx playwright test"
+  }
+}

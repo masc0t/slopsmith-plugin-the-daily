@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Daily - E2E Test Page</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .hidden { display: none !important; }
+    .flex { display: flex; }
+    .items-center { align-items: center; }
+    .justify-center { justify-content: center; }
+    .py-32 { padding-top: 8rem; padding-bottom: 8rem; }
+    .w-8 { width: 2rem; } .h-8 { height: 2rem; }
+    .border-2 { border-width: 2px; } .border-t-transparent { border-top-color: transparent; }
+    .rounded-full { border-radius: 9999px; }
+    .border-accent { border-color: #4080e0; }
+    .animate-spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <!-- The Daily is a 3D dungeon overlay built by screen.js (dsDungeonEnter).
+       This page only needs to load the script; the dungeon mounts itself onto
+       #ds-dungeon-overlay. The legacy 2D views were removed. -->
+  <div id="app">
+    <div id="plugin-the_daily">
+      <div id="ds-loading" class="flex items-center justify-center py-32">
+        <div class="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/screen.js"></script>
+  <script>
+    // Mock window.slopsmith for testing
+    window.slopsmith = { on: function () {}, emit: function () {} };
+    console.log('E2E test page loaded');
+  </script>
+</body>
+</html>

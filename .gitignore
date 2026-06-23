@@ -1,8 +1,12 @@
+test-results/
+node_modules/
 checkpoint.json
 fill_checkpoint.json
 songs_pool.json
 songs_pool.json.bak
 build_pool.py
+publish_pool.py
+publish_modifiers.py
 __pycache__/
 *.pyc
 *.bak
@@ -11,3 +15,26 @@ reset_today.py
 preview.py
 .claude/settings.local.json
 cleanup_pool.py
+debug_db.py
+the_daily.db
+*.db
+COMTEX.pk3
+
+# Administrative / dev-only tooling (pool refresh, cache + setlist admin, resets)
+refresh_and_publish.ps1
+check_*.py
+clear_*.py
+full_reset.py
+active.json
+
+# Debug / scratch artifacts (never part of the plugin)
+.scratch/
+.coverage
+.coverage.*
+screenshots/
+screenshots.js
+debug*.py
+debug*.js
+debug*.png
+debug*.html
+test_simple.png
