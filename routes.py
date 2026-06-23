@@ -1,11 +1,14 @@
 """Daily Setlist plugin — seeded global setlist inspired by Slay the Spire."""
 
 import hashlib
+from fastapi import Request
 import json
 import random
+import re
 import sqlite3
 import threading
 import urllib.request
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -23,8 +26,29 @@ POOL_URL = "https://github.com/masc0t/slopsmith-plugin-the-daily/releases/downlo
 
 DEFAULT_SONG_COUNT = 5
 
+# Lightweight per-day leaderboard cache
+import time as _time
+_lb_cache = {}
+LB_CACHE_TTL = 60  # seconds
+
+# Leaderboard protection
+NAME_MIN_LENGTH = 2
+NAME_MAX_LENGTH = 20
+IP_DAILY_LIMIT = 5
+STREAK_LOOKBACK_DAYS = 30
+
 # ── Day name ──────────────────────────────────────────────────────────────────
 _EPOCH = date(2026, 4, 22)
+
+def _get_today():
+    # Allow tests to set a deterministic 'today' via env var
+    t = os.environ.get("THE_DAILY_TEST_TODAY")
+    if t:
+        try:
+            return date.fromisoformat(t)
+        except Exception:
+            pass
+    return date.today()
 
 
 def _day_name(date_str, modifier_id, songs):
@@ -799,13 +823,28 @@ def _select_songs(date_str, modifier_id, pool, exclude=None):
 
 
 # ── Local library matching ────────────────────────────────────────────────────
+def _normalize_title(title):
+    title = (title or "").lower()
+    title = re.sub(r"\s*\(.*?\)", "", title)
+    title = re.sub(r"[?!\.,:;'\"\(\)]", "", title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
+
+
 def _find_locally(meta_db, song):
-    row = meta_db.conn.execute(
-        "SELECT filename FROM songs "
-        "WHERE title LIKE ? AND artist LIKE ? COLLATE NOCASE LIMIT 1",
-        (f"%{song['title']}%", f"%{song['artist']}%"),
-    ).fetchone()
-    return row[0] if row else None
+    norm = _normalize_title(song.get("title"))
+    artist_norm = (song.get("artist") or "").lower()
+    rows = meta_db.conn.execute(
+        "SELECT filename, title, artist FROM songs "
+        "WHERE artist LIKE ? COLLATE NOCASE LIMIT 20",
+        (f"%{artist_norm}%",),
+    ).fetchall()
+    for row in rows:
+        fn, local_title, local_artist = row
+        local_norm = _normalize_title(local_title)
+        if local_norm == norm:
+            return fn
+    return None
 
 
 # ── Streak ────────────────────────────────────────────────────────────────────
@@ -854,6 +893,62 @@ def _supabase_post(path, body):
         return resp.status
 
 
+def _get_client_ip(request):
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _validate_display_name(name):
+    if not name or len(name) < NAME_MIN_LENGTH or len(name) > NAME_MAX_LENGTH:
+        return False, f"Name must be {NAME_MIN_LENGTH}-{NAME_MAX_LENGTH} characters"
+    if not re.match(r"^[a-zA-Z0-9 ]+$", name):
+        return False, "Name can only contain letters, numbers, and spaces"
+    # Profanity enforcement lives in a Supabase trigger on the leaderboard
+    # table so the blocklist never touches this repo.
+    return True, None
+
+
+def _compute_streak_from_supabase(ip, today):
+    if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
+        return 0
+    if ip == "unknown":
+        return 0
+    streak = 0
+    check_date = today - timedelta(days=1)
+    for _ in range(STREAK_LOOKBACK_DAYS):
+        entries = _supabase_get(
+            "/rest/v1/leaderboard",
+            {
+                "date": f"eq.{check_date.isoformat()}",
+                "ip": f"eq.{ip}",
+                "select": "date",
+            },
+        )
+        if not entries:
+            break
+        streak += 1
+        check_date -= timedelta(days=1)
+    return streak
+
+
+def _check_ip_rate_limit(ip, target_date):
+    if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
+        return True
+    if ip == "unknown":
+        return True
+    entries = _supabase_get(
+        "/rest/v1/leaderboard",
+        {
+            "date": f"eq.{target_date.isoformat()}",
+            "ip": f"eq.{ip}",
+            "select": "ip",
+        },
+    )
+    return len(entries) < IP_DAILY_LIMIT
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 def setup(app, context):
     global _db_path
@@ -864,7 +959,7 @@ def setup(app, context):
 
     @app.get("/api/plugins/the_daily/today")
     def get_today():
-        today = date.today().isoformat()
+        today = _get_today().isoformat()
         conn = _get_conn()
 
         row = conn.execute(
@@ -937,6 +1032,7 @@ def setup(app, context):
             enriched.append(s)
 
         day_number = (date.fromisoformat(today) - _EPOCH).days + 1
+        has_unavailable = any(not s["has_locally"] for s in enriched)
         return {
             "date": today,
             "seed": _date_seed(today),
@@ -954,14 +1050,173 @@ def setup(app, context):
             "song_count": song_count,
             "progress": {"done": len(done_ids), "total": song_count},
             "is_complete": len(done_ids) >= song_count,
+            "has_unavailable": has_unavailable,
         }
+    # Diagnostic: log that the_daily module has loaded routes
+    try:
+        print("the_daily: routes registered: /today, /setlist/{date}, /mark, /streak, /leaderboard")
+    except Exception:
+        pass
+
+    @app.get("/api/plugins/the_daily/setlist/{date_str}")
+    def get_setlist_by_date(date_str: str):
+        # Validate date format
+        try:
+            target = date.fromisoformat(date_str)
+        except Exception:
+            return {"error": "Invalid date format"}, 400
+
+        today_date = _get_today()
+        if target > today_date:
+            return {"error": "Future dates are not allowed"}, 400
+
+        conn = _get_conn()
+        plugin_dir = Path(__file__).parent
+        # Historical locally-generated setlist (seed-based) when data is not in DB
+        def _generate_historical_setlist(target_date_str: str):
+            try:
+                targ = date.fromisoformat(target_date_str)
+            except Exception:
+                return None
+            mod_id = _pick_modifier(target_date_str)
+            pool = _load_pool(target_date_str, plugin_dir)
+            if not pool:
+                return None
+
+            # Exclude songs used in the last 14 days before the target date
+            used_cf = set()
+            for i in range(1, 15):
+                past = (targ - timedelta(days=i)).isoformat()
+                past_row = conn.execute("SELECT songs FROM daily_setlists WHERE date = ?", (past,)).fetchone()
+                if past_row:
+                    for s in json.loads(past_row[0]):
+                        used_cf.add(s.get("cf_id"))
+
+            fresh_pool = [s for s in pool if s.get("cf_id") not in used_cf]
+            active_pool = fresh_pool if len(fresh_pool) >= DEFAULT_SONG_COUNT else pool
+
+            exclude = None
+            if mod_id == "artist_takeover":
+                exclude = set()
+                for i in range(1, 15):
+                    past = (targ - timedelta(days=i)).isoformat()
+                    past_row = conn.execute("SELECT modifier, songs FROM daily_setlists WHERE date = ?", (past,)).fetchone()
+                    if past_row and past_row[0] == "artist_takeover":
+                        past_songs = json.loads(past_row[1])
+                        if past_songs:
+                            exclude.add((past_songs[0].get("artist") or "").lower())
+
+            songs, song_count, fallback = _select_songs(target_date_str, mod_id, active_pool, exclude=exclude)
+            day_name = _day_name(target_date_str, mod_id, songs)
+
+            # Enrich songs with local availability
+            enriched = []
+            for s in songs:
+                s2 = dict(s)
+                s2["local_filename"] = _find_locally(meta_db, s2)
+                s2["has_locally"] = s2["local_filename"] is not None
+                enriched.append(s2)
+            day_number = (targ - _EPOCH).days + 1
+            return {
+                "date": target_date_str,
+                "seed": _date_seed(target_date_str),
+                "day_name": day_name,
+                "day_number": day_number,
+                "modifier": {
+                    "id": mod_id,
+                    "label": MODIFIERS[mod_id]["label"],
+                    "description": MODIFIERS[mod_id]["description"],
+                    "icon": MODIFIERS[mod_id].get("icon", ""),
+                    "is_blindside": MODIFIERS[mod_id]["type"] == "ui",
+                },
+                "fallback": fallback,
+                "songs": enriched,
+                "song_count": song_count,
+                "progress": {"done": 0, "total": song_count},
+                "is_complete": False,
+                "has_unavailable": False,
+                "is_historical": True,
+            }
+
+        # Helper to build payload from a retrieved row
+        def build_payload(row, is_historical: bool, mod_id, songs, song_count, done_ids=None):
+            if not row:
+                return None
+            day_name = row[0]
+            modifier_id = mod_id
+            if isinstance(modifier_id, tuple):
+                modifier_id = modifier_id[0]
+            mod = MODIFIERS[modifier_id]
+            enriched = []
+            # enrich each song with local_filename, has_locally, done
+            for s in (songs or []):
+                s2 = dict(s)
+                s2["local_filename"] = _find_locally(meta_db, s2)
+                s2["has_locally"] = s2["local_filename"] is not None
+                s2["done"] = (done_ids or set()).__contains__(s2.get("cf_id"))
+                enriched.append(s2)
+            day_num = (target - _EPOCH).days + 1
+            return {
+                "date": date_str,
+                "seed": _date_seed(date_str),
+                "day_name": day_name,
+                "day_number": day_num,
+                "modifier": {
+                    "id": modifier_id,
+                    "label": mod["label"],
+                    "description": mod["description"],
+                    "icon": mod.get("icon", ""),
+                    "is_blindside": mod["type"] == "ui",
+                },
+                "fallback": False,
+                "songs": enriched,
+                "song_count": song_count,
+                "progress": {"done": len(done_ids or []), "total": song_count},
+                "is_complete": (len(done_ids or []) >= song_count),
+                "has_unavailable": any(not s.get("has_locally") for s in enriched),
+                "is_historical": is_historical,
+            }
+
+        # Today
+        row = conn.execute(
+            "SELECT day_name, modifier, songs, song_count FROM daily_setlists WHERE date = ?",
+            (date_str,),
+        ).fetchone()
+        if target == today_date:
+            if not row:
+                return {"error": "No setlist for today"}, 404
+            day_name, modifier_id, songs_json, song_count = row
+            songs = json.loads(songs_json)
+            # Enrich completion state for today
+            done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
+            payload = build_payload(row, False, modifier_id, songs, song_count, done_ids)
+            return payload
+
+        # Historical
+        if row:
+            day_name, modifier_id, songs_json, song_count = row
+            songs = json.loads(songs_json)
+            done_ids = {r[0] for r in conn.execute("SELECT cf_id FROM daily_completions WHERE date = ?", (date_str,)).fetchall()}
+            payload = build_payload(row, True, modifier_id, songs, song_count, done_ids)
+            return payload
+        # Not found for historical date: generate locally if date is historical
+        if target < today_date:
+            payload = _generate_historical_setlist(date_str)
+            if payload:
+                return payload
+            return {"error": "No setlist for this date yet"}, 404
+        # Otherwise, no data for this date
+        return {"error": "No setlist for this date yet"}, 404
+
+    MIN_PLAY_DURATION = 30  # seconds required to mark song as complete
 
     @app.post("/api/plugins/the_daily/mark")
     def mark_song(data: dict):
         cf_id = data.get("cf_id")
+        duration_played = data.get("duration_played", 0)
         if not cf_id:
             return {"error": "cf_id required"}
-        today = date.today().isoformat()
+        today = _get_today().isoformat()
         conn = _get_conn()
 
         row = conn.execute(
@@ -970,6 +1225,17 @@ def setup(app, context):
         if not row:
             return {"error": "No setlist for today"}
         song_count = row[0]
+
+        # Check if minimum play duration was met
+        if duration_played < MIN_PLAY_DURATION:
+            return {
+                "ok": False,
+                "requires_confirmation": True,
+                "duration_played": duration_played,
+                "threshold": MIN_PLAY_DURATION,
+                "progress": {"done": 0, "total": song_count},
+                "is_complete": False,
+            }
 
         with _lock:
             conn.execute(
@@ -991,89 +1257,291 @@ def setup(app, context):
     @app.get("/api/plugins/the_daily/streak")
     def get_streak():
         conn = _get_conn()
-        return {"streak": _compute_streak(conn, date.today().isoformat())}
+        return {"streak": _compute_streak(conn, _get_today().isoformat())}
+
+    @app.get("/api/plugins/the_daily/stats")
+    def get_stats():
+        conn = _get_conn()
+        today = _get_today().isoformat()
+
+        # Total songs played (all time)
+        total_played = conn.execute("SELECT COUNT(*) FROM daily_completions").fetchone()[0] or 0
+
+        # Total unique days completed
+        total_days_completed = conn.execute("SELECT COUNT(*) FROM daily_setlists").fetchone()[0] or 0
+
+        # Current streak
+        streak = _compute_streak(conn, today)
+
+        # Songs played today
+        played_today = conn.execute(
+            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today,)
+        ).fetchone()[0] or 0
+
+        return {
+            "total_played": total_played,
+            "streak": streak,
+            "played_today": played_today,
+            "total_days": total_days_completed,
+        }
+
+    @app.get("/api/plugins/the_daily/health")
+    def get_health():
+        # Expose registered endpoints for quick diagnosis in the host environment
+        endpoints = []
+        for r in app.router.routes:
+            path = getattr(r, 'path', None)
+            if path and isinstance(path, str) and path.startswith('/api/plugins/the_daily/'):
+                endpoints.append(path)
+        # Additional health signals
+        today_path = "/api/plugins/the_daily/today" in endpoints
+        setlist_by_date_path = any(p.startswith("/api/plugins/the_daily/setlist/") for p in endpoints)
+        conn = _get_conn()
+        pool_count = conn.execute("SELECT COUNT(*) FROM pool_cache").fetchone()[0]
+        today = _get_today().isoformat()
+        today_has_row = conn.execute("SELECT 1 FROM daily_setlists WHERE date = ?", (today,)).fetchone() is not None
+        return {
+            "registered_endpoints": endpoints,
+            "today_registered": today_path,
+            "setlist_by_date_registered": setlist_by_date_path,
+            "pool_cache_rows": pool_count,
+            "today_has_row": today_has_row,
+        }
+
+    @app.get("/api/plugins/the_daily/health_diag")
+    def health_diag():
+        conn = _get_conn()
+        endpoints = []
+        for r in app.router.routes:
+            path = getattr(r, 'path', None)
+            if path and isinstance(path, str) and path.startswith('/api/plugins/the_daily/'):
+                endpoints.append(path)
+        today_path = "/api/plugins/the_daily/today" in endpoints
+        setlist_by_date_path = any(p.startswith("/api/plugins/the_daily/setlist/") for p in endpoints)
+        pool_count = conn.execute("SELECT COUNT(*) FROM pool_cache").fetchone()[0]
+        today = _get_today().isoformat()
+        today_has_row = conn.execute("SELECT 1 FROM daily_setlists WHERE date = ?", (today,)).fetchone() is not None
+        return {
+            "endpoints": endpoints,
+            "today_registered": today_path,
+            "setlist_by_date_registered": setlist_by_date_path,
+            "pool_cache_rows": pool_count,
+            "today_has_row": today_has_row,
+        }
+
+    @app.get("/api/plugins/the_daily/test")
+    def test_endpoint():
+        return {"ok": True}
 
     @app.get("/api/plugins/the_daily/leaderboard")
-    def get_leaderboard(date_param: str = None):
-        target = date_param or date.today().isoformat()
+    def get_leaderboard(date: str = None):
+        # Normalize target date and enforce Day 1 boundaries
+        import datetime as _dt
+        from datetime import date as _Date
+        today_dt = _get_today()
+        today = today_dt
+        if date:
+            try:
+                target = _Date.fromisoformat(date)
+            except Exception:
+                target = today
+        else:
+            target = today
+
+        day1 = _EPOCH
+
+        # If target is before Day 1, clamp to Day 1 if data exists, else no data
+        if target < day1:
+            exists_day1 = _get_conn().execute(
+                "SELECT 1 FROM daily_setlists WHERE date = ?", (day1.isoformat(),)
+            ).fetchone()
+            if exists_day1:
+                target = day1
+            else:
+                return {
+                    "date": day1.isoformat(),
+                    "available": False,
+                    "entries": [],
+                    "total_entries": 0,
+                    "last_updated": None,
+                }
+
+        # Future date not available
+        if target > today:
+            return {
+                "date": target.isoformat(),
+                "available": False,
+                "entries": [],
+                "total_entries": 0,
+                "last_updated": None,
+            }
+
+        # Per-day cache lookup
+        cache_key = target.isoformat()
+        cached = _lb_cache.get(cache_key)
+        if cached:
+            expiry, payload = cached
+            if expiry is None or expiry > int(_time.time()):
+                return payload
+
         conn = _get_conn()
         row = conn.execute(
-            "SELECT day_name FROM daily_setlists WHERE date = ?", (target,)
+            "SELECT day_name, modifier FROM daily_setlists WHERE date = ?", (target.isoformat(),)
         ).fetchone()
-        day_name = row[0] if row else f"Daily #{(date.fromisoformat(target) - _EPOCH).days + 1}"
+        # Compute the day number without relying on date.fromisoformat to avoid name shadowing issues
+        day_num = (target - _EPOCH).days + 1
+        day_name = row[0] if row else f"Daily #{day_num}"
+        modifier_id = row[1] if row and len(row) > 1 else None
+        seed = _date_seed(target.isoformat()) if target else None
+        fallback = False
+
+        mod = MODIFIERS[modifier_id] if modifier_id else {}
+        modifier = {
+            "id": modifier_id,
+            "label": mod.get("label", ""),
+            "description": mod.get("description", ""),
+            "icon": mod.get("icon", ""),
+            "is_blindside": mod.get("type") == "ui",
+        } if modifier_id else {}
 
         if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
-            return {
-                "date": target,
+            payload = {
+                "date": target.isoformat(),
                 "day_name": day_name,
+                "day_number": day_num,
+                "seed": seed,
+                "modifier": modifier,
+                "fallback": fallback,
                 "entries": [],
-                "error": "Supabase not configured",
+                "available": True,
+                "total_entries": 0,
+                "last_updated": None,
             }
+            _lb_cache[cache_key] = (int(_time.time()) + LB_CACHE_TTL, payload)
+            return payload
 
         try:
             entries = _supabase_get(
                 "/rest/v1/leaderboard",
                 {
-                    "date": f"eq.{target}",
+                    "date": f"eq.{target.isoformat()}",
                     "order": "completed_at.asc",
-                    "select": "display_name,completed_at,streak,rating",
+                    "select": "display_name,completed_at,streak,rating,message",
                 },
             )
         except Exception as e:
-            return {"date": target, "day_name": day_name, "entries": [], "error": str(e)}
+            payload = {"date": target.isoformat(), "day_name": day_name, "entries": [], "available": True, "total_entries": 0, "last_updated": None}
+            _lb_cache[cache_key] = (int(_time.time()) + LB_CACHE_TTL, payload)
+            return payload
 
-        ratings = {-1: 0, 1: 0, 2: 0}
-        for e in entries:
-            r = e.get("rating")
-            if r in ratings:
-                ratings[r] += 1
+        last_updated = None
+        if isinstance(entries, list) and entries:
+            times = [e.get("completed_at") for e in entries if e.get("completed_at")]
+            if times:
+                last_updated = max(times)
 
-        return {"date": target, "day_name": day_name, "entries": entries, "ratings": ratings}
+        payload = {
+            "date": target.isoformat(),
+            "day_name": day_name,
+            "day_number": day_num,
+            "seed": seed,
+            "modifier": modifier,
+            "fallback": fallback,
+            "entries": entries or [],
+            "available": True,
+            "total_entries": len(entries or []),
+            "last_updated": last_updated,
+        }
+        _lb_cache[cache_key] = (int(_time.time()) + LB_CACHE_TTL, payload)
+        return payload
 
     @app.post("/api/plugins/the_daily/sign")
-    def sign_leaderboard(data: dict):
+    async def sign_leaderboard(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        data = body if isinstance(body, dict) else {}
+
+        # Handle fallback payload for empty results
+        if isinstance(entries, list) and len(entries) == 0:
+            payload = {"date": target.isoformat(), "day_name": day_name, "day_number": day_num, "seed": seed, "modifier": modifier, "fallback": fallback, "entries": [], "available": True, "total_entries": 0, "last_updated": None}
+        # Guard against signing historical days if a date is provided
+        if isinstance(data, dict) and data.get("date"):
+            try:
+                provided = date.fromisoformat(str(data.get("date")))
+            except Exception:
+                provided = None
+            if provided is not None:
+                today = _get_today()
+                if provided < today:
+                    return {"error": "Historical days cannot be signed"}, 403
         display_name = (data.get("display_name") or "").strip()
-        if not display_name:
-            return {"error": "Name required"}
+        valid, err = _validate_display_name(display_name)
+        if not valid:
+            return {"error": err}
         rating = data.get("rating")
         if rating not in (-1, 1, 2):
             rating = None
+        
+        message = data.get("message")
+        if isinstance(message, str):
+            message = message.strip()[:60]
+            if not message:
+                message = None
 
         if not SUPABASE_URL or SUPABASE_URL.startswith("https://YOURPROJECT"):
             return {"error": "Supabase not configured"}
 
-        today = date.today().isoformat()
+        today = date.today()
+        today_str = today.isoformat()
         conn = _get_conn()
 
         row = conn.execute(
-            "SELECT song_count FROM daily_setlists WHERE date = ?", (today,)
+            "SELECT song_count FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()
         if not row:
             return {"error": "No setlist for today"}
 
         done = conn.execute(
-            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today,)
+            "SELECT COUNT(*) FROM daily_completions WHERE date = ?", (today_str,)
         ).fetchone()[0]
         if done < row[0]:
             return {"error": "Setlist not complete yet"}
 
-        streak = _compute_streak(conn, today) + 1
+        client_ip = _get_client_ip(request)
+        if not _check_ip_rate_limit(client_ip, today):
+            return {"error": "Too many submissions from this IP today"}
+
+        streak = _compute_streak_from_supabase(client_ip, today) + 1
         day_name = conn.execute(
-            "SELECT day_name FROM daily_setlists WHERE date = ?", (today,)
+            "SELECT day_name FROM daily_setlists WHERE date = ?", (today_str,)
         ).fetchone()[0]
 
+        body = {
+            "date": today_str,
+            "day_name": day_name,
+            "display_name": display_name,
+            "completed_at": datetime.utcnow().isoformat() + "Z",
+            "streak": streak,
+            "ip": client_ip,
+        }
+        if rating is not None:
+            body["rating"] = rating
+        if message is not None:
+            body["message"] = message
         try:
-            body = {
-                "date": today,
-                "day_name": day_name,
-                "display_name": display_name,
-                "completed_at": datetime.utcnow().isoformat() + "Z",
-                "streak": streak,
-            }
-            if rating is not None:
-                body["rating"] = rating
             _supabase_post("/rest/v1/leaderboard", body)
         except Exception as e:
-            return {"error": f"Could not sign leaderboard: {e}"}
+            err_text = ""
+            if hasattr(e, "read"):
+                try:
+                    err_text = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            err_text = err_text or str(e)
+            if "inappropriate" in err_text.lower():
+                return {"error": "Name contains inappropriate language"}
+            return {"error": f"Could not sign leaderboard: {err_text}"}
 
         return {"ok": True, "streak": streak}
